@@ -121,6 +121,15 @@ export default function App() {
     setSelectedDate(todayIso);
   };
 
+  const moveItemToLeft = (itemId: number) => {
+    setItems((prev) => {
+      const idx = prev.findIndex((item) => item.id === itemId);
+      if (idx <= 0) return prev;
+      const target = prev[idx];
+      return [target, ...prev.slice(0, idx), ...prev.slice(idx + 1)];
+    });
+  };
+
   return (
     <div className="flex min-h-dvh items-center bg-background px-4 py-6">
       <div className="mx-auto w-full max-w-[1160px]">
@@ -207,7 +216,10 @@ export default function App() {
                         {...item}
                         index={i}
                         onMemoSaved={() =>
-                          setMemoItemIds((prev) => new Set(prev).add(item.id))
+                          {
+                            setMemoItemIds((prev) => new Set(prev).add(item.id));
+                            moveItemToLeft(item.id);
+                          }
                         }
                         onMemoDeleted={() =>
                           setMemoItemIds((prev) => {
