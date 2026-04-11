@@ -209,6 +209,13 @@ export default function App() {
                         onMemoSaved={() =>
                           setMemoItemIds((prev) => new Set(prev).add(item.id))
                         }
+                        onMemoDeleted={() =>
+                          setMemoItemIds((prev) => {
+                            const next = new Set(prev);
+                            next.delete(item.id);
+                            return next;
+                          })
+                        }
                       />
                     )}
                     {!memoItemIds.has(item.id) && (

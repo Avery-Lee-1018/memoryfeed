@@ -38,6 +38,10 @@ export default {
       const itemId = parseInt(url.pathname.split("/")[3]);
       return handlePostNote(itemId, request, env);
     }
+    if (request.method === "DELETE" && /^\/api\/notes\/\d+$/.test(url.pathname)) {
+      const itemId = parseInt(url.pathname.split("/")[3]);
+      return handleDeleteNote(itemId, env);
+    }
 
     return env.ASSETS.fetch(request);
   }
@@ -177,5 +181,10 @@ async function handlePostNote(itemId: number, request: Request, env: Env) {
     ON CONFLICT(item_id) DO UPDATE SET content = excluded.content, updated_at = CURRENT_TIMESTAMP
   `).bind(itemId, body.content).run();
 
+  return json({ ok: true });
+}
+
+async function handleDeleteNote(itemId: number, env: Env) {
+  await env.DB.prepare("DELETE FROM notes WHERE item_id = ?").bind(itemId).run();
   return json({ ok: true });
 }

@@ -19,7 +19,11 @@ export type FeedItem = {
   sourceType: "rss" | "blog";
 };
 
-type Props = FeedItem & { index?: number; onMemoSaved?: () => void };
+type Props = FeedItem & {
+  index?: number;
+  onMemoSaved?: () => void;
+  onMemoDeleted?: () => void;
+};
 
 marked.setOptions({ breaks: true });
 
@@ -32,6 +36,8 @@ export default function FeedCard({
   note,
   sourceName,
   onMemoSaved,
+  onMemoDeleted,
+  index = 0,
 }: Props) {
   const [expanded, setExpanded] = useState(false);
   const [memoOpen, setMemoOpen] = useState(false);
@@ -39,7 +45,8 @@ export default function FeedCard({
   const [memoValue, setMemoValue] = useState(note ?? "");
   const [savedMemo, setSavedMemo] = useState(note ?? "");
   const [saving, setSaving] = useState(false);
-  const thumbnail = thumbnail_url ?? FALLBACK_THUMBNAILS[id % 3];
+  const fallbackThumbnail = FALLBACK_THUMBNAILS[index % 3];
+  const [thumbnailSrc, setThumbnailSrc] = useState(thumbnail_url || fallbackThumbnail);
   const hasMemo = savedMemo.trim().length > 0;
 
   const handleSave = async () => {
@@ -53,6 +60,7 @@ export default function FeedCard({
     setSaving(false);
     setMemoEditing(false);
     if (memoValue.trim()) onMemoSaved?.();
+    else onMemoDeleted?.();
   };
 
   const handleMemoButtonClick = () => {
@@ -70,11 +78,27 @@ export default function FeedCard({
     }
   };
 
+  const handleDelete = async () => {
+    await fetch(`/api/notes/${id}`, { method: "DELETE" });
+    setSavedMemo("");
+    setMemoValue("");
+    setMemoEditing(false);
+    setMemoOpen(false);
+    onMemoDeleted?.();
+  };
+
   return (
     <Card className="w-full overflow-hidden rounded-2xl border-0 shadow-sm">
       {/* Thumbnail */}
       <div className="h-[201px] w-full overflow-hidden">
-        <img src={thumbnail} alt="" className="h-full w-full object-cover" />
+        <img
+          src={thumbnailSrc}
+          alt=""
+          className="h-full w-full object-cover"
+          onError={() => {
+            if (thumbnailSrc !== fallbackThumbnail) setThumbnailSrc(fallbackThumbnail);
+          }}
+        />
       </div>
 
       {/* Header */}
@@ -141,6 +165,14 @@ export default function FeedCard({
                 autoFocus
               />
               <div className="flex items-center justify-end gap-2">
+                {hasMemo && (
+                  <button
+                    onClick={handleDelete}
+                    className="text-xs text-red-500 hover:text-red-600 transition-colors px-2 py-1"
+                  >
+                    삭제
+                  </button>
+                )}
                 <button
                   onClick={() => {
                     setMemoValue(savedMemo);
@@ -166,13 +198,22 @@ export default function FeedCard({
                 className="prose prose-sm max-w-none text-sm text-foreground/80 rounded-lg bg-muted/30 p-3"
                 dangerouslySetInnerHTML={{ __html: marked.parse(savedMemo) as string }}
               />
-              <button
-                onClick={() => setMemoEditing(true)}
-                className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity flex h-6 w-6 items-center justify-center rounded-full bg-background/80 text-muted-foreground hover:text-foreground shadow-sm"
-                aria-label="메모 수정"
-              >
-                <i className="ri-pencil-line text-xs" />
-              </button>
+              <div className="absolute top-2 right-2 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                <button
+                  onClick={() => setMemoEditing(true)}
+                  className="flex h-6 w-6 items-center justify-center rounded-full bg-background/80 text-muted-foreground hover:text-foreground shadow-sm"
+                  aria-label="메모 수정"
+                >
+                  <i className="ri-pencil-line text-xs" />
+                </button>
+                <button
+                  onClick={handleDelete}
+                  className="flex h-6 w-6 items-center justify-center rounded-full bg-background/80 text-red-500 hover:text-red-600 shadow-sm"
+                  aria-label="메모 삭제"
+                >
+                  <i className="ri-delete-bin-line text-xs" />
+                </button>
+              </div>
             </div>
           )}
         </CardContent>
