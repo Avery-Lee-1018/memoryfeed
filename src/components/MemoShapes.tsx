@@ -27,19 +27,37 @@ function rand(seed: string, index: number): number {
 type Stamp = {
   src: string;
   label: string;
-  top: string;
-  left: string;
+  topPct: number;
+  leftPct: number;
   size: number;
   rotate: number;
   opacity: number;
   zIndex: number;
 };
 
-const SAFE_ZONES = [
-  { leftMin: 2, leftMax: 16, topMin: 4, topMax: 18 },
-  { leftMin: 84, leftMax: 98, topMin: 4, topMax: 18 },
-  { leftMin: 4, leftMax: 14, topMin: 18, topMax: 30 },
-  { leftMin: 86, leftMax: 96, topMin: 18, topMax: 30 },
+const SAFE_INSET_PX = 20;
+
+const LAYOUT_PATTERNS = [
+  [
+    { left: 20, top: 13, z: 1 },
+    { left: 80, top: 13, z: 2 },
+    { left: 24, top: 29, z: 3 },
+  ],
+  [
+    { left: 18, top: 11, z: 2 },
+    { left: 78, top: 16, z: 1 },
+    { left: 74, top: 31, z: 3 },
+  ],
+  [
+    { left: 24, top: 15, z: 3 },
+    { left: 76, top: 11, z: 2 },
+    { left: 50, top: 28, z: 1 },
+  ],
+  [
+    { left: 16, top: 16, z: 1 },
+    { left: 82, top: 12, z: 3 },
+    { left: 52, top: 30, z: 2 },
+  ],
 ] as const;
 
 function buildStamps(dateKey: string): Stamp[] {
@@ -53,35 +71,29 @@ function buildStamps(dateKey: string): Stamp[] {
     picked.push(pool.splice(idx, 1)[0]);
   }
 
-  const zonePool = [...SAFE_ZONES];
-  const pickedZones: (typeof SAFE_ZONES)[number][] = [];
-  while (pickedZones.length < stampCount && zonePool.length > 0) {
-    const idx = Math.floor(rand(dateKey, si++) * zonePool.length);
-    pickedZones.push(zonePool.splice(idx, 1)[0]);
-  }
+  const pattern = LAYOUT_PATTERNS[Math.floor(rand(dateKey, 777) * LAYOUT_PATTERNS.length)];
 
   return picked.map((shape, i) => {
     const r = (n: number) => rand(dateKey, i * 30 + n + 50);
-    const zone = pickedZones[i] ?? SAFE_ZONES[i % SAFE_ZONES.length];
-    const left = zone.leftMin + r(0) * (zone.leftMax - zone.leftMin);
-    const top = zone.topMin + r(1) * (zone.topMax - zone.topMin);
+    const base = pattern[i % pattern.length];
+    const leftPct = Math.min(84, Math.max(16, base.left + (r(0) * 2 - 1) * 4.5));
+    const topPct = Math.min(33, Math.max(10, base.top + (r(1) * 2 - 1) * 3.2));
 
-    // z-position represented as deterministic layer order
-    const zIndex = 1 + Math.floor(r(2) * 2);
+    const zIndex = base.z;
 
-    // size: 54–116 px
-    const size = 54 + r(3) * 62;
+    // size: 52–96 px
+    const size = 52 + r(3) * 44;
 
-    // rotation: -26..+26 deg
-    const rotate = r(4) * 52 - 26;
+    // rotation: -20..+20 deg
+    const rotate = r(4) * 40 - 20;
 
-    // opacity: 0.42..0.68
-    const opacity = 0.42 + r(5) * 0.26;
+    // opacity: 0.44..0.66
+    const opacity = 0.44 + r(5) * 0.22;
 
     return {
       ...shape,
-      top:  `${top.toFixed(1)}%`,
-      left: `${left.toFixed(1)}%`,
+      topPct,
+      leftPct,
       size,
       rotate,
       opacity,
@@ -98,7 +110,18 @@ export default function MemoShapes({ show, dateKey }: Props) {
   if (!show) return null;
 
   return (
-    <>
+    <div
+      style={{
+        position: "fixed",
+        top: SAFE_INSET_PX,
+        right: SAFE_INSET_PX,
+        bottom: SAFE_INSET_PX,
+        left: SAFE_INSET_PX,
+        pointerEvents: "none",
+        userSelect: "none",
+        zIndex: 0,
+      }}
+    >
       {stamps.map((stamp, i) => (
         <motion.img
           key={`memo-stamp-${dateKey}-${stamp.label}`}
@@ -113,18 +136,17 @@ export default function MemoShapes({ show, dateKey }: Props) {
             ease: "easeOut",
           }}
           style={{
-            position: "fixed",
-            top: stamp.top,
-            left: stamp.left,
+            position: "absolute",
+            top: `${stamp.topPct}%`,
+            left: `${stamp.leftPct}%`,
             width: stamp.size,
             height: stamp.size,
             objectFit: "contain",
-            pointerEvents: "none",
-            userSelect: "none",
+            transform: "translate(-50%, -50%)",
             zIndex: stamp.zIndex,
           }}
         />
       ))}
-    </>
+    </div>
   );
 }
