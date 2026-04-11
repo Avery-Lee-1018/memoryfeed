@@ -81,8 +81,7 @@ async function handlePostFeedReplacement(request: Request, env: Env) {
     excludeItemIds.length > 0 ? `AND i.id NOT IN (${placeholders})` : "";
   const targetDate = getDateParamOrToday(body.date ?? null);
 
-  const stmt = env.DB.prepare(
-    `
+  const stmt = env.DB.prepare(`
     SELECT i.id, i.title, i.url, i.summary, i.thumbnail_url,
            s.name AS sourceName, s.type AS sourceType,
            n.content AS note
@@ -90,16 +89,20 @@ async function handlePostFeedReplacement(request: Request, env: Env) {
     JOIN sources s ON i.source_id = s.id
     LEFT JOIN notes n ON n.item_id = i.id
     WHERE i.status = 'active'
-      AND i.shown_date = ?
+      AND (i.shown_date IS NULL OR i.shown_date != ?)
       ${exclusionClause}
-    ORDER BY i.last_seen_at IS NULL DESC,
-             i.last_seen_at ASC,
-             i.id DESC
+    ORDER BY RANDOM()
     LIMIT 1
-  `
-  );
+  `);
 
-  const replacement = await stmt.bind(targetDate, ...excludeItemIds).first();
+  const replacement = await stmt.bind(targetDate, ...excludeItemIds).first() as Record<string, unknown> | null;
+
+  if (replacement) {
+    await env.DB.prepare("UPDATE items SET shown_date = ? WHERE id = ?")
+      .bind(targetDate, replacement.id)
+      .run();
+  }
+
   return json({ item: replacement ?? null });
 }
 

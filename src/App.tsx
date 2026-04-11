@@ -86,21 +86,14 @@ export default function App() {
       <div className="w-full">
         <header className="mx-auto max-w-[390px] px-6 pb-5 pt-2">
           <div className="mb-3 flex items-center justify-between">
-            <button
-              onClick={() => setSelectedDate((prev) => shiftDate(prev, -1))}
-              className="flex h-12 w-12 items-center justify-center rounded-full border border-border bg-background text-2xl text-foreground hover:bg-accent"
-              aria-label="이전 날짜"
-            >
-              <i className="ri-arrow-left-s-line" />
-            </button>
             <p className="text-xs text-muted-foreground">{displayedDate}</p>
             <button
-              onClick={() => setSelectedDate((prev) => shiftDate(prev, 1))}
+              onClick={() => setSelectedDate(todayIso)}
               disabled={isToday}
-              className="flex h-12 w-12 items-center justify-center rounded-full border border-border bg-background text-2xl text-foreground hover:bg-accent disabled:cursor-not-allowed disabled:opacity-40"
-              aria-label="다음 날짜"
+              className="rounded-full border border-border px-2 py-1 text-[11px] font-medium text-foreground hover:bg-accent disabled:cursor-not-allowed disabled:opacity-40"
+              aria-label="오늘로 이동"
             >
-              <i className="ri-arrow-right-s-line" />
+              TODAY
             </button>
           </div>
           <h1 className="mt-1 text-lg font-semibold leading-snug tracking-tight">
@@ -108,37 +101,58 @@ export default function App() {
           </h1>
         </header>
 
-        {loading ? (
-          <div className="mx-auto max-w-[390px] px-6">
-            <p className="text-center text-sm text-muted-foreground">불러오는 중...</p>
-          </div>
-        ) : items.length === 0 ? (
-          <EmptyState hasItems={initialItemCount > 0} />
-        ) : (
-          <div className="mx-auto max-w-[390px] overflow-x-auto no-scrollbar">
-            <div className="flex gap-3 snap-x snap-mandatory px-6 pb-4">
-              {items.map((item, i) => (
-                <div
-                  key={item.id}
-                  className="snap-center shrink-0 w-[82vw] max-w-[340px] flex flex-col gap-2"
-                >
-                  {replacingIds.has(item.id) ? (
-                    <CardSkeleton />
-                  ) : (
-                    <FeedCard {...item} index={i} />
-                  )}
-                  <button
-                    onClick={() => skip(item.id)}
-                    disabled={replacingIds.has(item.id)}
-                    className="text-xs text-muted-foreground/50 hover:text-muted-foreground transition-colors text-center py-1 disabled:opacity-0"
-                  >
-                    오늘은 안볼래요
-                  </button>
+        <div className="mx-auto flex w-full max-w-[520px] items-start gap-2 px-2">
+          <button
+            onClick={() => setSelectedDate((prev) => shiftDate(prev, -1))}
+            className="mt-28 flex h-12 w-12 shrink-0 items-center justify-center rounded-full border border-border bg-background text-2xl text-foreground hover:bg-accent"
+            aria-label="이전 날짜"
+          >
+            <i className="ri-arrow-left-s-line" />
+          </button>
+
+          <div className="min-w-0 flex-1">
+            {loading ? (
+              <div className="mx-auto max-w-[390px] px-6">
+                <p className="text-center text-sm text-muted-foreground">불러오는 중...</p>
+              </div>
+            ) : items.length === 0 ? (
+              <EmptyState hasItems={initialItemCount > 0} />
+            ) : (
+              <div className="mx-auto max-w-[390px] overflow-x-auto no-scrollbar">
+                <div className="flex gap-3 snap-x snap-mandatory px-6 pb-4">
+                  {items.map((item, i) => (
+                    <div
+                      key={item.id}
+                      className="snap-center shrink-0 w-[82vw] max-w-[340px] flex flex-col gap-2"
+                    >
+                      {replacingIds.has(item.id) ? (
+                        <CardSkeleton />
+                      ) : (
+                        <FeedCard {...item} index={i} />
+                      )}
+                      <button
+                        onClick={() => skip(item.id)}
+                        disabled={replacingIds.has(item.id)}
+                        className="text-xs text-muted-foreground/50 hover:text-muted-foreground transition-colors text-center py-1 disabled:opacity-0"
+                      >
+                        오늘은 안볼래요
+                      </button>
+                    </div>
+                  ))}
                 </div>
-              ))}
-            </div>
+              </div>
+            )}
           </div>
-        )}
+
+          <button
+            onClick={() => setSelectedDate((prev) => shiftDate(prev, 1))}
+            disabled={isToday}
+            className="mt-28 flex h-12 w-12 shrink-0 items-center justify-center rounded-full border border-border bg-background text-2xl text-foreground hover:bg-accent disabled:cursor-not-allowed disabled:opacity-40"
+            aria-label="다음 날짜"
+          >
+            <i className="ri-arrow-right-s-line" />
+          </button>
+        </div>
       </div>
     </div>
   );
