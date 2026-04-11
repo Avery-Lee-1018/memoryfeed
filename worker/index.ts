@@ -41,9 +41,14 @@ export default {
 
 async function handleGetFeedToday(env: Env) {
   const today = new Date().toISOString().slice(0, 10);
-  const result = await env.DB.prepare(
-    "SELECT id, title, url, summary FROM items WHERE shown_date = ? LIMIT 3"
-  ).bind(today).all();
+  const result = await env.DB.prepare(`
+    SELECT i.id, i.title, i.url, i.summary, i.thumbnail_url,
+           s.name AS sourceName, s.type AS sourceType
+    FROM items i
+    JOIN sources s ON i.source_id = s.id
+    WHERE i.shown_date = ?
+    LIMIT 3
+  `).bind(today).all();
 
   return json({ date: today, items: result.results ?? [] });
 }
