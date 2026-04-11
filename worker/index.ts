@@ -1,0 +1,112 @@
+interface Env {
+  DB: D1Database;
+  ASSETS: Fetcher;
+}
+
+type ReactionType = "keep" | "skip";
+type SourceType = "rss" | "blog";
+
+const json = (data: unknown, init: ResponseInit = {}) =>
+  new Response(JSON.stringify(data), {
+    ...init,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      ...(init.headers || {})
+    }
+  });
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (request.method === "GET" && url.pathname === "/api/feed/today") {
+      return handleGetFeedToday(env);
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/reaction") {
+      return handlePostReaction(request, env);
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/sources") {
+      return handleGetSources(env);
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/sources") {
+      return handlePostSources(request, env);
+    }
+
+    return env.ASSETS.fetch(request);
+  }
+} satisfies ExportedHandler<Env>;
+
+async function handleGetFeedToday(env: Env) {
+  const today = new Date().toISOString().slice(0, 10);
+  const result = await env.DB.prepare(
+    "SELECT id, title, url, summary FROM items WHERE shown_date = ? LIMIT 3"
+  ).bind(today).all();
+
+  return json({ date: today, items: result.results ?? [] });
+}
+
+async function handlePostReaction(request: Request, env: Env) {
+  let body: { itemId?: number; type?: ReactionType };
+
+  try {
+    body = (await request.json()) as { itemId?: number; type?: ReactionType };
+  } catch {
+    return json({ error: "Invalid JSON body" }, { status: 400 });
+  }
+
+  if (typeof body.itemId !== "number" || !body.type) {
+    return json({ error: "itemId and type are required" }, { status: 400 });
+  }
+
+  if (!["keep", "skip"].includes(body.type)) {
+    return json({ error: "type must be keep | skip" }, { status: 400 });
+  }
+
+  const itemExists = await env.DB.prepare("SELECT id FROM items WHERE id = ? LIMIT 1")
+    .bind(body.itemId)
+    .first();
+  if (!itemExists) {
+    return json({ error: "item not found" }, { status: 404 });
+  }
+
+  await env.DB.prepare("INSERT INTO reactions (item_id, type) VALUES (?, ?)")
+    .bind(body.itemId, body.type)
+    .run();
+
+  return json({ ok: true });
+}
+
+async function handleGetSources(env: Env) {
+  const result = await env.DB.prepare(
+    "SELECT id, name, url, type, is_active FROM sources ORDER BY id DESC"
+  ).all();
+
+  return json({ sources: result.results ?? [] });
+}
+
+async function handlePostSources(request: Request, env: Env) {
+  let body: { name?: string; url?: string; type?: SourceType };
+
+  try {
+    body = (await request.json()) as { name?: string; url?: string; type?: SourceType };
+  } catch {
+    return json({ error: "Invalid JSON body" }, { status: 400 });
+  }
+
+  if (!body.name || !body.url || !body.type) {
+    return json({ error: "name, url, and type are required" }, { status: 400 });
+  }
+
+  if (!["rss", "blog"].includes(body.type)) {
+    return json({ error: "type must be rss | blog" }, { status: 400 });
+  }
+
+  await env.DB.prepare("INSERT INTO sources (name, url, type) VALUES (?, ?, ?)")
+    .bind(body.name, body.url, body.type)
+    .run();
+
+  return json({ ok: true }, { status: 201 });
+}

@@ -1,0 +1,31 @@
+:root {
+  font-family: sans-serif;
+  color: #111;
+  background: #f6f6f6;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+.page {
+  max-width: 390px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+.card {
+  background: #fff;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.meta {
+  color: #666;
+  font-size: 14px;
+}
