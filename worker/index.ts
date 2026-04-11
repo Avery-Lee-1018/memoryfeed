@@ -20,7 +20,7 @@ export default {
     const url = new URL(request.url);
 
     if (request.method === "GET" && url.pathname === "/api/feed/today") {
-      return handleGetFeedToday(env);
+      return handleGetFeedToday(url, env);
     }
     if (request.method === "POST" && url.pathname === "/api/feed/replacement") {
       return handlePostFeedReplacement(request, env);
@@ -43,8 +43,13 @@ export default {
   }
 } satisfies ExportedHandler<Env>;
 
-async function handleGetFeedToday(env: Env) {
-  const today = new Date().toISOString().slice(0, 10);
+function getDateParamOrToday(value: string | null): string {
+  if (!value) return new Date().toISOString().slice(0, 10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(value) ? value : new Date().toISOString().slice(0, 10);
+}
+
+async function handleGetFeedToday(url: URL, env: Env) {
+  const targetDate = getDateParamOrToday(url.searchParams.get("date"));
   const result = await env.DB.prepare(`
     SELECT i.id, i.title, i.url, i.summary, i.thumbnail_url,
            s.name AS sourceName, s.type AS sourceType,
@@ -54,15 +59,15 @@ async function handleGetFeedToday(env: Env) {
     LEFT JOIN notes n ON n.item_id = i.id
     WHERE i.shown_date = ?
     LIMIT 3
-  `).bind(today).all();
+  `).bind(targetDate).all();
 
-  return json({ date: today, items: result.results ?? [] });
+  return json({ date: targetDate, items: result.results ?? [] });
 }
 
 async function handlePostFeedReplacement(request: Request, env: Env) {
-  let body: { excludeItemIds?: number[] };
+  let body: { excludeItemIds?: number[]; date?: string };
   try {
-    body = (await request.json()) as { excludeItemIds?: number[] };
+    body = (await request.json()) as { excludeItemIds?: number[]; date?: string };
   } catch {
     return json({ error: "Invalid JSON body" }, { status: 400 });
   }
@@ -74,7 +79,7 @@ async function handlePostFeedReplacement(request: Request, env: Env) {
   const placeholders = excludeItemIds.map(() => "?").join(", ");
   const exclusionClause =
     excludeItemIds.length > 0 ? `AND i.id NOT IN (${placeholders})` : "";
-  const today = new Date().toISOString().slice(0, 10);
+  const targetDate = getDateParamOrToday(body.date ?? null);
 
   const stmt = env.DB.prepare(
     `
@@ -85,16 +90,16 @@ async function handlePostFeedReplacement(request: Request, env: Env) {
     JOIN sources s ON i.source_id = s.id
     LEFT JOIN notes n ON n.item_id = i.id
     WHERE i.status = 'active'
+      AND i.shown_date = ?
       ${exclusionClause}
-    ORDER BY CASE WHEN i.shown_date = ? THEN 0 ELSE 1 END,
-             i.last_seen_at IS NULL DESC,
+    ORDER BY i.last_seen_at IS NULL DESC,
              i.last_seen_at ASC,
              i.id DESC
     LIMIT 1
   `
   );
 
-  const replacement = await stmt.bind(...excludeItemIds, today).first();
+  const replacement = await stmt.bind(targetDate, ...excludeItemIds).first();
   return json({ item: replacement ?? null });
 }
 
