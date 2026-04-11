@@ -1,8 +1,6 @@
-import { useState } from "react";
-import { Card, CardContent, CardFooter, CardHeader } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
+import { useState, useRef } from "react";
+import { Card, CardContent, CardHeader } from "@/components/ui/card";
 
-// fallback: /public/thumbnails/ 에 01.png, 02.png, 03.png 저장 필요
 const FALLBACK_THUMBNAILS = [
   "/thumbnails/01.png",
   "/thumbnails/02.png",
@@ -15,15 +13,14 @@ export type FeedItem = {
   url: string;
   summary?: string | null;
   thumbnail_url?: string | null;
+  note?: string | null;
   sourceName: string;
   sourceType: "rss" | "blog";
 };
 
-type Props = FeedItem & {
-  index?: number;
-  onKeep: (id: number) => void;
-  onSkip: (id: number) => void;
-};
+type SaveState = "idle" | "editing" | "saving" | "saved";
+
+type Props = FeedItem & { index?: number };
 
 export default function FeedCard({
   id,
@@ -31,14 +28,32 @@ export default function FeedCard({
   url,
   summary,
   thumbnail_url,
+  note,
   sourceName,
-  sourceType,
   index = 0,
-  onKeep,
-  onSkip,
 }: Props) {
   const [expanded, setExpanded] = useState(false);
+  const [memoOpen, setMemoOpen] = useState(false);
+  const [memoValue, setMemoValue] = useState(note ?? "");
+  const [saveState, setSaveState] = useState<SaveState>("idle");
+  const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const thumbnail = thumbnail_url ?? FALLBACK_THUMBNAILS[index % 3];
+
+  const handleMemoChange = (value: string) => {
+    setMemoValue(value);
+    setSaveState("editing");
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(async () => {
+      setSaveState("saving");
+      await fetch(`/api/notes/${id}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ content: value }),
+      });
+      setSaveState("saved");
+      setTimeout(() => setSaveState("idle"), 2000);
+    }, 800);
+  };
 
   return (
     <Card className="w-full overflow-hidden rounded-2xl border-0 shadow-sm">
@@ -49,10 +64,7 @@ export default function FeedCard({
 
       {/* Header */}
       <CardHeader className="pb-2 pt-4">
-        <p className="flex items-center gap-1 text-xs text-muted-foreground">
-          <i className={sourceType === "rss" ? "ri-rss-line" : "ri-links-line"} />
-          {sourceName}
-        </p>
+        <p className="text-xs text-muted-foreground">{sourceName}</p>
         <h2 className="line-clamp-2 text-base font-semibold leading-snug tracking-tight">
           {title}
         </h2>
@@ -60,14 +72,14 @@ export default function FeedCard({
 
       {/* Highlight */}
       {summary && (
-        <CardContent className="pb-2 pt-0">
-          <p className={`text-sm text-muted-foreground ${expanded ? "" : "line-clamp-3"}`}>
+        <CardContent className="pb-0 pt-0">
+          <p className={`text-sm text-muted-foreground/80 ${expanded ? "" : "line-clamp-4"}`}>
             {summary}
           </p>
-          {!expanded && summary.length > 120 && (
+          {!expanded && summary.length > 160 && (
             <button
               onClick={() => setExpanded(true)}
-              className="mt-1 text-xs text-foreground/50 hover:text-foreground/80"
+              className="mt-1 text-xs text-muted-foreground/50 hover:text-muted-foreground/80 transition-colors"
             >
               더 보기
             </button>
@@ -76,34 +88,51 @@ export default function FeedCard({
       )}
 
       {/* Actions */}
-      <CardFooter className="flex items-center justify-between px-4 pb-4 pt-2">
-        <Button
-          variant="ghost"
-          size="icon"
-          onClick={() => onSkip(id)}
-          className="h-10 w-10 rounded-full text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
-        >
-          <i className="ri-close-line text-xl" />
-        </Button>
-
+      <CardContent className="flex items-center justify-between pb-4 pt-5">
         <a
           href={url}
           target="_blank"
           rel="noopener noreferrer"
-          className="flex h-10 w-10 items-center justify-center rounded-full text-muted-foreground hover:bg-muted transition-colors"
+          className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
         >
-          <i className="ri-external-link-line text-xl" />
+          <i className="ri-external-link-line" />
+          원문 보기
         </a>
+        <div className="flex items-center gap-2">
+          {saveState === "editing" && (
+            <span className="text-xs text-muted-foreground/50">입력 중...</span>
+          )}
+          {saveState === "saving" && (
+            <span className="text-xs text-muted-foreground/50">저장 중...</span>
+          )}
+          {saveState === "saved" && (
+            <span className="text-xs text-foreground/40">저장됨 ✓</span>
+          )}
+          <button
+            onClick={() => setMemoOpen((v) => !v)}
+            className={`flex items-center gap-1 text-xs transition-colors ${
+              memoOpen || memoValue ? "text-foreground/70" : "text-muted-foreground hover:text-foreground"
+            }`}
+          >
+            <i className="ri-pencil-line" />
+            메모
+            {memoValue && <span className="h-1.5 w-1.5 rounded-full bg-foreground/30" />}
+          </button>
+        </div>
+      </CardContent>
 
-        <Button
-          variant="ghost"
-          size="icon"
-          onClick={() => onKeep(id)}
-          className="h-10 w-10 rounded-full text-muted-foreground hover:bg-primary/10 hover:text-primary"
-        >
-          <i className="ri-check-line text-xl" />
-        </Button>
-      </CardFooter>
+      {/* Memo */}
+      {memoOpen && (
+        <CardContent className="pt-0 pb-4">
+          <textarea
+            className="w-full resize-none rounded-lg border border-border bg-muted/40 p-3 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-ring"
+            rows={4}
+            placeholder={"메모를 남겨보세요\n마크다운 지원: # 제목  **굵게**  - 목록"}
+            value={memoValue}
+            onChange={(e) => handleMemoChange(e.target.value)}
+          />
+        </CardContent>
+      )}
     </Card>
   );
 }
