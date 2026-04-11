@@ -1,14 +1,33 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import FeedCard, { FeedItem } from "@/components/FeedCard";
 import CardSkeleton from "@/components/CardSkeleton";
 
 const SKELETON_MIN_MS = 500;
+
+const TITLE_CANDIDATES = [
+  "기억을 수면 위로 떠올린다",
+  "오늘의 영감을 저장한다",
+  "어제의 인사이트를 다시 꺼낸다",
+  "흘려보낸 아이디어를 다시 붙잡는다",
+  "작은 메모를 오늘의 힌트로 바꾼다",
+  "쌓아둔 링크를 지금의 생각으로 연결한다",
+  "기억의 단서를 오늘의 실행으로 이어간다",
+  "지나친 콘텐츠를 다시 내 편으로 만든다",
+];
 
 const toIsoDate = (date: Date) => date.toISOString().slice(0, 10);
 const shiftDate = (isoDate: string, deltaDays: number) => {
   const d = new Date(`${isoDate}T00:00:00`);
   d.setDate(d.getDate() + deltaDays);
   return toIsoDate(d);
+};
+
+const getTitleForDate = (isoDate: string) => {
+  const seed = isoDate
+    .replaceAll("-", "")
+    .split("")
+    .reduce((acc, cur) => acc + Number(cur), 0);
+  return TITLE_CANDIDATES[seed % TITLE_CANDIDATES.length];
 };
 
 export default function App() {
@@ -55,7 +74,11 @@ export default function App() {
       await new Promise((r) => setTimeout(r, SKELETON_MIN_MS - elapsed));
     }
 
-    setReplacingIds((prev) => { const next = new Set(prev); next.delete(id); return next; });
+    setReplacingIds((prev) => {
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
     setItems((prev) => {
       const targetIndex = prev.findIndex((item) => item.id === id);
       if (targetIndex === -1) return prev;
@@ -74,73 +97,71 @@ export default function App() {
     day: "numeric",
     weekday: "short",
   });
+  const heroTitle = useMemo(() => getTitleForDate(selectedDate), [selectedDate]);
 
   return (
-    <div className="min-h-dvh bg-background">
-      <div className="mx-auto max-w-[1120px] px-8 py-10">
-
-        {/* Header */}
-        <header className="mb-8 flex items-end justify-between">
+    <div className="flex min-h-dvh items-center bg-background px-2 py-6">
+      <div className="mx-auto w-full max-w-[1160px]">
+        <header className="mb-6 flex items-end justify-between px-2">
           <div>
             <p className="text-xs text-muted-foreground">{displayedDate}</p>
-            <h1 className="mt-1 text-xl font-semibold leading-snug tracking-tight">
-              오늘 기억할 콘텐츠를 확인할까요?
-            </h1>
+            <h1 className="mt-1 text-xl font-semibold leading-snug tracking-tight">{heroTitle}</h1>
           </div>
-          <div className="flex items-center gap-1">
-            <button
-              onClick={() => setSelectedDate((prev) => shiftDate(prev, -1))}
-              className="flex h-8 w-8 items-center justify-center rounded-full hover:bg-muted transition-colors text-muted-foreground"
-              aria-label="이전 날짜"
-            >
-              <i className="ri-arrow-left-s-line text-lg" />
-            </button>
-            <button
-              onClick={() => setSelectedDate(todayIso)}
-              disabled={isToday}
-              className="rounded-full border border-border px-2.5 py-1 text-[11px] font-medium text-foreground hover:bg-accent disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-            >
-              TODAY
-            </button>
-            <button
-              onClick={() => setSelectedDate((prev) => shiftDate(prev, 1))}
-              disabled={isToday}
-              className="flex h-8 w-8 items-center justify-center rounded-full hover:bg-muted transition-colors text-muted-foreground disabled:opacity-30 disabled:cursor-not-allowed"
-              aria-label="다음 날짜"
-            >
-              <i className="ri-arrow-right-s-line text-lg" />
-            </button>
-          </div>
+          <button
+            onClick={() => setSelectedDate(todayIso)}
+            disabled={isToday}
+            className="rounded-full border border-border px-2.5 py-1 text-[11px] font-medium text-foreground hover:bg-accent disabled:cursor-not-allowed disabled:opacity-40"
+            aria-label="오늘로 이동"
+          >
+            TODAY
+          </button>
         </header>
 
-        {/* Cards */}
-        {loading ? (
-          <div className="grid grid-cols-3 gap-5">
-            {[0, 1, 2].map((i) => <CardSkeleton key={i} />)}
-          </div>
-        ) : items.length === 0 ? (
-          <EmptyState hasItems={initialItemCount > 0} />
-        ) : (
-          <div className="grid grid-cols-3 gap-5">
-            {items.map((item, i) => (
-              <div key={item.id} className="flex flex-col gap-2">
-                {replacingIds.has(item.id) ? (
-                  <CardSkeleton />
-                ) : (
-                  <FeedCard {...item} index={i} />
-                )}
-                <button
-                  onClick={() => skip(item.id)}
-                  disabled={replacingIds.has(item.id)}
-                  className="text-xs text-muted-foreground/50 hover:text-muted-foreground transition-colors text-center py-1 disabled:opacity-0"
-                >
-                  오늘은 안볼래요
-                </button>
-              </div>
-            ))}
-          </div>
-        )}
+        <div className="flex items-center gap-3">
+          <button
+            onClick={() => setSelectedDate((prev) => shiftDate(prev, -1))}
+            className="flex h-12 w-12 shrink-0 items-center justify-center rounded-full border border-border bg-background text-2xl text-foreground hover:bg-accent"
+            aria-label="이전 날짜"
+          >
+            <i className="ri-arrow-left-s-line" />
+          </button>
 
+          <div className="min-w-0 flex-1">
+            {loading ? (
+              <div className="grid grid-cols-1 gap-5 md:grid-cols-3">
+                {[0, 1, 2].map((i) => (
+                  <CardSkeleton key={i} />
+                ))}
+              </div>
+            ) : items.length === 0 ? (
+              <EmptyState hasItems={initialItemCount > 0} />
+            ) : (
+              <div className="grid grid-cols-1 gap-5 md:grid-cols-3">
+                {items.map((item, i) => (
+                  <div key={item.id} className="flex flex-col gap-2">
+                    {replacingIds.has(item.id) ? <CardSkeleton /> : <FeedCard {...item} index={i} />}
+                    <button
+                      onClick={() => skip(item.id)}
+                      disabled={replacingIds.has(item.id)}
+                      className="text-xs text-muted-foreground/50 hover:text-muted-foreground transition-colors text-center py-1 disabled:opacity-0"
+                    >
+                      오늘은 안볼래요
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <button
+            onClick={() => setSelectedDate((prev) => shiftDate(prev, 1))}
+            disabled={isToday}
+            className="flex h-12 w-12 shrink-0 items-center justify-center rounded-full border border-border bg-background text-2xl text-foreground hover:bg-accent disabled:cursor-not-allowed disabled:opacity-40"
+            aria-label="다음 날짜"
+          >
+            <i className="ri-arrow-right-s-line" />
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -151,7 +172,7 @@ function EmptyState({ hasItems }: { hasItems: boolean }) {
     <div className="flex flex-col items-center gap-2 py-24 text-center">
       <i className="ri-inbox-line text-4xl text-muted-foreground/40" />
       <p className="text-sm text-muted-foreground">
-        {hasItems ? "오늘 카드를 다 봤어요" : "아직 콘텐츠가 없어요"}
+        {hasItems ? "해당 날짜 카드를 다 봤어요" : "해당 날짜 콘텐츠가 없어요"}
       </p>
     </div>
   );
