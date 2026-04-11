@@ -53,8 +53,10 @@ export default function FeedCard({
     return `/api/thumbnail?${params.toString()}`;
   }, [url, thumbnail_url]);
   const [thumbnailSrc, setThumbnailSrc] = useState(resolvedThumbnail);
+  const [imageLoaded, setImageLoaded] = useState(false);
   useEffect(() => {
     setThumbnailSrc(resolvedThumbnail);
+    setImageLoaded(false);
   }, [resolvedThumbnail]);
   const hasMemo = savedMemo.trim().length > 0;
 
@@ -99,14 +101,23 @@ export default function FeedCard({
   return (
     <Card className="w-full overflow-hidden rounded-2xl border-0 shadow-sm">
       {/* Thumbnail */}
-      <div className="h-[201px] w-full overflow-hidden">
+      <div className="relative h-[201px] w-full overflow-hidden">
+        {!imageLoaded && (
+          <div className="absolute inset-0 animate-pulse bg-muted/50" />
+        )}
         <img
           src={thumbnailSrc}
           alt=""
-          className="h-full w-full object-cover"
+          className={`h-full w-full object-cover transition-opacity duration-300 ${
+            imageLoaded ? "opacity-100" : "opacity-0"
+          }`}
+          loading="eager"
+          decoding="async"
           onError={() => {
             if (thumbnailSrc !== fallbackThumbnail) setThumbnailSrc(fallbackThumbnail);
+            else setImageLoaded(true);
           }}
+          onLoad={() => setImageLoaded(true)}
         />
       </div>
 

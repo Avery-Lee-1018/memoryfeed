@@ -16,11 +16,11 @@ const json = (data: unknown, init: ResponseInit = {}) =>
   });
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     if (request.method === "GET" && url.pathname === "/api/thumbnail") {
-      return handleGetThumbnail(url);
+      return handleGetThumbnail(request, url, ctx);
     }
     if (request.method === "GET" && url.pathname === "/api/feed/today") {
       return handleGetFeedToday(url, env);
@@ -50,7 +50,7 @@ export default {
   }
 } satisfies ExportedHandler<Env>;
 
-async function handleGetThumbnail(url: URL) {
+async function handleGetThumbnail(request: Request, url: URL, ctx: ExecutionContext) {
   const pageUrl = url.searchParams.get("pageUrl");
   const imageUrl = url.searchParams.get("imageUrl");
 
@@ -58,10 +58,20 @@ async function handleGetThumbnail(url: URL) {
     return new Response("Bad Request", { status: 400 });
   }
 
+  const cache = caches.default;
+  const cacheKey = new Request(request.url, { method: "GET" });
+  const cached = await cache.match(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
   // 1) Prefer explicit imageUrl if provided and reachable.
   if (imageUrl && /^https?:\/\//i.test(imageUrl)) {
     const direct = await fetchImage(imageUrl, pageUrl);
-    if (direct) return direct;
+    if (direct) {
+      ctx.waitUntil(cache.put(cacheKey, direct.clone()));
+      return direct;
+    }
   }
 
   // 2) Resolve OG/Twitter image from page HTML.
@@ -93,9 +103,24 @@ async function handleGetThumbnail(url: URL) {
       const ogImage = extractMetaImage(html, pageUrl);
       if (ogImage) {
         const ogResult = await fetchImage(ogImage, pageUrl);
-        if (ogResult) return ogResult;
+        if (ogResult) {
+          ctx.waitUntil(cache.put(cacheKey, ogResult.clone()));
+          return ogResult;
+        }
       }
     }
+  }
+
+  // Last fallback: site favicon (still domain-specific) to avoid repeated generic placeholder.
+  try {
+    const faviconUrl = new URL("/favicon.ico", pageUrl).toString();
+    const favicon = await fetchImage(faviconUrl, pageUrl);
+    if (favicon) {
+      ctx.waitUntil(cache.put(cacheKey, favicon.clone()));
+      return favicon;
+    }
+  } catch {
+    // no-op
   }
 
   return new Response("Not Found", { status: 404 });
