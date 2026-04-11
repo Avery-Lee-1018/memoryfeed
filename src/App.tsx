@@ -15,7 +15,12 @@ const TITLE_CANDIDATES = [
   "지나친 콘텐츠를 다시 내 편으로 만든다",
 ];
 
-const toIsoDate = (date: Date) => date.toISOString().slice(0, 10);
+const toIsoDate = (date: Date) => {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+};
 const shiftDate = (isoDate: string, deltaDays: number) => {
   const d = new Date(`${isoDate}T00:00:00`);
   d.setDate(d.getDate() + deltaDays);
