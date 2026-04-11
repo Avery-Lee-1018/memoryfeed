@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { marked } from "marked";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 
@@ -46,7 +46,17 @@ export default function FeedCard({
   const [savedMemo, setSavedMemo] = useState(note ?? "");
   const [saving, setSaving] = useState(false);
   const fallbackThumbnail = FALLBACK_THUMBNAILS[index % 3];
-  const [thumbnailSrc, setThumbnailSrc] = useState(thumbnail_url || fallbackThumbnail);
+  const resolvedThumbnail = useMemo(() => {
+    if (!thumbnail_url) return fallbackThumbnail;
+    if (/^https?:\/\//i.test(thumbnail_url)) {
+      return `/api/thumbnail?url=${encodeURIComponent(thumbnail_url)}`;
+    }
+    return thumbnail_url;
+  }, [thumbnail_url, fallbackThumbnail]);
+  const [thumbnailSrc, setThumbnailSrc] = useState(resolvedThumbnail);
+  useEffect(() => {
+    setThumbnailSrc(resolvedThumbnail);
+  }, [resolvedThumbnail]);
   const hasMemo = savedMemo.trim().length > 0;
 
   const handleSave = async () => {

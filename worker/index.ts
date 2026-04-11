@@ -19,6 +19,9 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
+    if (request.method === "GET" && url.pathname === "/api/thumbnail") {
+      return handleGetThumbnail(url);
+    }
     if (request.method === "GET" && url.pathname === "/api/feed/today") {
       return handleGetFeedToday(url, env);
     }
@@ -46,6 +49,35 @@ export default {
     return env.ASSETS.fetch(request);
   }
 } satisfies ExportedHandler<Env>;
+
+async function handleGetThumbnail(url: URL) {
+  const rawUrl = url.searchParams.get("url");
+  if (!rawUrl || !/^https?:\/\//i.test(rawUrl)) {
+    return new Response("Bad Request", { status: 400 });
+  }
+
+  const upstream = await fetch(rawUrl, {
+    headers: {
+      accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
+    },
+    cf: {
+      cacheEverything: true,
+      cacheTtl: 60 * 60 * 12
+    }
+  });
+
+  if (!upstream.ok || !upstream.body) {
+    return new Response("Not Found", { status: 404 });
+  }
+
+  return new Response(upstream.body, {
+    status: 200,
+    headers: {
+      "content-type": upstream.headers.get("content-type") || "image/jpeg",
+      "cache-control": "public, max-age=43200"
+    }
+  });
+}
 
 function getDateParamOrToday(value: string | null): string {
   if (!value) return new Date().toISOString().slice(0, 10);
