@@ -1,4 +1,4 @@
-import { AnimatePresence, motion } from "framer-motion";
+import { motion } from "framer-motion";
 import { useMemo } from "react";
 
 // ── Full shape pool (8 shapes) ───────────────────────────────────────────────
@@ -35,6 +35,13 @@ type Stamp = {
   zIndex: number;
 };
 
+const SAFE_ZONES = [
+  { leftMin: 2, leftMax: 16, topMin: 4, topMax: 18 },
+  { leftMin: 84, leftMax: 98, topMin: 4, topMax: 18 },
+  { leftMin: 4, leftMax: 14, topMin: 18, topMax: 30 },
+  { leftMin: 86, leftMax: 96, topMin: 18, topMax: 30 },
+] as const;
+
 function buildStamps(dateKey: string): Stamp[] {
   // Pick 3 unique shapes from pool (deterministic per dateKey)
   const stampCount = 3;
@@ -46,30 +53,30 @@ function buildStamps(dateKey: string): Stamp[] {
     picked.push(pool.splice(idx, 1)[0]);
   }
 
+  const zonePool = [...SAFE_ZONES];
+  const pickedZones: (typeof SAFE_ZONES)[number][] = [];
+  while (pickedZones.length < stampCount && zonePool.length > 0) {
+    const idx = Math.floor(rand(dateKey, si++) * zonePool.length);
+    pickedZones.push(zonePool.splice(idx, 1)[0]);
+  }
+
   return picked.map((shape, i) => {
     const r = (n: number) => rand(dateKey, i * 30 + n + 50);
-
-    // x-position (edge-biased, stamp-like)
-    const leftRaw = r(0);
-    const left =
-      leftRaw < 0.5
-        ? 4 + leftRaw * 2 * 22
-        : 74 + (leftRaw - 0.5) * 2 * 22;
-
-    // y-position (upper/mid visual band)
-    const top = 8 + r(1) * 56;
+    const zone = pickedZones[i] ?? SAFE_ZONES[i % SAFE_ZONES.length];
+    const left = zone.leftMin + r(0) * (zone.leftMax - zone.leftMin);
+    const top = zone.topMin + r(1) * (zone.topMax - zone.topMin);
 
     // z-position represented as deterministic layer order
-    const zIndex = 1 + Math.floor(r(2) * 5);
+    const zIndex = 1 + Math.floor(r(2) * 2);
 
-    // size: 60–150 px
-    const size = 60 + r(3) * 90;
+    // size: 54–116 px
+    const size = 54 + r(3) * 62;
 
-    // rotation: -36..+36 deg
-    const rotate = r(4) * 72 - 36;
+    // rotation: -26..+26 deg
+    const rotate = r(4) * 52 - 26;
 
-    // opacity: 0.46..0.78
-    const opacity = 0.46 + r(5) * 0.32;
+    // opacity: 0.42..0.68
+    const opacity = 0.42 + r(5) * 0.26;
 
     return {
       ...shape,
@@ -88,22 +95,22 @@ type Props = { show: boolean; dateKey: string };
 
 export default function MemoShapes({ show, dateKey }: Props) {
   const stamps = useMemo(() => buildStamps(dateKey), [dateKey]);
+  if (!show) return null;
 
   return (
-    <AnimatePresence>
-      {show && stamps.map((stamp, i) => (
+    <>
+      {stamps.map((stamp, i) => (
         <motion.img
           key={`memo-stamp-${dateKey}-${stamp.label}`}
           src={stamp.src}
           alt=""
           aria-hidden
-          initial={{ opacity: 0, scale: 0.45, rotate: stamp.rotate - 20 }}
+          initial={{ opacity: 0, scale: 0.55, rotate: stamp.rotate - 12 }}
           animate={{ opacity: stamp.opacity, scale: 1, rotate: stamp.rotate }}
-          exit={{ opacity: 0, scale: 0.5, rotate: stamp.rotate + 10 }}
           transition={{
-            duration: 0.55,
-            delay: i * 0.1,
-            ease: [0.34, 1.56, 0.64, 1],
+            duration: 0.4,
+            delay: i * 0.08,
+            ease: "easeOut",
           }}
           style={{
             position: "fixed",
@@ -118,6 +125,6 @@ export default function MemoShapes({ show, dateKey }: Props) {
           }}
         />
       ))}
-    </AnimatePresence>
+    </>
   );
 }
