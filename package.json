@@ -14,15 +14,26 @@
     "d1:migrate:remote": "wrangler d1 migrations apply memory_feed --remote"
   },
   "dependencies": {
+    "@radix-ui/react-slot": "^1.2.4",
+    "@tailwindcss/vite": "^4.2.2",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "lucide-react": "^1.8.0",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "remixicon": "^4.9.1",
+    "tailwind-merge": "^3.5.0",
+    "tailwindcss-animate": "^1.0.7"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260405.0",
     "@types/react": "^18.3.21",
     "@types/react-dom": "^18.3.7",
     "@vitejs/plugin-react": "^4.4.1",
+    "autoprefixer": "^10.4.27",
     "concurrently": "^9.2.1",
+    "postcss": "^8.5.9",
+    "tailwindcss": "^3.4.17",
     "typescript": "^5.7.3",
     "vite": "^5.4.19",
     "wrangler": "^4.11.1"
