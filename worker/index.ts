@@ -207,6 +207,7 @@ async function handleGetFeedToday(url: URL, env: Env) {
       LEFT JOIN notes n ON n.item_id = i.id
       WHERE i.status = 'active'
         AND (i.shown_date IS NULL OR i.shown_date != ?)
+        AND (n.content IS NULL OR trim(n.content) = '')
         ${exclusion}
       ORDER BY RANDOM()
       LIMIT ?
@@ -248,6 +249,7 @@ async function handlePostFeedReplacement(request: Request, env: Env) {
     LEFT JOIN notes n ON n.item_id = i.id
     WHERE i.status = 'active'
       AND (i.shown_date IS NULL OR i.shown_date != ?)
+      AND (n.content IS NULL OR trim(n.content) = '')
       ${exclusionClause}
     ORDER BY RANDOM()
     LIMIT 1
@@ -260,7 +262,17 @@ async function handlePostFeedReplacement(request: Request, env: Env) {
       .bind(targetDate, replacement.id)
       .run();
     if (Number.isInteger(body.replaceItemId)) {
-      await env.DB.prepare("UPDATE items SET shown_date = NULL WHERE id = ?")
+      await env.DB.prepare(`
+        UPDATE items
+        SET shown_date = NULL
+        WHERE id = ?
+          AND NOT EXISTS (
+            SELECT 1
+            FROM notes n
+            WHERE n.item_id = items.id
+              AND trim(n.content) != ''
+          )
+      `)
         .bind(body.replaceItemId)
         .run();
     }

@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useState } from "react";
-import { marked } from "marked";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 
 const FALLBACK_THUMBNAILS = [
@@ -24,8 +23,6 @@ type Props = FeedItem & {
   onMemoSaved?: () => void;
   onMemoDeleted?: () => void;
 };
-
-marked.setOptions({ breaks: true });
 
 export default function FeedCard({
   id,
@@ -179,7 +176,7 @@ export default function FeedCard({
               <textarea
                 className="w-full resize-none rounded-lg border border-border bg-muted/40 p-3 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-ring"
                 rows={4}
-                placeholder={"메모를 남겨보세요\n마크다운 지원: # 제목  **굵게**  - 목록"}
+                placeholder={"읽고 떠오른 것들을 모두 남겨 주세요.\n큰 생각, 작은 생각 모두 괜찮아요."}
                 value={memoValue}
                 onChange={(e) => setMemoValue(e.target.value)}
                 autoFocus
@@ -215,9 +212,10 @@ export default function FeedCard({
           ) : (
             <div className="relative group">
               <div
-                className="prose prose-sm max-w-none text-sm text-foreground/80 rounded-lg bg-muted/30 p-3"
-                dangerouslySetInnerHTML={{ __html: marked.parse(savedMemo) as string }}
-              />
+                className="max-w-none whitespace-pre-wrap break-words text-sm text-foreground/80 rounded-lg bg-muted/30 p-3"
+              >
+                {savedMemo}
+              </div>
               <div className="absolute top-2 right-2 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
                 <button
                   onClick={() => setMemoEditing(true)}
