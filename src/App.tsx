@@ -102,65 +102,63 @@ export default function App() {
   return (
     <div className="flex min-h-dvh items-center bg-background px-2 py-6">
       <div className="mx-auto w-full max-w-[1160px]">
-        <header className="mb-6 flex items-end justify-between px-2">
-          <div>
-            <p className="text-xs text-muted-foreground">{displayedDate}</p>
-            <h1 className="mt-1 text-xl font-semibold leading-snug tracking-tight">{heroTitle}</h1>
+        <header className="mb-6 px-2">
+          <p className="text-xs text-muted-foreground">{displayedDate}</p>
+          <div className="mt-1 flex items-center gap-2">
+            <h1 className="text-xl font-semibold leading-snug tracking-tight">{heroTitle}</h1>
+            <div className="flex items-center gap-0.5 ml-1">
+              <button
+                onClick={() => setSelectedDate((prev) => shiftDate(prev, -1))}
+                className="flex h-7 w-7 items-center justify-center rounded-full text-lg text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
+                aria-label="이전 날짜"
+              >
+                <i className="ri-arrow-left-s-line" />
+              </button>
+              <button
+                onClick={() => setSelectedDate((prev) => shiftDate(prev, 1))}
+                disabled={isToday}
+                className="flex h-7 w-7 items-center justify-center rounded-full text-lg text-muted-foreground hover:bg-accent hover:text-foreground transition-colors disabled:cursor-not-allowed disabled:opacity-30"
+                aria-label="다음 날짜"
+              >
+                <i className="ri-arrow-right-s-line" />
+              </button>
+              <button
+                onClick={() => setSelectedDate(todayIso)}
+                disabled={isToday}
+                className="ml-1 rounded-full border border-border px-2.5 py-1 text-[11px] font-medium text-foreground hover:bg-accent disabled:cursor-not-allowed disabled:opacity-40"
+                aria-label="오늘로 이동"
+              >
+                TODAY
+              </button>
+            </div>
           </div>
-          <button
-            onClick={() => setSelectedDate(todayIso)}
-            disabled={isToday}
-            className="rounded-full border border-border px-2.5 py-1 text-[11px] font-medium text-foreground hover:bg-accent disabled:cursor-not-allowed disabled:opacity-40"
-            aria-label="오늘로 이동"
-          >
-            TODAY
-          </button>
         </header>
 
-        <div className="flex items-center gap-3">
-          <button
-            onClick={() => setSelectedDate((prev) => shiftDate(prev, -1))}
-            className="flex h-12 w-12 shrink-0 items-center justify-center rounded-full border border-border bg-background text-2xl text-foreground hover:bg-accent"
-            aria-label="이전 날짜"
-          >
-            <i className="ri-arrow-left-s-line" />
-          </button>
-
-          <div className="min-w-0 flex-1">
-            {loading ? (
-              <div className="grid grid-cols-1 gap-5 md:grid-cols-3">
-                {[0, 1, 2].map((i) => (
-                  <CardSkeleton key={i} />
-                ))}
-              </div>
-            ) : items.length === 0 ? (
-              <EmptyState hasItems={initialItemCount > 0} />
-            ) : (
-              <div className="grid grid-cols-1 gap-5 md:grid-cols-3">
-                {items.map((item, i) => (
-                  <div key={item.id} className="flex flex-col gap-2">
-                    {replacingIds.has(item.id) ? <CardSkeleton /> : <FeedCard {...item} index={i} />}
-                    <button
-                      onClick={() => skip(item.id)}
-                      disabled={replacingIds.has(item.id)}
-                      className="text-xs text-muted-foreground/50 hover:text-muted-foreground transition-colors text-center py-1 disabled:opacity-0"
-                    >
-                      오늘은 안볼래요
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-
-          <button
-            onClick={() => setSelectedDate((prev) => shiftDate(prev, 1))}
-            disabled={isToday}
-            className="flex h-12 w-12 shrink-0 items-center justify-center rounded-full border border-border bg-background text-2xl text-foreground hover:bg-accent disabled:cursor-not-allowed disabled:opacity-40"
-            aria-label="다음 날짜"
-          >
-            <i className="ri-arrow-right-s-line" />
-          </button>
+        <div className="min-h-[560px]">
+          {loading ? (
+            <div className="grid grid-cols-1 gap-5 md:grid-cols-3">
+              {[0, 1, 2].map((i) => (
+                <CardSkeleton key={i} />
+              ))}
+            </div>
+          ) : items.length === 0 ? (
+            <EmptyState hasItems={initialItemCount > 0} />
+          ) : (
+            <div className="grid grid-cols-1 gap-5 md:grid-cols-3">
+              {items.map((item, i) => (
+                <div key={item.id} className="flex flex-col gap-2">
+                  {replacingIds.has(item.id) ? <CardSkeleton /> : <FeedCard {...item} index={i} />}
+                  <button
+                    onClick={() => skip(item.id)}
+                    disabled={replacingIds.has(item.id)}
+                    className="text-xs text-muted-foreground/50 hover:text-muted-foreground transition-colors text-center py-1 disabled:opacity-0"
+                  >
+                    오늘은 안볼래요
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       </div>
     </div>

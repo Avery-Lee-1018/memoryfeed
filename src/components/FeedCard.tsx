@@ -1,4 +1,5 @@
-import { useState, useRef } from "react";
+import { useState } from "react";
+import { marked } from "marked";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 
 const FALLBACK_THUMBNAILS = [
@@ -20,6 +21,8 @@ export type FeedItem = {
 
 type Props = FeedItem & { index?: number };
 
+marked.setOptions({ breaks: true });
+
 export default function FeedCard({
   id,
   title,
@@ -32,6 +35,7 @@ export default function FeedCard({
 }: Props) {
   const [expanded, setExpanded] = useState(false);
   const [memoOpen, setMemoOpen] = useState(false);
+  const [memoEditing, setMemoEditing] = useState(false);
   const [memoValue, setMemoValue] = useState(note ?? "");
   const [savedMemo, setSavedMemo] = useState(note ?? "");
   const [saving, setSaving] = useState(false);
@@ -47,15 +51,22 @@ export default function FeedCard({
     });
     setSavedMemo(memoValue);
     setSaving(false);
-    setMemoOpen(false);
+    setMemoEditing(false);
   };
 
-  const handleToggleMemo = () => {
-    if (memoOpen) {
-      // 닫을 때 unsaved 변경사항은 되돌림
+  const handleMemoButtonClick = () => {
+    if (memoOpen && memoEditing) {
+      // Cancel editing — revert unsaved changes
       setMemoValue(savedMemo);
+      setMemoEditing(false);
+      if (!hasMemo) setMemoOpen(false);
+    } else if (memoOpen) {
+      setMemoOpen(false);
+    } else {
+      setMemoOpen(true);
+      // If no saved memo, go directly to edit mode
+      if (!hasMemo) setMemoEditing(true);
     }
-    setMemoOpen((v) => !v);
   };
 
   return (
@@ -102,7 +113,7 @@ export default function FeedCard({
           원문 보기
         </a>
         <button
-          onClick={handleToggleMemo}
+          onClick={handleMemoButtonClick}
           className={`flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium transition-colors ${
             hasMemo
               ? "bg-blue-50 text-blue-600"
@@ -118,29 +129,51 @@ export default function FeedCard({
       {/* Memo */}
       {memoOpen && (
         <CardContent className="pt-0 pb-4 flex flex-col gap-2">
-          <textarea
-            className="w-full resize-none rounded-lg border border-border bg-muted/40 p-3 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-ring"
-            rows={4}
-            placeholder={"메모를 남겨보세요\n마크다운 지원: # 제목  **굵게**  - 목록"}
-            value={memoValue}
-            onChange={(e) => setMemoValue(e.target.value)}
-            autoFocus
-          />
-          <div className="flex items-center justify-end gap-2">
-            <button
-              onClick={handleToggleMemo}
-              className="text-xs text-muted-foreground hover:text-foreground transition-colors px-2 py-1"
-            >
-              취소
-            </button>
-            <button
-              onClick={handleSave}
-              disabled={saving || memoValue === savedMemo}
-              className="rounded-md bg-foreground px-3 py-1.5 text-xs font-medium text-background transition-opacity disabled:opacity-40"
-            >
-              {saving ? "저장 중..." : "저장"}
-            </button>
-          </div>
+          {memoEditing ? (
+            <>
+              <textarea
+                className="w-full resize-none rounded-lg border border-border bg-muted/40 p-3 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-ring"
+                rows={4}
+                placeholder={"메모를 남겨보세요\n마크다운 지원: # 제목  **굵게**  - 목록"}
+                value={memoValue}
+                onChange={(e) => setMemoValue(e.target.value)}
+                autoFocus
+              />
+              <div className="flex items-center justify-end gap-2">
+                <button
+                  onClick={() => {
+                    setMemoValue(savedMemo);
+                    setMemoEditing(false);
+                    if (!hasMemo) setMemoOpen(false);
+                  }}
+                  className="text-xs text-muted-foreground hover:text-foreground transition-colors px-2 py-1"
+                >
+                  취소
+                </button>
+                <button
+                  onClick={handleSave}
+                  disabled={saving || memoValue === savedMemo}
+                  className="rounded-md bg-foreground px-3 py-1.5 text-xs font-medium text-background transition-opacity disabled:opacity-40"
+                >
+                  {saving ? "저장 중..." : "저장"}
+                </button>
+              </div>
+            </>
+          ) : (
+            <div className="relative group">
+              <div
+                className="prose prose-sm max-w-none text-sm text-foreground/80 rounded-lg bg-muted/30 p-3"
+                dangerouslySetInnerHTML={{ __html: marked.parse(savedMemo) as string }}
+              />
+              <button
+                onClick={() => setMemoEditing(true)}
+                className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity flex h-6 w-6 items-center justify-center rounded-full bg-background/80 text-muted-foreground hover:text-foreground shadow-sm"
+                aria-label="메모 수정"
+              >
+                <i className="ri-pencil-line text-xs" />
+              </button>
+            </div>
+          )}
         </CardContent>
       )}
     </Card>
