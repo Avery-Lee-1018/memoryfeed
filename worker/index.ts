@@ -101,9 +101,9 @@ async function handleGetFeedToday(url: URL, env: Env) {
 }
 
 async function handlePostFeedReplacement(request: Request, env: Env) {
-  let body: { excludeItemIds?: number[]; date?: string };
+  let body: { excludeItemIds?: number[]; date?: string; replaceItemId?: number };
   try {
-    body = (await request.json()) as { excludeItemIds?: number[]; date?: string };
+    body = (await request.json()) as { excludeItemIds?: number[]; date?: string; replaceItemId?: number };
   } catch {
     return json({ error: "Invalid JSON body" }, { status: 400 });
   }
@@ -137,6 +137,11 @@ async function handlePostFeedReplacement(request: Request, env: Env) {
     await env.DB.prepare("UPDATE items SET shown_date = ? WHERE id = ?")
       .bind(targetDate, replacement.id)
       .run();
+    if (Number.isInteger(body.replaceItemId)) {
+      await env.DB.prepare("UPDATE items SET shown_date = NULL WHERE id = ?")
+        .bind(body.replaceItemId)
+        .run();
+    }
   }
 
   return json({ item: replacement ?? null });

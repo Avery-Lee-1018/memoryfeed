@@ -74,7 +74,7 @@ export default function App() {
     const res = await fetch("/api/feed/replacement", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ excludeItemIds: currentItemIds, date: selectedDate }),
+      body: JSON.stringify({ excludeItemIds: currentItemIds, date: selectedDate, replaceItemId: id }),
     });
     const data = (await res.json()) as { item?: FeedItem | null };
 
