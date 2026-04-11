@@ -19,7 +19,7 @@ export type FeedItem = {
   sourceType: "rss" | "blog";
 };
 
-type Props = FeedItem & { index?: number };
+type Props = FeedItem & { index?: number; onMemoSaved?: () => void };
 
 marked.setOptions({ breaks: true });
 
@@ -31,7 +31,7 @@ export default function FeedCard({
   thumbnail_url,
   note,
   sourceName,
-  index = 0,
+  onMemoSaved,
 }: Props) {
   const [expanded, setExpanded] = useState(false);
   const [memoOpen, setMemoOpen] = useState(false);
@@ -39,7 +39,7 @@ export default function FeedCard({
   const [memoValue, setMemoValue] = useState(note ?? "");
   const [savedMemo, setSavedMemo] = useState(note ?? "");
   const [saving, setSaving] = useState(false);
-  const thumbnail = thumbnail_url ?? FALLBACK_THUMBNAILS[index % 3];
+  const thumbnail = thumbnail_url ?? FALLBACK_THUMBNAILS[id % 3];
   const hasMemo = savedMemo.trim().length > 0;
 
   const handleSave = async () => {
@@ -52,6 +52,7 @@ export default function FeedCard({
     setSavedMemo(memoValue);
     setSaving(false);
     setMemoEditing(false);
+    if (memoValue.trim()) onMemoSaved?.();
   };
 
   const handleMemoButtonClick = () => {

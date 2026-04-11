@@ -41,6 +41,7 @@ export default function App() {
   const [initialItemCount, setInitialItemCount] = useState(0);
   const [loading, setLoading] = useState(true);
   const [replacingIds, setReplacingIds] = useState<Set<number>>(new Set());
+  const [memoItemIds, setMemoItemIds] = useState<Set<number>>(new Set());
   const [selectedDate, setSelectedDate] = useState(toIsoDate(new Date()));
   const [dateDirection, setDateDirection] = useState(0);
 
@@ -53,6 +54,7 @@ export default function App() {
         setItems(nextItems);
         setInitialItemCount(nextItems.length);
         setReplacingIds(new Set());
+        setMemoItemIds(new Set(nextItems.filter(i => !!i.note?.trim()).map(i => i.id)));
       })
       .catch(console.error)
       .finally(() => setLoading(false));
@@ -198,14 +200,26 @@ export default function App() {
               >
                 {items.map((item, i) => (
                   <div key={item.id} className="flex flex-col gap-2">
-                    {replacingIds.has(item.id) ? <CardSkeleton /> : <FeedCard {...item} index={i} />}
-                    <button
-                      onClick={() => skip(item.id)}
-                      disabled={replacingIds.has(item.id)}
-                      className="text-xs text-muted-foreground/50 hover:text-muted-foreground transition-colors text-center py-1 disabled:opacity-0"
-                    >
-                      오늘은 안볼래요
-                    </button>
+                    {replacingIds.has(item.id) ? (
+                      <CardSkeleton />
+                    ) : (
+                      <FeedCard
+                        {...item}
+                        index={i}
+                        onMemoSaved={() =>
+                          setMemoItemIds((prev) => new Set(prev).add(item.id))
+                        }
+                      />
+                    )}
+                    {!memoItemIds.has(item.id) && (
+                      <button
+                        onClick={() => skip(item.id)}
+                        disabled={replacingIds.has(item.id)}
+                        className="text-xs text-muted-foreground/50 hover:text-muted-foreground transition-colors text-center py-1 disabled:opacity-0"
+                      >
+                        오늘은 안볼래요
+                      </button>
+                    )}
                   </div>
                 ))}
               </motion.div>
