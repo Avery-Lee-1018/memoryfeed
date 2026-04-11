@@ -117,5 +117,6 @@ body {
   }
   body {
     @apply bg-background text-foreground;
+    font-family: 'Manrope', 'Pretendard', -apple-system, sans-serif;
   }
 }
