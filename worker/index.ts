@@ -51,14 +51,62 @@ export default {
 } satisfies ExportedHandler<Env>;
 
 async function handleGetThumbnail(url: URL) {
-  const rawUrl = url.searchParams.get("url");
-  if (!rawUrl || !/^https?:\/\//i.test(rawUrl)) {
+  const pageUrl = url.searchParams.get("pageUrl");
+  const imageUrl = url.searchParams.get("imageUrl");
+
+  if (!pageUrl || !/^https?:\/\//i.test(pageUrl)) {
     return new Response("Bad Request", { status: 400 });
   }
 
-  const upstream = await fetch(rawUrl, {
+  // 1) Prefer explicit imageUrl if provided and reachable.
+  if (imageUrl && /^https?:\/\//i.test(imageUrl)) {
+    const direct = await fetchImage(imageUrl, pageUrl);
+    if (direct) return direct;
+  }
+
+  // 2) Resolve OG/Twitter image from page HTML.
+  const pageRes = await fetch(pageUrl, {
     headers: {
-      accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
+      "user-agent": "Mozilla/5.0 (compatible; MemoryFeedBot/1.0)",
+      accept: "text/html,application/xhtml+xml"
+    },
+    cf: {
+      cacheEverything: true,
+      cacheTtl: 60 * 30
+    }
+  });
+
+  if (pageRes.ok) {
+    const contentType = pageRes.headers.get("content-type") || "";
+    if (contentType.startsWith("image/") && pageRes.body) {
+      return new Response(pageRes.body, {
+        status: 200,
+        headers: {
+          "content-type": contentType,
+          "cache-control": "public, max-age=43200"
+        }
+      });
+    }
+
+    if (contentType.includes("text/html")) {
+      const html = await pageRes.text();
+      const ogImage = extractMetaImage(html, pageUrl);
+      if (ogImage) {
+        const ogResult = await fetchImage(ogImage, pageUrl);
+        if (ogResult) return ogResult;
+      }
+    }
+  }
+
+  return new Response("Not Found", { status: 404 });
+}
+
+async function fetchImage(targetUrl: string, referer?: string) {
+  const upstream = await fetch(targetUrl, {
+    headers: {
+      "user-agent": "Mozilla/5.0 (compatible; MemoryFeedBot/1.0)",
+      accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+      ...(referer ? { referer } : {})
     },
     cf: {
       cacheEverything: true,
@@ -66,17 +114,36 @@ async function handleGetThumbnail(url: URL) {
     }
   });
 
-  if (!upstream.ok || !upstream.body) {
-    return new Response("Not Found", { status: 404 });
+  const contentType = upstream.headers.get("content-type") || "";
+  if (!upstream.ok || !upstream.body || !contentType.startsWith("image/")) {
+    return null;
   }
 
   return new Response(upstream.body, {
     status: 200,
     headers: {
-      "content-type": upstream.headers.get("content-type") || "image/jpeg",
+      "content-type": contentType,
       "cache-control": "public, max-age=43200"
     }
   });
+}
+
+function extractMetaImage(html: string, pageUrl: string): string | null {
+  const ogMatch =
+    html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["'][^>]*>/i) ||
+    html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["'][^>]*>/i);
+  const twMatch =
+    html.match(/<meta[^>]+name=["']twitter:image(?::src)?["'][^>]+content=["']([^"']+)["'][^>]*>/i) ||
+    html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+name=["']twitter:image(?::src)?["'][^>]*>/i);
+
+  const found = ogMatch?.[1] || twMatch?.[1];
+  if (!found) return null;
+
+  try {
+    return new URL(found, pageUrl).toString();
+  } catch {
+    return null;
+  }
 }
 
 function getDateParamOrToday(value: string | null): string {
@@ -97,7 +164,37 @@ async function handleGetFeedToday(url: URL, env: Env) {
     LIMIT 3
   `).bind(targetDate).all();
 
-  return json({ date: targetDate, items: result.results ?? [] });
+  const items = (result.results ?? []) as Record<string, unknown>[];
+
+  // Always guarantee 3 items — auto-fill from pool if short
+  if (items.length < 3) {
+    const needed = 3 - items.length;
+    const existingIds = items.map(i => i.id as number);
+    const exclusion = existingIds.length > 0
+      ? `AND i.id NOT IN (${existingIds.map(() => "?").join(", ")})`
+      : "";
+    const fill = await env.DB.prepare(`
+      SELECT i.id, i.title, i.url, i.summary, i.thumbnail_url,
+             s.name AS sourceName, s.type AS sourceType,
+             n.content AS note
+      FROM items i
+      JOIN sources s ON i.source_id = s.id
+      LEFT JOIN notes n ON n.item_id = i.id
+      WHERE i.status = 'active'
+        AND (i.shown_date IS NULL OR i.shown_date != ?)
+        ${exclusion}
+      ORDER BY RANDOM()
+      LIMIT ?
+    `).bind(targetDate, ...existingIds, needed).all();
+
+    for (const extra of (fill.results ?? []) as Record<string, unknown>[]) {
+      await env.DB.prepare("UPDATE items SET shown_date = ? WHERE id = ?")
+        .bind(targetDate, extra.id).run();
+      items.push(extra);
+    }
+  }
+
+  return json({ date: targetDate, items });
 }
 
 async function handlePostFeedReplacement(request: Request, env: Env) {

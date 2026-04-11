@@ -47,12 +47,11 @@ export default function FeedCard({
   const [saving, setSaving] = useState(false);
   const fallbackThumbnail = FALLBACK_THUMBNAILS[index % 3];
   const resolvedThumbnail = useMemo(() => {
-    if (!thumbnail_url) return fallbackThumbnail;
-    if (/^https?:\/\//i.test(thumbnail_url)) {
-      return `/api/thumbnail?url=${encodeURIComponent(thumbnail_url)}`;
-    }
-    return thumbnail_url;
-  }, [thumbnail_url, fallbackThumbnail]);
+    const params = new URLSearchParams();
+    params.set("pageUrl", url);
+    if (thumbnail_url) params.set("imageUrl", thumbnail_url);
+    return `/api/thumbnail?${params.toString()}`;
+  }, [url, thumbnail_url]);
   const [thumbnailSrc, setThumbnailSrc] = useState(resolvedThumbnail);
   useEffect(() => {
     setThumbnailSrc(resolvedThumbnail);

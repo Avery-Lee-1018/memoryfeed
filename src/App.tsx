@@ -91,7 +91,7 @@ export default function App() {
     setItems((prev) => {
       const targetIndex = prev.findIndex((item) => item.id === id);
       if (targetIndex === -1) return prev;
-      if (!data.item) return prev.filter((item) => item.id !== id);
+      if (!data.item) return prev; // no replacement available — keep current items
       const next = [...prev];
       next[targetIndex] = data.item;
       return next;
