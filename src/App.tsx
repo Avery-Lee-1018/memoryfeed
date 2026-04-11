@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { AnimatePresence, motion } from "framer-motion";
 import FeedCard, { FeedItem } from "@/components/FeedCard";
 import CardSkeleton from "@/components/CardSkeleton";
 
@@ -41,6 +42,7 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [replacingIds, setReplacingIds] = useState<Set<number>>(new Set());
   const [selectedDate, setSelectedDate] = useState(toIsoDate(new Date()));
+  const [dateDirection, setDateDirection] = useState(0);
 
   useEffect(() => {
     setLoading(true);
@@ -103,25 +105,46 @@ export default function App() {
     weekday: "short",
   });
   const heroTitle = useMemo(() => getTitleForDate(selectedDate), [selectedDate]);
+  const slideFrom = dateDirection >= 0 ? 20 : -20;
+  const slideTo = -slideFrom;
+
+  const moveDate = (delta: number) => {
+    setDateDirection(delta);
+    setSelectedDate((prev) => shiftDate(prev, delta));
+  };
+
+  const moveToToday = () => {
+    if (isToday) return;
+    setDateDirection(selectedDate < todayIso ? 1 : -1);
+    setSelectedDate(todayIso);
+  };
 
   return (
     <div className="flex min-h-dvh items-center bg-background px-4 py-6">
       <div className="mx-auto w-full max-w-[1160px]">
         <header className="mb-6 flex items-end justify-between">
-          <div>
-            <p className="text-xs text-muted-foreground">{displayedDate}</p>
-            <h1 className="mt-1 text-xl font-semibold leading-snug tracking-tight">{heroTitle}</h1>
-          </div>
+          <AnimatePresence mode="wait" initial={false}>
+            <motion.div
+              key={`title-${selectedDate}`}
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -8 }}
+              transition={{ duration: 0.22, ease: "easeOut" }}
+            >
+              <p className="text-xs text-muted-foreground">{displayedDate}</p>
+              <h1 className="mt-1 text-xl font-semibold leading-snug tracking-tight">{heroTitle}</h1>
+            </motion.div>
+          </AnimatePresence>
           <div className="flex items-center gap-1 pb-0.5">
             <button
-              onClick={() => setSelectedDate((prev) => shiftDate(prev, -1))}
+              onClick={() => moveDate(-1)}
               className="flex h-7 w-7 items-center justify-center rounded-full text-lg text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
               aria-label="이전 날짜"
             >
               <i className="ri-arrow-left-s-line" />
             </button>
             <button
-              onClick={() => setSelectedDate((prev) => shiftDate(prev, 1))}
+              onClick={() => moveDate(1)}
               disabled={isToday}
               className="flex h-7 w-7 items-center justify-center rounded-full text-lg text-muted-foreground hover:bg-accent hover:text-foreground transition-colors disabled:cursor-not-allowed disabled:opacity-30"
               aria-label="다음 날짜"
@@ -129,7 +152,7 @@ export default function App() {
               <i className="ri-arrow-right-s-line" />
             </button>
             <button
-              onClick={() => setSelectedDate(todayIso)}
+              onClick={moveToToday}
               disabled={isToday}
               className="ml-1 rounded-full border border-border px-2.5 py-1 text-[11px] font-medium text-foreground hover:bg-accent disabled:cursor-not-allowed disabled:opacity-40"
               aria-label="오늘로 이동"
@@ -140,30 +163,54 @@ export default function App() {
         </header>
 
         <div className="min-h-[560px]">
-          {loading ? (
-            <div className="grid grid-cols-3 gap-5">
-              {[0, 1, 2].map((i) => (
-                <CardSkeleton key={i} />
-              ))}
-            </div>
-          ) : items.length === 0 ? (
-            <EmptyState hasItems={initialItemCount > 0} />
-          ) : (
-            <div className="grid grid-cols-3 gap-5">
-              {items.map((item, i) => (
-                <div key={item.id} className="flex flex-col gap-2">
-                  {replacingIds.has(item.id) ? <CardSkeleton /> : <FeedCard {...item} index={i} />}
-                  <button
-                    onClick={() => skip(item.id)}
-                    disabled={replacingIds.has(item.id)}
-                    className="text-xs text-muted-foreground/50 hover:text-muted-foreground transition-colors text-center py-1 disabled:opacity-0"
-                  >
-                    오늘은 안볼래요
-                  </button>
-                </div>
-              ))}
-            </div>
-          )}
+          <AnimatePresence mode="wait" initial={false}>
+            {loading ? (
+              <motion.div
+                key={`loading-${selectedDate}`}
+                initial={{ opacity: 0, x: slideFrom }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={{ opacity: 0, x: slideTo }}
+                transition={{ duration: 0.24, ease: "easeOut" }}
+                className="grid grid-cols-3 gap-5"
+              >
+                {[0, 1, 2].map((i) => (
+                  <CardSkeleton key={i} />
+                ))}
+              </motion.div>
+            ) : items.length === 0 ? (
+              <motion.div
+                key={`empty-${selectedDate}`}
+                initial={{ opacity: 0, x: slideFrom }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={{ opacity: 0, x: slideTo }}
+                transition={{ duration: 0.24, ease: "easeOut" }}
+              >
+                <EmptyState hasItems={initialItemCount > 0} />
+              </motion.div>
+            ) : (
+              <motion.div
+                key={`cards-${selectedDate}`}
+                initial={{ opacity: 0, x: slideFrom }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={{ opacity: 0, x: slideTo }}
+                transition={{ duration: 0.24, ease: "easeOut" }}
+                className="grid grid-cols-3 gap-5"
+              >
+                {items.map((item, i) => (
+                  <div key={item.id} className="flex flex-col gap-2">
+                    {replacingIds.has(item.id) ? <CardSkeleton /> : <FeedCard {...item} index={i} />}
+                    <button
+                      onClick={() => skip(item.id)}
+                      disabled={replacingIds.has(item.id)}
+                      className="text-xs text-muted-foreground/50 hover:text-muted-foreground transition-colors text-center py-1 disabled:opacity-0"
+                    >
+                      오늘은 안볼래요
+                    </button>
+                  </div>
+                ))}
+              </motion.div>
+            )}
+          </AnimatePresence>
         </div>
       </div>
     </div>
