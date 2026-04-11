@@ -43,7 +43,7 @@ body {
 
 @layer base {
   :root {
-    --background: oklch(1 0 0);
+    --background: oklch(0.975 0.006 85);
     --foreground: oklch(0.141 0.005 285.823);
     --card: oklch(1 0 0);
     --card-foreground: oklch(0.141 0.005 285.823);

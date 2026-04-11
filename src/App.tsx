@@ -6,14 +6,36 @@ import CardSkeleton from "@/components/CardSkeleton";
 const SKELETON_MIN_MS = 500;
 
 const TITLE_CANDIDATES = [
-  "기억을 수면 위로 떠올린다",
-  "오늘의 영감을 저장한다",
-  "어제의 인사이트를 다시 꺼낸다",
-  "흘려보낸 아이디어를 다시 붙잡는다",
-  "작은 메모를 오늘의 힌트로 바꾼다",
-  "쌓아둔 링크를 지금의 생각으로 연결한다",
-  "기억의 단서를 오늘의 실행으로 이어간다",
-  "지나친 콘텐츠를 다시 내 편으로 만든다",
+  "수면 위로 떠오른 것들",
+  "오늘은 이 셋이면 충분하다",
+  "다시 보게 된 이유가 있다면",
+  "그냥 지나치긴 아쉬운 것들",
+  "익숙한데 낯선 단서들",
+  "오늘따라 오래 남는 문장들",
+  "말없이 붙잡히는 장면들",
+  "조용히 다시 열어본 것들",
+  "지금의 마음에 닿는 기록",
+  "잠깐 멈추게 되는 이유",
+  "한 번 더 읽게 된 조각들",
+  "어제와는 다른 결의 문장",
+  "지나쳤다가 돌아온 생각",
+  "오늘의 속도를 바꾸는 힌트",
+  "문득 다시 붙는 연결들",
+  "가볍게 넘기기 어려운 것",
+  "지금 필요한 온도의 문장",
+  "늦게 도착한 좋은 단서",
+  "한 칸 더 깊어지는 시선",
+  "의외로 오래 머무는 장면",
+  "잊힌 줄 알았던 감각들",
+  "다시 보면 달라지는 조각",
+  "오늘의 맥락을 깨우는 것",
+  "잠깐의 정적을 만드는 글",
+  "익숙함 바깥의 작은 힌트",
+  "지금 꺼내기 좋은 기억",
+  "어쩐지 오늘 맞는 흐름",
+  "생각보다 가까이 있던 단서",
+  "한 번쯤 멈춰 볼 이유",
+  "계속 남아 있던 여운",
 ];
 
 const toIsoDate = (date: Date) => {
@@ -29,11 +51,21 @@ const shiftDate = (isoDate: string, deltaDays: number) => {
 };
 
 const getTitleForDate = (isoDate: string) => {
-  const seed = isoDate
-    .replaceAll("-", "")
-    .split("")
-    .reduce((acc, cur) => acc + Number(cur), 0);
-  return TITLE_CANDIDATES[seed % TITLE_CANDIDATES.length];
+  const hashDate = (date: string) =>
+    date
+      .replaceAll("-", "")
+      .split("")
+      .reduce((acc, cur, idx) => acc + Number(cur) * (idx + 3), 17);
+
+  const prevDate = shiftDate(isoDate, -1);
+  let idx = hashDate(isoDate) % TITLE_CANDIDATES.length;
+  const prevIdx = hashDate(prevDate) % TITLE_CANDIDATES.length;
+
+  if (idx === prevIdx) {
+    idx = (idx + 1) % TITLE_CANDIDATES.length;
+  }
+
+  return TITLE_CANDIDATES[idx];
 };
 
 export default function App() {
