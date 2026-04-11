@@ -131,9 +131,9 @@ export default function App() {
   };
 
   return (
-    <div className="flex min-h-dvh items-center bg-background px-4 py-6">
+    <div className="flex min-h-dvh items-start bg-background px-3 py-4 md:items-center md:px-4 md:py-6">
       <div className="mx-auto w-full max-w-[1160px]">
-        <header className="mb-6 flex items-end justify-between">
+        <header className="mb-5 flex flex-col gap-3 sm:mb-6 sm:flex-row sm:items-end sm:justify-between">
           <AnimatePresence mode="wait" initial={false}>
             <motion.div
               key={`title-${selectedDate}`}
@@ -143,13 +143,13 @@ export default function App() {
               transition={{ duration: 0.22, ease: "easeOut" }}
             >
               <p className="text-xs text-muted-foreground">{displayedDate}</p>
-              <h1 className="mt-1 text-xl font-semibold leading-snug tracking-tight">{heroTitle}</h1>
+              <h1 className="mt-1 text-lg font-semibold leading-snug tracking-tight sm:text-xl">{heroTitle}</h1>
             </motion.div>
           </AnimatePresence>
-          <div className="flex items-center gap-1 pb-0.5">
+          <div className="flex items-center gap-1 self-start pb-0.5 sm:self-auto">
             <button
               onClick={() => moveDate(-1)}
-              className="flex h-7 w-7 items-center justify-center rounded-full text-lg text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
+              className="flex h-9 w-9 items-center justify-center rounded-full text-xl text-muted-foreground hover:bg-accent hover:text-foreground transition-colors sm:h-7 sm:w-7 sm:text-lg"
               aria-label="이전 날짜"
             >
               <i className="ri-arrow-left-s-line" />
@@ -157,7 +157,7 @@ export default function App() {
             <button
               onClick={() => moveDate(1)}
               disabled={isToday}
-              className="flex h-7 w-7 items-center justify-center rounded-full text-lg text-muted-foreground hover:bg-accent hover:text-foreground transition-colors disabled:cursor-not-allowed disabled:opacity-30"
+              className="flex h-9 w-9 items-center justify-center rounded-full text-xl text-muted-foreground hover:bg-accent hover:text-foreground transition-colors disabled:cursor-not-allowed disabled:opacity-30 sm:h-7 sm:w-7 sm:text-lg"
               aria-label="다음 날짜"
             >
               <i className="ri-arrow-right-s-line" />
@@ -173,7 +173,7 @@ export default function App() {
           </div>
         </header>
 
-        <div className="min-h-[560px]">
+        <div className="min-h-[520px] sm:min-h-[560px]">
           <AnimatePresence mode="wait" initial={false}>
             {loading ? (
               <motion.div
@@ -182,7 +182,7 @@ export default function App() {
                 animate={{ opacity: 1, x: 0 }}
                 exit={{ opacity: 0, x: slideTo }}
                 transition={{ duration: 0.24, ease: "easeOut" }}
-                className="grid grid-cols-3 gap-5"
+                className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 sm:gap-5"
               >
                 {[0, 1, 2].map((i) => (
                   <CardSkeleton key={i} />
@@ -205,7 +205,7 @@ export default function App() {
                 animate={{ opacity: 1, x: 0 }}
                 exit={{ opacity: 0, x: slideTo }}
                 transition={{ duration: 0.24, ease: "easeOut" }}
-                className="grid grid-cols-3 gap-5"
+                className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 sm:gap-5"
               >
                 {items.map((item, i) => (
                   <div key={item.id} className="flex flex-col gap-2">
