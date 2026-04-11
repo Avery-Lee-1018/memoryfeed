@@ -101,7 +101,7 @@ export default function FeedCard({
           onClick={() => onKeep(id)}
           className="h-10 w-10 rounded-full text-muted-foreground hover:bg-primary/10 hover:text-primary"
         >
-          <i className="ri-bookmark-line text-xl" />
+          <i className="ri-check-line text-xl" />
         </Button>
       </CardFooter>
     </Card>

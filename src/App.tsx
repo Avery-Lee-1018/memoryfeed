@@ -1,10 +1,9 @@
 import { useEffect, useState } from "react";
 import FeedCard, { FeedItem } from "@/components/FeedCard";
-import { Button } from "@/components/ui/button";
 
 export default function App() {
   const [items, setItems] = useState<FeedItem[]>([]);
-  const [index, setIndex] = useState(0);
+  const [reacted, setReacted] = useState<Set<number>>(new Set());
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -16,49 +15,46 @@ export default function App() {
   }, []);
 
   const react = async (id: number, type: "keep" | "skip") => {
+    setReacted((prev) => new Set(prev).add(id));
     await fetch("/api/reaction", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ itemId: id, type }),
     });
-    setIndex((i) => i + 1);
   };
 
-  const current = items[index];
+  const visible = items.filter((i) => !reacted.has(i.id));
 
   return (
-    <div className="flex min-h-dvh flex-col items-center justify-center bg-background px-4">
-      <div className="w-full max-w-[390px]">
+    <div className="min-h-dvh bg-background px-4 py-8">
+      <div className="mx-auto flex w-full max-w-[390px] flex-col gap-4">
         {loading ? (
           <p className="text-center text-sm text-muted-foreground">불러오는 중...</p>
-        ) : !current ? (
-          <EmptyState hasItems={items.length > 0} onReset={() => setIndex(0)} />
+        ) : visible.length === 0 ? (
+          <EmptyState hasItems={items.length > 0} />
         ) : (
-          <FeedCard
-            key={current.id}
-            {...current}
-            index={index}
-            onKeep={(id) => react(id, "keep")}
-            onSkip={(id) => react(id, "skip")}
-          />
+          visible.map((item, i) => (
+            <FeedCard
+              key={item.id}
+              {...item}
+              index={i}
+              onKeep={(id) => react(id, "keep")}
+              onSkip={(id) => react(id, "skip")}
+            />
+          ))
         )}
       </div>
     </div>
   );
 }
 
-function EmptyState({ hasItems, onReset }: { hasItems: boolean; onReset: () => void }) {
+function EmptyState({ hasItems }: { hasItems: boolean }) {
   return (
-    <div className="flex flex-col items-center gap-3 py-16 text-center">
+    <div className="flex flex-col items-center gap-2 py-16 text-center">
       <i className="ri-inbox-line text-4xl text-muted-foreground/40" />
       <p className="text-sm text-muted-foreground">
         {hasItems ? "오늘 카드를 다 봤어요" : "아직 콘텐츠가 없어요"}
       </p>
-      {hasItems && (
-        <Button variant="outline" size="sm" onClick={onReset}>
-          처음부터 보기
-        </Button>
-      )}
     </div>
   );
 }
