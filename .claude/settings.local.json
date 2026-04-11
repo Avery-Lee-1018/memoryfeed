@@ -1,7 +1,35 @@
 {
   "permissions": {
     "allow": [
-      "WebFetch(domain:avery.yssv6273.workers.dev)"
+      "WebFetch(domain:avery.yssv6273.workers.dev)",
+      "WebFetch(domain:ui.shadcn.com)",
+      "WebFetch(domain:www.nngroup.com)",
+      "WebFetch(domain:www.figma.com)",
+      "WebFetch(domain:uxdesign.cc)",
+      "WebFetch(domain:techcrunch.com)",
+      "WebFetch(domain:thegradient.pub)",
+      "WebFetch(domain:www.designboom.com)",
+      "WebFetch(domain:toss.im)",
+      "WebFetch(domain:about.daangn.com)",
+      "Bash(wrangler d1:*)",
+      "Bash(npx wrangler:*)",
+      "Bash(npm run:*)",
+      "Bash(curl -s https://avery.yssv6273.workers.dev/api/feed/today)",
+      "Bash(python3 -m json.tool)",
+      "Bash(curl -sv https://avery.yssv6273.workers.dev/api/feed/today)",
+      "Bash(curl -L \"https://www.figma.com/api/mcp/asset/6e954e0f-4bf3-4a4a-b33a-bddc286ae22f\" -o /Users/swing/Downloads/memory_feed_docs/public/thumbnails/01.png)",
+      "Bash(curl -L \"https://www.figma.com/api/mcp/asset/a36aee53-c554-40a2-9b82-7488b6b0a046\" -o /Users/swing/Downloads/memory_feed_docs/public/thumbnails/02.png)",
+      "Bash(curl -L \"https://www.figma.com/api/mcp/asset/1f3a71b3-6546-4686-a867-0f6d756d5ed8\" -o /Users/swing/Downloads/memory_feed_docs/public/thumbnails/03.png)",
+      "Bash(git add:*)",
+      "Bash(git commit -m ':*)",
+      "Bash(git push:*)",
+      "WebFetch(domain:memoryfeed.yssv6273.workers.dev)",
+      "Bash(npm install:*)",
+      "Bash(python3 -c \"import sys,json; [print\\(json.loads\\(l\\).get\\('message',{}\\).get\\('content',''\\)[:300] if isinstance\\(json.loads\\(l\\).get\\('message',{}\\).get\\('content',''\\),str\\) else ''\\) for l in sys.stdin]\")",
+      "WebFetch(domain:www.bucketplace.com)",
+      "WebFetch(domain:growth.design)",
+      "WebFetch(domain:stratechery.com)",
+      "WebFetch(domain:techblog.gccompany.co.kr)"
     ]
   }
 }
