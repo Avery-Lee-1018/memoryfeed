@@ -100,43 +100,43 @@ export default function App() {
   const heroTitle = useMemo(() => getTitleForDate(selectedDate), [selectedDate]);
 
   return (
-    <div className="flex min-h-dvh items-center bg-background px-2 py-6">
+    <div className="flex min-h-dvh items-center bg-background px-4 py-6">
       <div className="mx-auto w-full max-w-[1160px]">
-        <header className="mb-6 px-2">
-          <p className="text-xs text-muted-foreground">{displayedDate}</p>
-          <div className="mt-1 flex items-center gap-2">
-            <h1 className="text-xl font-semibold leading-snug tracking-tight">{heroTitle}</h1>
-            <div className="flex items-center gap-0.5 ml-1">
-              <button
-                onClick={() => setSelectedDate((prev) => shiftDate(prev, -1))}
-                className="flex h-7 w-7 items-center justify-center rounded-full text-lg text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
-                aria-label="이전 날짜"
-              >
-                <i className="ri-arrow-left-s-line" />
-              </button>
-              <button
-                onClick={() => setSelectedDate((prev) => shiftDate(prev, 1))}
-                disabled={isToday}
-                className="flex h-7 w-7 items-center justify-center rounded-full text-lg text-muted-foreground hover:bg-accent hover:text-foreground transition-colors disabled:cursor-not-allowed disabled:opacity-30"
-                aria-label="다음 날짜"
-              >
-                <i className="ri-arrow-right-s-line" />
-              </button>
-              <button
-                onClick={() => setSelectedDate(todayIso)}
-                disabled={isToday}
-                className="ml-1 rounded-full border border-border px-2.5 py-1 text-[11px] font-medium text-foreground hover:bg-accent disabled:cursor-not-allowed disabled:opacity-40"
-                aria-label="오늘로 이동"
-              >
-                TODAY
-              </button>
-            </div>
+        <header className="mb-6 flex items-end justify-between">
+          <div>
+            <p className="text-xs text-muted-foreground">{displayedDate}</p>
+            <h1 className="mt-1 text-xl font-semibold leading-snug tracking-tight">{heroTitle}</h1>
+          </div>
+          <div className="flex items-center gap-1 pb-0.5">
+            <button
+              onClick={() => setSelectedDate((prev) => shiftDate(prev, -1))}
+              className="flex h-7 w-7 items-center justify-center rounded-full text-lg text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
+              aria-label="이전 날짜"
+            >
+              <i className="ri-arrow-left-s-line" />
+            </button>
+            <button
+              onClick={() => setSelectedDate((prev) => shiftDate(prev, 1))}
+              disabled={isToday}
+              className="flex h-7 w-7 items-center justify-center rounded-full text-lg text-muted-foreground hover:bg-accent hover:text-foreground transition-colors disabled:cursor-not-allowed disabled:opacity-30"
+              aria-label="다음 날짜"
+            >
+              <i className="ri-arrow-right-s-line" />
+            </button>
+            <button
+              onClick={() => setSelectedDate(todayIso)}
+              disabled={isToday}
+              className="ml-1 rounded-full border border-border px-2.5 py-1 text-[11px] font-medium text-foreground hover:bg-accent disabled:cursor-not-allowed disabled:opacity-40"
+              aria-label="오늘로 이동"
+            >
+              TODAY
+            </button>
           </div>
         </header>
 
         <div className="min-h-[560px]">
           {loading ? (
-            <div className="grid grid-cols-1 gap-5 md:grid-cols-3">
+            <div className="grid grid-cols-3 gap-5">
               {[0, 1, 2].map((i) => (
                 <CardSkeleton key={i} />
               ))}
@@ -144,7 +144,7 @@ export default function App() {
           ) : items.length === 0 ? (
             <EmptyState hasItems={initialItemCount > 0} />
           ) : (
-            <div className="grid grid-cols-1 gap-5 md:grid-cols-3">
+            <div className="grid grid-cols-3 gap-5">
               {items.map((item, i) => (
                 <div key={item.id} className="flex flex-col gap-2">
                   {replacingIds.has(item.id) ? <CardSkeleton /> : <FeedCard {...item} index={i} />}
