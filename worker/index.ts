@@ -7,7 +7,6 @@ type ReactionType = "keep" | "skip";
 type SourceType = "rss" | "blog";
 type SourceLevel = "core" | "focus" | "light";
 const FEED_START_DATE = "2026-04-01";
-const SOURCE_HYDRATE_LIMIT_PER_REQUEST = 10;
 const ENTRY_LIMIT_PER_SOURCE = 18;
 
 const json = (data: unknown, init: ResponseInit = {}) =>
@@ -200,90 +199,71 @@ async function handleGetFeedToday(url: URL, env: Env) {
   await ensureItemsFromSources(env);
   const targetDate = getDateParamOrToday(url.searchParams.get("date"));
   await backfillFeedsUntilDate(targetDate, env);
-  const result = await env.DB.prepare(`
-    SELECT i.id, i.title, i.url, i.summary, i.thumbnail_url,
-           s.name AS sourceName, s.type AS sourceType, s.level AS sourceLevel,
-           n.content AS note
-    FROM items i
-    JOIN sources s ON i.source_id = s.id
-    LEFT JOIN notes n ON n.item_id = i.id
-    WHERE i.shown_date = ?
-      AND s.is_active = 1
-    LIMIT 3
-  `).bind(targetDate).all();
+  let result = await queryDistinctDateItems(targetDate, env);
 
   const items = (result.results ?? []) as Record<string, unknown>[];
 
-  // Always guarantee 3 items — auto-fill from pool if short
+  // Always guarantee 3 items — prioritize source diversity for the same date.
   if (items.length < 3) {
-    const needed = 3 - items.length;
-    const existingIds = items.map(i => i.id as number);
-    const exclusion = existingIds.length > 0
-      ? `AND i.id NOT IN (${existingIds.map(() => "?").join(", ")})`
-      : "";
-    const fill = await env.DB.prepare(`
+    const existingIds = items.map((i) => Number(i.id)).filter(Number.isFinite);
+    const existingSourceIds = items.map((i) => Number(i.sourceId)).filter(Number.isFinite);
+    const neededDistinct = 3 - items.length;
+
+    const diverse = await selectCandidateItemIds(env, {
+      limit: neededDistinct,
+      excludeItemIds: existingIds,
+      excludeSourceIds: existingSourceIds,
+      requireUnassigned: true,
+      requireNoMemo: true,
+      distinctBySource: true,
+    });
+    for (const id of diverse) {
+      await env.DB.prepare("UPDATE items SET shown_date = ? WHERE id = ?").bind(targetDate, id).run();
+      existingIds.push(id);
+    }
+
+    if (existingIds.length < 3) {
+      const neededFallback = 3 - existingIds.length;
+      const fallback = await selectCandidateItemIds(env, {
+        limit: neededFallback,
+        excludeItemIds: existingIds,
+        excludeSourceIds: [],
+        requireUnassigned: true,
+        requireNoMemo: true,
+        distinctBySource: false,
+      });
+      for (const id of fallback) {
+        await env.DB.prepare("UPDATE items SET shown_date = ? WHERE id = ?").bind(targetDate, id).run();
+        existingIds.push(id);
+      }
+    }
+
+    result = await queryDistinctDateItems(targetDate, env);
+  }
+
+  const finalItems = ((result.results ?? []) as Record<string, unknown>[]).map(({ sourceId, ...rest }) => rest);
+  return json({ date: targetDate, items: finalItems });
+}
+
+async function queryDistinctDateItems(targetDate: string, env: Env) {
+  return env.DB.prepare(`
+    WITH shown AS (
       SELECT i.id, i.title, i.url, i.summary, i.thumbnail_url,
              s.name AS sourceName, s.type AS sourceType, s.level AS sourceLevel,
-             n.content AS note
+             i.source_id AS sourceId,
+             n.content AS note,
+             ROW_NUMBER() OVER (PARTITION BY i.source_id ORDER BY i.id DESC) AS source_rank
       FROM items i
       JOIN sources s ON i.source_id = s.id
       LEFT JOIN notes n ON n.item_id = i.id
-      WHERE i.status = 'active'
+      WHERE i.shown_date = ?
         AND s.is_active = 1
-        AND i.shown_date IS NULL
-        AND (n.content IS NULL OR trim(n.content) = '')
-        ${exclusion}
-      ORDER BY (ABS(RANDOM()) % 1000000) * 1.0 /
-        CASE COALESCE(s.level, 'focus')
-          WHEN 'core' THEN 3.0
-          WHEN 'focus' THEN 2.0
-          WHEN 'light' THEN 1.0
-          ELSE 2.0
-        END
-      LIMIT ?
-    `).bind(...existingIds, needed).all();
-
-    for (const extra of (fill.results ?? []) as Record<string, unknown>[]) {
-      await env.DB.prepare("UPDATE items SET shown_date = ? WHERE id = ?")
-        .bind(targetDate, extra.id).run();
-      items.push(extra);
-    }
-
-    // If the unassigned pool is exhausted, still return cards from active user sources.
-    if (items.length < 3) {
-      const additionalNeeded = 3 - items.length;
-      const fallbackIds = items.map(i => Number(i.id)).filter(Number.isFinite);
-      const fallbackExclusion = fallbackIds.length > 0
-        ? `AND i.id NOT IN (${fallbackIds.map(() => "?").join(", ")})`
-        : "";
-      const fallback = await env.DB.prepare(`
-        SELECT i.id, i.title, i.url, i.summary, i.thumbnail_url,
-               s.name AS sourceName, s.type AS sourceType, s.level AS sourceLevel,
-               n.content AS note
-        FROM items i
-        JOIN sources s ON i.source_id = s.id
-        LEFT JOIN notes n ON n.item_id = i.id
-        WHERE i.status = 'active'
-          AND s.is_active = 1
-          ${fallbackExclusion}
-        ORDER BY (ABS(RANDOM()) % 1000000) * 1.0 /
-          CASE COALESCE(s.level, 'focus')
-            WHEN 'core' THEN 3.0
-            WHEN 'focus' THEN 2.0
-            WHEN 'light' THEN 1.0
-            ELSE 2.0
-          END
-        LIMIT ?
-      `).bind(...fallbackIds, additionalNeeded).all();
-
-      for (const extra of (fallback.results ?? []) as Record<string, unknown>[]) {
-        items.push(extra);
-      }
-    }
-  }
-
-  const enrichedItems = await enrichFeedItems(items, env);
-  return json({ date: targetDate, items: enrichedItems });
+    )
+    SELECT id, title, url, summary, thumbnail_url, sourceName, sourceType, sourceLevel, sourceId, note
+    FROM shown
+    WHERE source_rank = 1
+    LIMIT 3
+  `).bind(targetDate).all();
 }
 
 async function handlePostFeedReplacement(request: Request, env: Env) {
@@ -298,63 +278,58 @@ async function handlePostFeedReplacement(request: Request, env: Env) {
     ? body.excludeItemIds.filter((id): id is number => Number.isInteger(id))
     : [];
 
-  const placeholders = excludeItemIds.map(() => "?").join(", ");
-  const exclusionClause =
-    excludeItemIds.length > 0 ? `AND i.id NOT IN (${placeholders})` : "";
   const targetDate = getDateParamOrToday(body.date ?? null);
 
-  const stmt = env.DB.prepare(`
-    SELECT i.id, i.title, i.url, i.summary, i.thumbnail_url,
-           s.name AS sourceName, s.type AS sourceType, s.level AS sourceLevel,
-           n.content AS note
-    FROM items i
-    JOIN sources s ON i.source_id = s.id
-    LEFT JOIN notes n ON n.item_id = i.id
-    WHERE i.status = 'active'
-      AND s.is_active = 1
-      AND i.shown_date IS NULL
-      AND (n.content IS NULL OR trim(n.content) = '')
-      ${exclusionClause}
-    ORDER BY (ABS(RANDOM()) % 1000000) * 1.0 /
-      CASE COALESCE(s.level, 'focus')
-        WHEN 'core' THEN 3.0
-        WHEN 'focus' THEN 2.0
-        WHEN 'light' THEN 1.0
-        ELSE 2.0
-      END
-    LIMIT 1
-  `);
+  const excludedSourceRows = excludeItemIds.length > 0
+    ? await env.DB.prepare(`
+      SELECT DISTINCT source_id
+      FROM items
+      WHERE id IN (${excludeItemIds.map(() => "?").join(", ")})
+    `).bind(...excludeItemIds).all()
+    : { results: [] as Record<string, unknown>[] };
+  const excludedSourceIds = ((excludedSourceRows.results ?? []) as Record<string, unknown>[])
+    .map((row) => Number(row.source_id))
+    .filter(Number.isFinite);
 
-  const replacement = await stmt.bind(...excludeItemIds).first() as Record<string, unknown> | null;
+  let replacementId: number | null = null;
 
-  let finalReplacement = replacement;
+  const preferred = await selectCandidateItemIds(env, {
+    limit: 1,
+    excludeItemIds,
+    excludeSourceIds: excludedSourceIds,
+    requireUnassigned: true,
+    requireNoMemo: true,
+    distinctBySource: false,
+  });
+  if (preferred.length > 0) replacementId = preferred[0];
 
-  if (!finalReplacement) {
-    const fallback = await env.DB.prepare(`
-      SELECT i.id, i.title, i.url, i.summary, i.thumbnail_url,
-             s.name AS sourceName, s.type AS sourceType, s.level AS sourceLevel,
-             n.content AS note
-      FROM items i
-      JOIN sources s ON i.source_id = s.id
-      LEFT JOIN notes n ON n.item_id = i.id
-      WHERE i.status = 'active'
-        AND s.is_active = 1
-        ${exclusionClause}
-      ORDER BY (ABS(RANDOM()) % 1000000) * 1.0 /
-        CASE COALESCE(s.level, 'focus')
-          WHEN 'core' THEN 3.0
-          WHEN 'focus' THEN 2.0
-          WHEN 'light' THEN 1.0
-          ELSE 2.0
-        END
-      LIMIT 1
-    `).bind(...excludeItemIds).first() as Record<string, unknown> | null;
-    finalReplacement = fallback;
+  if (!replacementId) {
+    const fallbackUnassigned = await selectCandidateItemIds(env, {
+      limit: 1,
+      excludeItemIds,
+      excludeSourceIds: [],
+      requireUnassigned: true,
+      requireNoMemo: true,
+      distinctBySource: false,
+    });
+    if (fallbackUnassigned.length > 0) replacementId = fallbackUnassigned[0];
   }
 
-  if (finalReplacement && replacement) {
+  if (!replacementId) {
+    const fallbackAny = await selectCandidateItemIds(env, {
+      limit: 1,
+      excludeItemIds,
+      excludeSourceIds: [],
+      requireUnassigned: false,
+      requireNoMemo: false,
+      distinctBySource: false,
+    });
+    if (fallbackAny.length > 0) replacementId = fallbackAny[0];
+  }
+
+  if (replacementId) {
     await env.DB.prepare("UPDATE items SET shown_date = ? WHERE id = ?")
-      .bind(targetDate, finalReplacement.id)
+      .bind(targetDate, replacementId)
       .run();
     if (Number.isInteger(body.replaceItemId)) {
       await env.DB.prepare(`
@@ -373,9 +348,18 @@ async function handlePostFeedReplacement(request: Request, env: Env) {
     }
   }
 
-  if (!finalReplacement) return json({ item: null });
-  const [enriched] = await enrichFeedItems([finalReplacement], env);
-  return json({ item: enriched ?? finalReplacement });
+  if (!replacementId) return json({ item: null });
+  const finalReplacement = await env.DB.prepare(`
+    SELECT i.id, i.title, i.url, i.summary, i.thumbnail_url,
+           s.name AS sourceName, s.type AS sourceType, s.level AS sourceLevel,
+           n.content AS note
+    FROM items i
+    JOIN sources s ON i.source_id = s.id
+    LEFT JOIN notes n ON n.item_id = i.id
+    WHERE i.id = ?
+    LIMIT 1
+  `).bind(replacementId).first();
+  return json({ item: finalReplacement ?? null });
 }
 
 async function handlePostReaction(request: Request, env: Env) {
@@ -620,33 +604,85 @@ function nextIsoDate(isoDate: string) {
   return d.toISOString().slice(0, 10);
 }
 
-async function fillDateIfNeeded(targetDate: string, env: Env) {
-  const existing = await env.DB.prepare(`
-    SELECT i.id
-    FROM items i
-    JOIN sources s ON s.id = i.source_id
-    WHERE i.shown_date = ?
-      AND s.is_active = 1
-    LIMIT 3
-  `).bind(targetDate).all();
-  const currentIds = ((existing.results ?? []) as Record<string, unknown>[]).map((row) => Number(row.id));
-  const needed = 3 - currentIds.length;
-  if (needed <= 0) return;
+type CandidateQueryOptions = {
+  limit: number;
+  excludeItemIds: number[];
+  excludeSourceIds: number[];
+  requireUnassigned: boolean;
+  requireNoMemo: boolean;
+  distinctBySource: boolean;
+};
 
-  const exclusion = currentIds.length > 0
-    ? `AND i.id NOT IN (${currentIds.map(() => "?").join(", ")})`
-    : "";
+function buildInClause(column: string, values: number[]) {
+  if (values.length === 0) return { sql: "", params: [] as number[] };
+  return {
+    sql: `AND ${column} NOT IN (${values.map(() => "?").join(", ")})`,
+    params: values,
+  };
+}
 
-  const fill = await env.DB.prepare(`
+async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) {
+  const itemExclusion = buildInClause("i.id", options.excludeItemIds);
+  const sourceExclusion = buildInClause("i.source_id", options.excludeSourceIds);
+  const shownClause = options.requireUnassigned ? "AND i.shown_date IS NULL" : "";
+  const memoClause = options.requireNoMemo ? "AND (n.content IS NULL OR trim(n.content) = '')" : "";
+  const limit = Math.max(0, options.limit);
+  if (limit === 0) return [] as number[];
+
+  if (options.distinctBySource) {
+    const rows = await env.DB.prepare(`
+      WITH candidate AS (
+        SELECT
+          i.id,
+          i.source_id,
+          (ABS(RANDOM()) % 1000000) * 1.0 /
+            CASE COALESCE(s.level, 'focus')
+              WHEN 'core' THEN 3.0
+              WHEN 'focus' THEN 2.0
+              WHEN 'light' THEN 1.0
+              ELSE 2.0
+            END AS score,
+          ROW_NUMBER() OVER (
+            PARTITION BY i.source_id
+            ORDER BY (ABS(RANDOM()) % 1000000)
+          ) AS source_rank
+        FROM items i
+        JOIN sources s ON i.source_id = s.id
+        LEFT JOIN notes n ON n.item_id = i.id
+        WHERE i.status = 'active'
+          AND s.is_active = 1
+          ${shownClause}
+          ${memoClause}
+          ${itemExclusion.sql}
+          ${sourceExclusion.sql}
+      )
+      SELECT id
+      FROM candidate
+      WHERE source_rank = 1
+      ORDER BY score
+      LIMIT ?
+    `).bind(
+      ...itemExclusion.params,
+      ...sourceExclusion.params,
+      limit,
+    ).all();
+
+    return ((rows.results ?? []) as Record<string, unknown>[])
+      .map((row) => Number(row.id))
+      .filter(Number.isFinite);
+  }
+
+  const rows = await env.DB.prepare(`
     SELECT i.id
     FROM items i
     JOIN sources s ON i.source_id = s.id
     LEFT JOIN notes n ON n.item_id = i.id
     WHERE i.status = 'active'
       AND s.is_active = 1
-      AND i.shown_date IS NULL
-      AND (n.content IS NULL OR trim(n.content) = '')
-      ${exclusion}
+      ${shownClause}
+      ${memoClause}
+      ${itemExclusion.sql}
+      ${sourceExclusion.sql}
     ORDER BY (ABS(RANDOM()) % 1000000) * 1.0 /
       CASE COALESCE(s.level, 'focus')
         WHEN 'core' THEN 3.0
@@ -655,11 +691,63 @@ async function fillDateIfNeeded(targetDate: string, env: Env) {
         ELSE 2.0
       END
     LIMIT ?
-  `).bind(...currentIds, needed).all();
+  `).bind(
+    ...itemExclusion.params,
+    ...sourceExclusion.params,
+    limit,
+  ).all();
 
-  for (const row of (fill.results ?? []) as Record<string, unknown>[]) {
+  return ((rows.results ?? []) as Record<string, unknown>[])
+    .map((row) => Number(row.id))
+    .filter(Number.isFinite);
+}
+
+async function fillDateIfNeeded(targetDate: string, env: Env) {
+  const existing = await env.DB.prepare(`
+    SELECT i.id, i.source_id
+    FROM items i
+    JOIN sources s ON s.id = i.source_id
+    WHERE i.shown_date = ?
+      AND s.is_active = 1
+    LIMIT 3
+  `).bind(targetDate).all();
+  const currentRows = (existing.results ?? []) as Record<string, unknown>[];
+  const currentIds = currentRows.map((row) => Number(row.id)).filter(Number.isFinite);
+  const currentSourceIds = currentRows.map((row) => Number(row.source_id)).filter(Number.isFinite);
+  const uniqueSourceCount = new Set(currentSourceIds).size;
+  const needed = 3 - uniqueSourceCount;
+  if (needed <= 0) return;
+
+  const diverse = await selectCandidateItemIds(env, {
+    limit: needed,
+    excludeItemIds: currentIds,
+    excludeSourceIds: currentSourceIds,
+    requireUnassigned: true,
+    requireNoMemo: true,
+    distinctBySource: true,
+  });
+
+  for (const id of diverse) {
     await env.DB.prepare("UPDATE items SET shown_date = ? WHERE id = ?")
-      .bind(targetDate, row.id)
+      .bind(targetDate, id)
+      .run();
+    currentIds.push(id);
+  }
+
+  if (currentIds.length >= 3) return;
+
+  const fallback = await selectCandidateItemIds(env, {
+    limit: 3 - currentIds.length,
+    excludeItemIds: currentIds,
+    excludeSourceIds: [],
+    requireUnassigned: true,
+    requireNoMemo: true,
+    distinctBySource: false,
+  });
+
+  for (const id of fallback) {
+    await env.DB.prepare("UPDATE items SET shown_date = ? WHERE id = ?")
+      .bind(targetDate, id)
       .run();
   }
 }
@@ -667,11 +755,7 @@ async function fillDateIfNeeded(targetDate: string, env: Env) {
 async function backfillFeedsUntilDate(targetDate: string, env: Env) {
   const today = new Date().toISOString().slice(0, 10);
   const maxDate = targetDate > today ? today : targetDate;
-  let cursor = FEED_START_DATE;
-  while (cursor <= maxDate) {
-    await fillDateIfNeeded(cursor, env);
-    cursor = nextIsoDate(cursor);
-  }
+  await fillDateIfNeeded(maxDate, env);
 }
 
 async function cleanupDemoData(env: Env) {
@@ -681,21 +765,12 @@ async function cleanupDemoData(env: Env) {
 
 async function ensureItemsFromSources(env: Env) {
   const rows = await env.DB.prepare(`
-    SELECT
-      s.id,
-      s.name,
-      s.url,
-      s.type,
-      COUNT(i.id) AS itemCount,
-      COALESCE(SUM(CASE WHEN RTRIM(i.url, '/') = RTRIM(s.url, '/') THEN 1 ELSE 0 END), 0) AS seedCount
+    SELECT s.id, s.name, s.url, s.type, COUNT(i.id) AS itemCount
     FROM sources s
     LEFT JOIN items i ON i.source_id = s.id
     WHERE s.is_active = 1
     GROUP BY s.id
-    ORDER BY RANDOM()
   `).all();
-
-  const hydrateCandidates: { id: number; name: string; url: string; type: SourceType }[] = [];
 
   for (const row of (rows.results ?? []) as Record<string, unknown>[]) {
     const source = {
@@ -705,43 +780,9 @@ async function ensureItemsFromSources(env: Env) {
       type: (row.type === "rss" ? "rss" : "blog") as SourceType,
     };
     const itemCount = Number(row.itemCount ?? 0);
-    const seedCount = Number(row.seedCount ?? 0);
-
     if (itemCount === 0) {
       await seedItemForSource(source, env);
-      hydrateCandidates.push(source);
-      continue;
     }
-
-    // If this source still has only fallback rows, try upgrading to article-level entries.
-    if (seedCount === itemCount) {
-      hydrateCandidates.push(source);
-    }
-  }
-
-  for (const source of hydrateCandidates.slice(0, SOURCE_HYDRATE_LIMIT_PER_REQUEST)) {
-    await hydrateSourceItems(source, env);
-  }
-}
-
-async function hydrateSourceItems(
-  source: { id: number; name: string; url: string; type: SourceType },
-  env: Env,
-) {
-  const inserted = await ingestItemsForSource(source, env);
-  if (inserted > 0) {
-    // Remove fallback source-url rows when article rows were successfully generated.
-    await env.DB.prepare(`
-      DELETE FROM items
-      WHERE source_id = ?
-        AND RTRIM(url, '/') = RTRIM(?, '/')
-        AND NOT EXISTS (
-          SELECT 1
-          FROM notes n
-          WHERE n.item_id = items.id
-            AND trim(n.content) != ''
-        )
-    `).bind(source.id, source.url).run();
   }
 }
 
@@ -1036,58 +1077,6 @@ function deriveTitleFromUrl(url: string) {
   } catch {
     return "";
   }
-}
-
-function isWeakTitle(title: string, sourceName: string) {
-  const normalized = title.trim().toLowerCase();
-  if (!normalized) return true;
-  if (normalized === sourceName.trim().toLowerCase()) return true;
-  if (normalized.startsWith("http://") || normalized.startsWith("https://")) return true;
-  return false;
-}
-
-type DbFeedRow = Record<string, unknown>;
-
-async function enrichFeedItems(items: DbFeedRow[], env: Env) {
-  const next: DbFeedRow[] = [];
-  for (const item of items) {
-    const id = Number(item.id);
-    const pageUrl = String(item.url ?? "");
-    const sourceName = String(item.sourceName ?? "");
-    const currentTitle = String(item.title ?? "");
-    const currentSummary = typeof item.summary === "string" ? item.summary : "";
-
-    let title = normalizeDisplayText(currentTitle);
-    let summary = typeof currentSummary === "string" ? normalizeDisplayText(currentSummary) : "";
-
-    const needTitle = isWeakTitle(title, sourceName);
-    const needSummary = !summary;
-
-    if (needTitle || needSummary) {
-      const html = await fetchSourceText(pageUrl, "text/html,application/xhtml+xml");
-      if (html) {
-        const htmlTitle = normalizeDisplayText(extractHtmlTitle(html) ?? "");
-        const metaSummary = normalizeDisplayText(extractMetaDescription(html) ?? "");
-        if (needTitle && htmlTitle) title = htmlTitle;
-        if (needSummary && metaSummary) summary = metaSummary;
-      }
-      if (needTitle && isWeakTitle(title, sourceName)) {
-        const fromUrl = normalizeDisplayText(deriveTitleFromUrl(pageUrl));
-        if (fromUrl) title = fromUrl;
-      }
-    }
-
-    if (title && title !== currentTitle) {
-      await env.DB.prepare("UPDATE items SET title = ? WHERE id = ?").bind(title, id).run();
-      item.title = title;
-    }
-    if (summary && summary !== currentSummary) {
-      await env.DB.prepare("UPDATE items SET summary = ? WHERE id = ?").bind(summary, id).run();
-      item.summary = summary;
-    }
-    next.push(item);
-  }
-  return next;
 }
 
 function normalizeEntryUrl(url: string, baseUrl: string) {
