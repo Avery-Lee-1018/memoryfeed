@@ -184,7 +184,7 @@ export default function FeedCard({
               className={`flex items-center justify-center rounded-xl px-2 py-2 transition-colors ${
                 hasMemo
                   ? "bg-amber-50 text-amber-500 hover:bg-amber-100"
-                  : "bg-[#EBEBEC] text-muted-foreground/50 hover:bg-zinc-200 hover:text-muted-foreground/80"
+                  : "bg-[#F2F2F3] text-muted-foreground/50 hover:bg-[#EBEBEC] hover:text-muted-foreground/80"
               }`}
               style={{ minWidth: 44, minHeight: 44 }}
               aria-label="메모"
@@ -204,23 +204,23 @@ export default function FeedCard({
                 autoFocus
                 value={draftMemo}
                 onChange={(e) => setDraftMemo(e.target.value)}
-                placeholder="메모를 남겨보세요 (마크다운 지원)"
-                className="w-full resize-none rounded-xl border border-border bg-zinc-50 p-2.5 text-sm leading-relaxed text-foreground placeholder:text-muted-foreground/40 focus:outline-none focus:ring-1 focus:ring-ring"
+                placeholder="메모를 남겨보세요"
+                className="w-full resize-none rounded-xl border border-zinc-200 bg-zinc-50 p-2.5 text-sm leading-relaxed text-foreground placeholder:text-muted-foreground/40 focus:outline-none focus:ring-1 focus:ring-zinc-200"
                 rows={3}
               />
-              <div className="flex items-center gap-2">
+              <div className="flex items-center justify-between">
+                <button
+                  onClick={handleCancelEdit}
+                  className="rounded-full px-3 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent"
+                >
+                  취소
+                </button>
                 <button
                   onClick={handleSave}
                   disabled={memoSaving || !draftMemo.trim()}
                   className="rounded-full bg-foreground px-3.5 py-1 text-xs font-medium text-white transition-colors hover:bg-foreground/80 disabled:opacity-40"
                 >
                   {memoSaving ? "저장 중…" : "저장"}
-                </button>
-                <button
-                  onClick={handleCancelEdit}
-                  className="rounded-full px-3 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent"
-                >
-                  취소
                 </button>
               </div>
             </div>
