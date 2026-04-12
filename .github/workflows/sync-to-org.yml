@@ -1,0 +1,19 @@
+name: Sync to Org
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Push to Org repo
+        run: |
+          git remote add org https://x-access-token:${{ secrets.ORG_TOKEN }}@github.com/BF-D-challenge/[make-own-product2].git
+          git push org HEAD:refs/heads/members/[이예서-memoryfeed] --force
