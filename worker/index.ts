@@ -7,7 +7,7 @@ type ReactionType = "keep" | "skip";
 type SourceType = "rss" | "blog";
 type SourceLevel = "core" | "focus" | "light";
 const FEED_START_DATE = "2026-04-01";
-const SOURCE_HYDRATE_LIMIT_PER_REQUEST = 2;
+const SOURCE_HYDRATE_LIMIT_PER_REQUEST = 10;
 const ENTRY_LIMIT_PER_SOURCE = 18;
 
 const json = (data: unknown, init: ResponseInit = {}) =>
@@ -689,6 +689,7 @@ async function ensureItemsFromSources(env: Env) {
     LEFT JOIN items i ON i.source_id = s.id
     WHERE s.is_active = 1
     GROUP BY s.id
+    ORDER BY RANDOM()
   `).all();
 
   const hydrateCandidates: { id: number; name: string; url: string; type: SourceType }[] = [];
@@ -771,9 +772,9 @@ async function ingestItemsForSource(
       VALUES (?, ?, ?, ?, ?, 'active', NULL)
     `).bind(
       source.id,
-      entry.title || source.name,
+      normalizeDisplayText(entry.title || deriveTitleFromUrl(entry.url) || source.name),
       entry.url,
-      entry.summary ?? null,
+      entry.summary ? normalizeDisplayText(entry.summary) : null,
       entry.thumbnailUrl ?? null,
     ).run();
     inserted += Number(result.meta?.changes ?? 0);
@@ -838,10 +839,33 @@ function discoverFeedUrlsFromHtml(html: string, pageUrl: string) {
     if (normalized) urls.add(normalized);
   }
 
-  const commonPaths = ["/feed", "/rss", "/atom.xml", "/feed.xml", "/rss.xml"];
-  for (const path of commonPaths) {
+  const parsed = new URL(pageUrl);
+  const origin = parsed.origin;
+  const normalizedPath = parsed.pathname.replace(/\/+$/, "");
+  const pathCandidates = [
+    "/feed",
+    "/feed/",
+    "/rss",
+    "/rss.xml",
+    "/atom.xml",
+    "/feed.xml",
+    normalizedPath ? `${normalizedPath}/feed` : "",
+    normalizedPath ? `${normalizedPath}/feed/` : "",
+    normalizedPath ? `${normalizedPath}/rss.xml` : "",
+    normalizedPath ? `${normalizedPath}/atom.xml` : "",
+    normalizedPath ? `${normalizedPath}.rss` : "",
+    normalizedPath ? `${normalizedPath}.xml` : "",
+  ].filter(Boolean);
+
+  for (const path of pathCandidates) {
     try {
-      urls.add(new URL(path, pageUrl).toString());
+      if (path.startsWith("http://") || path.startsWith("https://")) {
+        urls.add(path);
+      } else if (path.startsWith("/")) {
+        urls.add(new URL(path, origin).toString());
+      } else {
+        urls.add(new URL(path, pageUrl).toString());
+      }
     } catch {
       // ignore
     }
@@ -871,9 +895,9 @@ function parseRssEntries(xml: string, baseUrl: string) {
   const entries: SourceEntry[] = [];
   const itemBlocks = xml.match(/<item[\s\S]*?<\/item>/gi) || [];
   for (const block of itemBlocks) {
-    const title = decodeXml(stripTags(matchTag(block, "title"))).trim();
+    const title = normalizeDisplayText(decodeXml(stripTags(matchTag(block, "title"))).trim());
     const linkRaw = decodeXml(matchTag(block, "link")).trim();
-    const description = decodeXml(stripTags(matchTag(block, "description"))).trim();
+    const description = normalizeDisplayText(decodeXml(stripTags(matchTag(block, "description"))).trim());
     const descriptionHtml = matchTag(block, "description");
     const thumbnailRaw =
       getAttr((block.match(/<media:content[^>]*>/i) || [""])[0], "url") ||
@@ -894,12 +918,12 @@ function parseRssEntries(xml: string, baseUrl: string) {
 
   const entryBlocks = xml.match(/<entry[\s\S]*?<\/entry>/gi) || [];
   for (const block of entryBlocks) {
-    const title = decodeXml(stripTags(matchTag(block, "title"))).trim();
+    const title = normalizeDisplayText(decodeXml(stripTags(matchTag(block, "title"))).trim());
     const hrefMatch = block.match(/<link[^>]+href=["']([^"']+)["'][^>]*>/i);
     const altMatch = block.match(/<link[^>]+rel=["']alternate["'][^>]+href=["']([^"']+)["'][^>]*>/i);
     const linkRaw = (altMatch?.[1] || hrefMatch?.[1] || "").trim();
     const summaryRaw = matchTag(block, "summary") || matchTag(block, "content");
-    const summary = decodeXml(stripTags(summaryRaw)).trim();
+    const summary = normalizeDisplayText(decodeXml(stripTags(summaryRaw)).trim());
     const enclosureMatch = block.match(/<link[^>]+rel=["']enclosure["'][^>]+href=["']([^"']+)["'][^>]*>/i);
     const thumbnailRaw = enclosureMatch?.[1] || extractFirstImageSrc(summaryRaw);
     const thumbnailUrl = thumbnailRaw ? normalizeEntryUrl(decodeXml(thumbnailRaw), baseUrl) : null;
@@ -930,13 +954,70 @@ function stripTags(text: string) {
 }
 
 function decodeXml(text: string) {
-  return text
+  const decoded = text
     .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")
     .replace(/&amp;/g, "&")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, "\"")
     .replace(/&#39;/g, "'");
+  return decodeHtmlEntities(decoded);
+}
+
+function decodeHtmlEntities(text: string) {
+  const named: Record<string, string> = {
+    nbsp: " ",
+    amp: "&",
+    lt: "<",
+    gt: ">",
+    quot: '"',
+    apos: "'",
+    laquo: '"',
+    raquo: '"',
+    ldquo: '"',
+    rdquo: '"',
+    lsquo: "'",
+    rsquo: "'",
+    ndash: "-",
+    mdash: "-",
+    hellip: "...",
+  };
+
+  return text.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/g, (_, entity: string) => {
+    if (entity.startsWith("#x") || entity.startsWith("#X")) {
+      const code = Number.parseInt(entity.slice(2), 16);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : "";
+    }
+    if (entity.startsWith("#")) {
+      const code = Number.parseInt(entity.slice(1), 10);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : "";
+    }
+    return named[entity.toLowerCase()] ?? "";
+  });
+}
+
+function normalizeDisplayText(text: string) {
+  return text
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .replace(/[–—]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function deriveTitleFromUrl(url: string) {
+  try {
+    const parsed = new URL(url);
+    const parts = parsed.pathname.split("/").filter(Boolean);
+    const last = parts[parts.length - 1] || "";
+    if (!last) return "";
+    return last
+      .replace(/[-_]+/g, " ")
+      .replace(/\.[a-z0-9]+$/i, "")
+      .trim();
+  } catch {
+    return "";
+  }
 }
 
 function normalizeEntryUrl(url: string, baseUrl: string) {
