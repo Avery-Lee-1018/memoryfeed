@@ -127,7 +127,7 @@ export default function MemoShapes({ show, dateKey }: Props) {
         left: SAFE_INSET_PX,
         pointerEvents: "none",
         userSelect: "none",
-        zIndex: 0,
+        zIndex: -1,
       }}
     >
       {stamps.map((stamp, i) => (

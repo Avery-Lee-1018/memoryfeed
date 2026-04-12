@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 
+const THUMBNAIL_FALLBACK_TIMEOUT_MS = 2600;
+
 const FALLBACK_THUMBNAILS = [
   "/thumbnails/01.png",
   "/thumbnails/02.png",
@@ -55,6 +57,13 @@ export default function FeedCard({
     setThumbnailSrc(resolvedThumbnail);
     setImageLoaded(false);
   }, [resolvedThumbnail]);
+  useEffect(() => {
+    if (thumbnailSrc !== resolvedThumbnail || imageLoaded) return;
+    const timer = window.setTimeout(() => {
+      setThumbnailSrc((current) => (current === resolvedThumbnail ? fallbackThumbnail : current));
+    }, THUMBNAIL_FALLBACK_TIMEOUT_MS);
+    return () => window.clearTimeout(timer);
+  }, [thumbnailSrc, resolvedThumbnail, fallbackThumbnail, imageLoaded]);
   const hasMemo = savedMemo.trim().length > 0;
 
   const handleSave = async () => {
@@ -108,8 +117,9 @@ export default function FeedCard({
           className={`h-full w-full object-cover transition-opacity duration-300 ${
             imageLoaded ? "opacity-100" : "opacity-0"
           }`}
-          loading="eager"
+          loading="lazy"
           decoding="async"
+          referrerPolicy="no-referrer"
           onError={() => {
             if (thumbnailSrc !== fallbackThumbnail) setThumbnailSrc(fallbackThumbnail);
             else setImageLoaded(true);

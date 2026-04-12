@@ -166,9 +166,9 @@ export default function App() {
   const hasMemoToday = memoItemIds.size > 0;
 
   return (
-    <div className="flex min-h-dvh items-start bg-background px-3 py-4 md:items-center md:px-4 md:py-6">
+    <div className="relative isolate flex min-h-dvh items-start overflow-x-clip bg-background px-3 py-4 md:items-center md:px-4 md:py-6">
       <MemoShapes show={hasMemoToday} dateKey={selectedDate} />
-      <div className="relative z-10 mx-auto w-full max-w-[1160px]">
+      <div className="relative z-20 mx-auto w-full max-w-[1160px]">
         <header className="mb-5 flex flex-col gap-3 sm:mb-6 sm:flex-row sm:items-end sm:justify-between">
           <AnimatePresence mode="wait" initial={false}>
             <motion.div
