@@ -502,6 +502,14 @@ async function handlePostSources(request: Request, env: Env, ctx: ExecutionConte
 
   if (typeof body.rawText === "string" || Array.isArray(body.urls)) {
     const { urls, totalCandidates, invalidTokens } = parseSourceUrls(body.rawText, body.urls);
+    const existingRows = await env.DB
+      .prepare("SELECT id, name, url, type FROM sources")
+      .all<{ id: number; name: string; url: string; type: SourceType }>();
+    const sourceByHost = new Map<string, { id: number; name: string; url: string; type: SourceType }>();
+    for (const row of existingRows.results ?? []) {
+      const host = extractSourceHost(row.url);
+      if (host && !sourceByHost.has(host)) sourceByHost.set(host, row);
+    }
 
     if (totalCandidates === 0) {
       return json({
@@ -523,6 +531,13 @@ async function handlePostSources(request: Request, env: Env, ctx: ExecutionConte
     const duplicateUrls: string[] = [];
     const failedUrls: string[] = [];
     for (const sourceUrl of urls) {
+      const host = extractSourceHost(sourceUrl);
+      const existingByHost = host ? sourceByHost.get(host) : undefined;
+      if (existingByHost) {
+        duplicateUrls.push(sourceUrl);
+        ctx.waitUntil(hydrateSourceItems(existingByHost, env));
+        continue;
+      }
       const sourceType = inferSourceType(sourceUrl);
       // Keep bulk insert fast/reliable: avoid per-URL network fetch during request.
       const sourceName = extractDomain(sourceUrl);
@@ -540,6 +555,8 @@ async function handlePostSources(request: Request, env: Env, ctx: ExecutionConte
           if (inserted) {
             await seedItemForSource(inserted, env);
             ctx.waitUntil(hydrateSourceItems(inserted, env));
+            const insertedHost = extractSourceHost(inserted.url);
+            if (insertedHost && !sourceByHost.has(insertedHost)) sourceByHost.set(insertedHost, inserted);
           }
         } else {
           duplicateUrls.push(sourceUrl);
@@ -578,6 +595,18 @@ async function handlePostSources(request: Request, env: Env, ctx: ExecutionConte
   }
   if (!["rss", "blog"].includes(body.type)) {
     return json({ error: "type must be rss | blog" }, { status: 400 });
+  }
+
+  const incomingHost = extractSourceHost(body.url);
+  if (incomingHost) {
+    const existing = await env.DB
+      .prepare("SELECT id, name, url, type FROM sources")
+      .all<{ id: number; name: string; url: string; type: SourceType }>();
+    const match = (existing.results ?? []).find((row) => extractSourceHost(row.url) === incomingHost);
+    if (match) {
+      ctx.waitUntil(hydrateSourceItems(match, env));
+      return json({ ok: true, duplicateByHost: true }, { status: 201 });
+    }
   }
 
   await env.DB.prepare("INSERT INTO sources (name, url, type) VALUES (?, ?, ?)")
@@ -634,6 +663,14 @@ function extractDomain(sourceUrl: string) {
     return host.replace(/^www\./, "");
   } catch {
     return "unknown";
+  }
+}
+
+function extractSourceHost(sourceUrl: string) {
+  try {
+    return new URL(sourceUrl).hostname.toLowerCase().replace(/^www\./, "");
+  } catch {
+    return "";
   }
 }
 
