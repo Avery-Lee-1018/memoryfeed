@@ -199,15 +199,7 @@ export default function FeedCard({
       {memoOpen && (
         <div className="mt-1.5 rounded-2xl bg-white px-4 py-3 shadow-sm">
           {memoEditing ? (
-            <div className="flex flex-col gap-2.5">
-              <textarea
-                autoFocus
-                value={draftMemo}
-                onChange={(e) => setDraftMemo(e.target.value)}
-                placeholder="메모를 남겨보세요"
-                className="w-full resize-none rounded-xl border border-zinc-200 bg-zinc-50 p-2.5 text-sm leading-relaxed text-foreground placeholder:text-muted-foreground/40 focus:outline-none focus:ring-1 focus:ring-zinc-200"
-                rows={3}
-              />
+            <div className="flex flex-col gap-2">
               <div className="flex items-center justify-between">
                 <button
                   onClick={handleCancelEdit}
@@ -218,11 +210,19 @@ export default function FeedCard({
                 <button
                   onClick={handleSave}
                   disabled={memoSaving || !draftMemo.trim()}
-                  className="rounded-full bg-foreground px-3.5 py-1 text-xs font-medium text-white transition-colors hover:bg-foreground/80 disabled:opacity-40"
+                  className="rounded-full bg-foreground px-3.5 py-1 text-xs font-medium text-white transition-colors hover:bg-foreground/80 disabled:opacity-30 disabled:cursor-not-allowed"
                 >
                   {memoSaving ? "저장 중…" : "저장"}
                 </button>
               </div>
+              <textarea
+                autoFocus
+                value={draftMemo}
+                onChange={(e) => setDraftMemo(e.target.value)}
+                placeholder="메모를 남겨보세요"
+                className="w-full resize-none rounded-xl border border-zinc-200 bg-zinc-50 p-2.5 text-sm leading-relaxed text-foreground placeholder:text-muted-foreground/40 focus:outline-none focus:ring-1 focus:ring-zinc-200"
+                rows={3}
+              />
             </div>
           ) : (
             <div>
