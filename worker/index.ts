@@ -1000,6 +1000,7 @@ async function ingestItemsForSource(
           WHEN lower(trim(items.title)) = lower(trim(?)) THEN excluded.title
           WHEN items.title LIKE 'http://%' OR items.title LIKE 'https://%' THEN excluded.title
           WHEN items.title LIKE '%&#%' THEN excluded.title
+          WHEN items.title GLOB '*%[0-9A-Fa-f][0-9A-Fa-f]*' THEN excluded.title
           ELSE items.title
         END,
         summary = CASE
@@ -1577,13 +1578,30 @@ function deriveTitleFromUrl(url: string) {
     const parts = parsed.pathname.split("/").filter(Boolean);
     const last = parts[parts.length - 1] || "";
     if (!last) return "";
-    return last
+    const decoded = decodeUrlSlug(last);
+    return decoded
       .replace(/[-_]+/g, " ")
+      .replace(/[?&]source=[^\s]+/gi, "")
+      .replace(/\b[a-f0-9]{8,}\b$/i, "")
       .replace(/\.[a-z0-9]+$/i, "")
       .trim();
   } catch {
     return "";
   }
+}
+
+function decodeUrlSlug(value: string) {
+  let current = value;
+  for (let i = 0; i < 2; i += 1) {
+    try {
+      const next = decodeURIComponent(current.replace(/\+/g, " "));
+      if (next === current) break;
+      current = next;
+    } catch {
+      break;
+    }
+  }
+  return current;
 }
 
 function normalizeEntryUrl(url: string, baseUrl: string) {
