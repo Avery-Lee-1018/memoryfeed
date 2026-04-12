@@ -72,6 +72,12 @@ function buildStamps(dateKey: string): Stamp[] {
   }
 
   const pattern = LAYOUT_PATTERNS[Math.floor(rand(dateKey, 777) * LAYOUT_PATTERNS.length)];
+  const sizeProfilePool = [
+    [1.2, 1.0, 0.9],
+    [1.15, 0.95, 1.0],
+    [1.1, 1.0, 1.05],
+  ] as const;
+  const sizeProfile = sizeProfilePool[Math.floor(rand(dateKey, 991) * sizeProfilePool.length)];
 
   return picked.map((shape, i) => {
     const r = (n: number) => rand(dateKey, i * 30 + n + 50);
@@ -82,8 +88,9 @@ function buildStamps(dateKey: string): Stamp[] {
 
     const zIndex = base.z;
 
-    // size: 42–74 px (smaller to reduce card overlap risk)
-    const size = 42 + r(3) * 32;
+    // size: base 56–90 px, then harmonized per-stamp scale profile
+    const baseSize = 56 + r(3) * 34;
+    const size = baseSize * (sizeProfile[i] ?? 1);
 
     // rotation: -20..+20 deg
     const rotate = r(4) * 40 - 20;
