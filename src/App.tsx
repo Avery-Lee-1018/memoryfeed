@@ -134,7 +134,17 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [replacingIds, setReplacingIds] = useState<Set<number>>(new Set());
   const [memoItemIds, setMemoItemIds] = useState<Set<number>>(new Set());
-  const [selectedDate, setSelectedDate] = useState(toIsoDate(new Date()));
+  const [selectedDate, setSelectedDate] = useState(() => {
+    // Restore last-viewed date within the same browser session (survives refresh).
+    // sessionStorage is cleared when the tab/window is closed, so a new session
+    // always starts on today.
+    const stored = sessionStorage.getItem("selectedDate");
+    const todayStr = toIsoDate(new Date());
+    if (stored && /^\d{4}-\d{2}-\d{2}$/.test(stored) && stored <= todayStr && stored >= FEED_START_DATE) {
+      return stored;
+    }
+    return todayStr;
+  });
   const [sourceInput, setSourceInput] = useState("");
   const [sourceSubmitting, setSourceSubmitting] = useState(false);
   const [sources, setSources] = useState<SourceEntry[]>([]);
@@ -237,11 +247,16 @@ export default function App() {
 
   const moveDate = (delta: number) => {
     if (delta < 0 && isAtStartDate) return;
-    setSelectedDate((prev) => shiftDate(prev, delta));
+    setSelectedDate((prev) => {
+      const next = shiftDate(prev, delta);
+      sessionStorage.setItem("selectedDate", next);
+      return next;
+    });
   };
 
   const moveToToday = () => {
     if (isToday) return;
+    sessionStorage.setItem("selectedDate", todayIso);
     setSelectedDate(todayIso);
   };
 
