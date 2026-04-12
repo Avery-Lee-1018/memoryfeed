@@ -1,18 +1,6 @@
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
-
-export type SourceEntry = {
-  id: number;
-  name: string;
-  url: string;
-  type: "rss" | "blog";
-  level?: "core" | "focus" | "light";
-  is_active: number;
-  exposureCount: number;
-  memoCount: number;
-  lastExposedAt?: string | null;
-  lastActivityAt?: string | null;
-};
+import type { SourceEntry, SourceLevel } from "@/types/source";
 
 type Props = {
   sourceInput: string;
@@ -26,7 +14,7 @@ type Props = {
   onDeleteSource: (sourceId: number) => void;
 };
 
-type LevelKey = "light" | "focus" | "core";
+type LevelKey = SourceLevel;
 
 const LEVELS: { key: LevelKey; title: string; hint: string }[] = [
   { key: "core", title: "Core", hint: "자주 떠오른 출처" },

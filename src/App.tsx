@@ -3,130 +3,19 @@ import { AnimatePresence, motion } from "framer-motion";
 import FeedCard, { FeedItem } from "@/components/FeedCard";
 import CardSkeleton from "@/components/CardSkeleton";
 import MemoShapes from "@/components/MemoShapes";
-import MySourcesView, { SourceEntry } from "@/components/MySourcesView";
+import MySourcesView from "@/components/MySourcesView";
+import AppToast, { type AppToastState } from "@/components/AppToast";
 import { authorizedFetch, readJson } from "@/lib/api";
+import { FEED_START_DATE, getTitleForDate, shiftDate, toIsoDate } from "@/lib/feed";
+import {
+  type SourceBulkResult,
+  buildSourceResultToast,
+  normalizeSourceEntry,
+  parseSourceInput,
+} from "@/lib/sources";
+import type { SourceEntry } from "@/types/source";
 
 const SKELETON_MIN_MS = 500;
-const FEED_START_DATE = "2026-04-01";
-
-const TITLE_CANDIDATES = [
-  "수면 위로 떠오른 것들",
-  "오늘은 이 셋이면 충분하다",
-  "다시 보게 된 이유가 있다면",
-  "그냥 지나치긴 아쉬운 것들",
-  "익숙한데 낯선 단서들",
-  "오늘따라 오래 남는 문장들",
-  "말없이 붙잡히는 장면들",
-  "조용히 다시 열어본 것들",
-  "지금의 마음에 닿는 기록",
-  "잠깐 멈추게 되는 이유",
-  "한 번 더 읽게 된 조각들",
-  "어제와는 다른 결의 문장",
-  "지나쳤다가 돌아온 생각",
-  "오늘의 속도를 바꾸는 힌트",
-  "문득 다시 붙는 연결들",
-  "가볍게 넘기기 어려운 것",
-  "지금 필요한 온도의 문장",
-  "늦게 도착한 좋은 단서",
-  "한 칸 더 깊어지는 시선",
-  "의외로 오래 머무는 장면",
-  "잊힌 줄 알았던 감각들",
-  "다시 보면 달라지는 조각",
-  "오늘의 맥락을 깨우는 것",
-  "잠깐의 정적을 만드는 글",
-  "익숙함 바깥의 작은 힌트",
-  "지금 꺼내기 좋은 기억",
-  "어쩐지 오늘 맞는 흐름",
-  "생각보다 가까이 있던 단서",
-  "한 번쯤 멈춰 볼 이유",
-  "계속 남아 있던 여운",
-];
-
-const toIsoDate = (date: Date) => {
-  const y = date.getFullYear();
-  const m = String(date.getMonth() + 1).padStart(2, "0");
-  const d = String(date.getDate()).padStart(2, "0");
-  return `${y}-${m}-${d}`;
-};
-const shiftDate = (isoDate: string, deltaDays: number) => {
-  const d = new Date(`${isoDate}T00:00:00`);
-  d.setDate(d.getDate() + deltaDays);
-  return toIsoDate(d);
-};
-
-const getTitleForDate = (isoDate: string) => {
-  // Use a coprime step to cycle through all titles before repeating.
-  // This guarantees day-to-day variation and avoids clustered repeats.
-  const serialDay = Math.floor(new Date(`${isoDate}T00:00:00`).getTime() / 86400000);
-  const len = TITLE_CANDIDATES.length;
-  const step = 7; // gcd(7, 30) = 1
-  const offset = 11;
-  const idx = ((serialDay * step + offset) % len + len) % len;
-  return TITLE_CANDIDATES[idx];
-};
-
-function parseSourceInput(input: string) {
-  const tokens = input
-    .split(/\s+/)
-    .map((v) => v.trim())
-    .filter(Boolean);
-
-  const deduped = new Set<string>();
-  for (const token of tokens) {
-    try {
-      const parsed = new URL(token);
-      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") continue;
-      parsed.hash = "";
-      deduped.add(parsed.toString());
-    } catch {
-      // ignore invalid URL token
-    }
-  }
-
-  return {
-    totalTokens: tokens.length,
-    urls: [...deduped],
-  };
-}
-
-function normalizeSourceEntry(raw: Record<string, unknown>): SourceEntry {
-  const levelRaw = typeof raw.level === "string" ? raw.level : null;
-  const level = levelRaw === "core" || levelRaw === "focus" || levelRaw === "light"
-    ? levelRaw
-    : undefined;
-  return {
-    id: Number(raw.id ?? 0),
-    name: String(raw.name ?? ""),
-    url: String(raw.url ?? ""),
-    type: (raw.type === "rss" ? "rss" : "blog"),
-    level,
-    is_active: Number(raw.is_active ?? 0),
-    exposureCount: Number(raw.exposureCount ?? 0),
-    memoCount: Number(raw.memoCount ?? 0),
-    lastExposedAt: typeof raw.lastExposedAt === "string" ? raw.lastExposedAt : null,
-    lastActivityAt: typeof raw.lastActivityAt === "string" ? raw.lastActivityAt : null,
-  };
-}
-
-type SourceBulkResult = {
-  added?: number;
-  failed?: number;
-  invalidCount?: number;
-  duplicateCount?: number;
-  addedUrls?: string[];
-  duplicateUrls?: string[];
-  failedUrls?: string[];
-  invalidTokens?: string[];
-  error?: string;
-};
-
-type ToastState = {
-  tone: "success" | "warning" | "error";
-  title: string;
-  description?: string;
-  retryUrls?: string[];
-  undoFn?: () => void;
-} | null;
 
 export default function App() {
   const [view, setView] = useState<"feed" | "sources">("feed");
@@ -150,7 +39,7 @@ export default function App() {
   const [sourceSubmitting, setSourceSubmitting] = useState(false);
   const [sources, setSources] = useState<SourceEntry[]>([]);
   const [sourcesLoading, setSourcesLoading] = useState(false);
-  const [toast, setToast] = useState<ToastState>(null);
+  const [toast, setToast] = useState<AppToastState>(null);
 
   useEffect(() => {
     setLoading(true);
@@ -273,45 +162,6 @@ export default function App() {
   const hasMemoToday = memoItemIds.size > 0;
   const canSubmitSource = sourceInput.trim().length > 0 && !sourceSubmitting;
 
-  const showSourceToast = (result: SourceBulkResult) => {
-    const added = result.added ?? 0;
-    const duplicateCount = result.duplicateCount ?? 0;
-    const invalidCount = result.invalidCount ?? 0;
-    const failedUrls = result.failedUrls ?? [];
-    const failedCount = invalidCount + failedUrls.length;
-    const registeredCount = added + duplicateCount;
-    const reasonParts: string[] = [];
-    if (duplicateCount > 0) reasonParts.push(`이미 등록 ${duplicateCount}개`);
-    if (invalidCount > 0) reasonParts.push(`형식 오류 ${invalidCount}개`);
-    if (failedUrls.length > 0) reasonParts.push(`처리 실패 ${failedUrls.length}개`);
-
-    if (registeredCount > 0 && failedCount === 0) {
-      setToast({
-        tone: "success",
-        title: `${registeredCount}개 등록됨`,
-        description: duplicateCount > 0 ? `새로 ${added}개, 기존 ${duplicateCount}개` : undefined,
-      });
-      return;
-    }
-
-    if (registeredCount === 0 && failedCount > 0) {
-      setToast({
-        tone: "error",
-        title: `등록된 것 0개 · 안된 것 ${failedCount}개`,
-        description: reasonParts.join(" · "),
-        retryUrls: failedUrls.length > 0 ? failedUrls : undefined,
-      });
-      return;
-    }
-
-    setToast({
-      tone: "warning",
-      title: `등록된 것 ${registeredCount}개 · 안된 것 ${failedCount}개`,
-      description: reasonParts.join(" · "),
-      retryUrls: failedUrls.length > 0 ? failedUrls : undefined,
-    });
-  };
-
   const postSources = async (payload: { rawText?: string; urls?: string[] }) => {
     setSourceSubmitting(true);
     try {
@@ -339,7 +189,7 @@ export default function App() {
         });
         return;
       }
-      showSourceToast(data);
+      setToast(buildSourceResultToast(data));
       if ((data.added ?? 0) > 0 || (data.duplicateCount ?? 0) > 0) {
         void loadSources(false);
       }
@@ -621,58 +471,13 @@ export default function App() {
           )}
         </div>
       </div>
-      {toast && (
-        <div className="fixed left-1/2 top-12 z-50 w-[min(92vw,560px)] -translate-x-1/2">
-          <div
-            className={`rounded-xl border px-4 py-3 shadow-lg backdrop-blur ${
-              toast.tone === "success"
-                ? "border-emerald-200 bg-emerald-50/95 text-emerald-900"
-                : toast.tone === "warning"
-                  ? "border-amber-200 bg-amber-50/95 text-amber-900"
-                  : "border-rose-200 bg-rose-50/95 text-rose-900"
-            }`}
-          >
-            <div className="flex items-start justify-between gap-3">
-              <div>
-                <p className="text-sm font-semibold">{toast.title}</p>
-                {toast.description && (
-                  <p className="mt-0.5 text-xs opacity-80">{toast.description}</p>
-                )}
-              </div>
-              {!toast.undoFn && (
-                <button
-                  onClick={() => setToast(null)}
-                  className="mt-0.5 text-xs opacity-70 hover:opacity-100"
-                  aria-label="토스트 닫기"
-                >
-                  닫기
-                </button>
-              )}
-            </div>
-            {toast.undoFn && (
-              <div className="mt-2">
-                <button
-                  onClick={toast.undoFn}
-                  className="rounded-full border border-current/30 bg-white/70 px-3 py-1 text-xs font-medium hover:bg-white"
-                >
-                  실행취소
-                </button>
-              </div>
-            )}
-            {toast.retryUrls && toast.retryUrls.length > 0 && (
-              <div className="mt-2">
-                <button
-                  onClick={retryFailedSources}
-                  disabled={sourceSubmitting}
-                  className="rounded-full border border-current/30 bg-white/70 px-3 py-1 text-xs font-medium hover:bg-white disabled:opacity-50"
-                >
-                  {sourceSubmitting ? "재시도 중..." : "안된 것만 등록하기"}
-                </button>
-              </div>
-            )}
-          </div>
-        </div>
-      )}
+      <AppToast
+        toast={toast}
+        sourceSubmitting={sourceSubmitting}
+        onClose={() => setToast(null)}
+        onUndo={() => toast?.undoFn?.()}
+        onRetry={retryFailedSources}
+      />
     </div>
   );
 }
