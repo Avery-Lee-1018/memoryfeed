@@ -105,7 +105,7 @@ export default function FeedCard({
   };
 
   return (
-    <Card className="w-full overflow-hidden rounded-2xl border-0 shadow-sm">
+    <Card className="relative z-30 w-full overflow-hidden rounded-2xl border-0 shadow-sm">
       {/* Thumbnail */}
       <div className="relative h-[201px] w-full overflow-hidden">
         {!imageLoaded && (
