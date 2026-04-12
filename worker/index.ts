@@ -27,7 +27,7 @@ export default {
         return handleGetThumbnail(request, url, ctx);
       }
       if (request.method === "GET" && url.pathname === "/api/feed/today") {
-        return handleGetFeedToday(url, env);
+        return handleGetFeedToday(url, env, ctx);
       }
       if (request.method === "POST" && url.pathname === "/api/feed/replacement") {
         return handlePostFeedReplacement(request, env);
@@ -39,7 +39,7 @@ export default {
         return handleGetSources(env);
       }
       if (request.method === "POST" && url.pathname === "/api/sources") {
-        return handlePostSources(request, env);
+        return handlePostSources(request, env, ctx);
       }
       if (request.method === "PATCH" && /^\/api\/sources\/\d+$/.test(url.pathname)) {
         const sourceId = parseInt(url.pathname.split("/")[3]);
@@ -194,7 +194,7 @@ function getDateParamOrToday(value: string | null): string {
   return parsed;
 }
 
-async function handleGetFeedToday(url: URL, env: Env) {
+async function handleGetFeedToday(url: URL, env: Env, ctx: ExecutionContext) {
   await cleanupDemoData(env);
   await ensureItemsFromSources(env);
   const targetDate = getDateParamOrToday(url.searchParams.get("date"));
@@ -241,8 +241,70 @@ async function handleGetFeedToday(url: URL, env: Env) {
     result = await queryDistinctDateItems(targetDate, env);
   }
 
-  const finalItems = ((result.results ?? []) as Record<string, unknown>[]).map(({ sourceId, ...rest }) => rest);
+  const rows = (result.results ?? []) as Record<string, unknown>[];
+  ctx.waitUntil((async () => {
+    await Promise.allSettled([
+      rehydrateWeakShownSources(rows, env),
+      rehydrateRandomWeakSource(env),
+    ]);
+  })());
+  const finalItems = rows.map(({ sourceId, ...rest }) => rest);
   return json({ date: targetDate, items: finalItems });
+}
+
+async function rehydrateWeakShownSources(rows: Record<string, unknown>[], env: Env) {
+  const sourceIds = [...new Set(
+    rows.map((row) => Number(row.sourceId)).filter(Number.isFinite)
+  )];
+  for (const sourceId of sourceIds.slice(0, 2)) {
+    const source = await env.DB.prepare(`
+      SELECT id, name, url, type
+      FROM sources
+      WHERE id = ?
+      LIMIT 1
+    `).bind(sourceId).first<{ id: number; name: string; url: string; type: SourceType }>();
+    if (!source) continue;
+
+    const weak = await env.DB.prepare(`
+      SELECT COUNT(*) AS weakCount
+      FROM items
+      WHERE source_id = ?
+        AND (
+          title IS NULL OR trim(title) = ''
+          OR lower(trim(title)) = lower(trim(?))
+          OR title LIKE 'http://%'
+          OR title LIKE 'https://%'
+          OR title LIKE '%&#%'
+          OR summary LIKE '%&#%'
+        )
+    `).bind(sourceId, source.name).first<{ weakCount?: number }>();
+
+    if (Number(weak?.weakCount ?? 0) <= 0) continue;
+    await hydrateSourceItems(source, env);
+  }
+}
+
+async function rehydrateRandomWeakSource(env: Env) {
+  const source = await env.DB.prepare(`
+    SELECT s.id, s.name, s.url, s.type
+    FROM sources s
+    JOIN items i ON i.source_id = s.id
+    WHERE s.is_active = 1
+      AND (
+        i.title IS NULL OR trim(i.title) = ''
+        OR lower(trim(i.title)) = lower(trim(s.name))
+        OR i.title LIKE 'http://%'
+        OR i.title LIKE 'https://%'
+        OR i.title LIKE '%&#%'
+        OR i.summary LIKE '%&#%'
+        OR trim(COALESCE(i.summary, '')) IN ('*', '-')
+      )
+    ORDER BY RANDOM()
+    LIMIT 1
+  `).first<{ id: number; name: string; url: string; type: SourceType }>();
+
+  if (!source) return;
+  await hydrateSourceItems(source, env);
 }
 
 async function queryDistinctDateItems(targetDate: string, env: Env) {
@@ -418,7 +480,7 @@ async function handleGetSources(env: Env) {
   return json({ sources: result.results ?? [] });
 }
 
-async function handlePostSources(request: Request, env: Env) {
+async function handlePostSources(request: Request, env: Env, ctx: ExecutionContext) {
   let body: { name?: string; url?: string; type?: SourceType; rawText?: string; urls?: string[] };
   try {
     body = (await request.json()) as { name?: string; url?: string; type?: SourceType; rawText?: string; urls?: string[] };
@@ -465,6 +527,7 @@ async function handlePostSources(request: Request, env: Env) {
             .first<{ id: number; name: string; url: string; type: SourceType }>();
           if (inserted) {
             await seedItemForSource(inserted, env);
+            ctx.waitUntil(hydrateSourceItems(inserted, env));
           }
         } else {
           duplicateUrls.push(sourceUrl);
@@ -507,10 +570,8 @@ async function handlePostSources(request: Request, env: Env) {
     .bind(body.url)
     .first<{ id: number; name: string; url: string; type: SourceType }>();
   if (inserted) {
-    const count = await ingestItemsForSource(inserted, env);
-    if (count === 0) {
-      await seedItemForSource(inserted, env);
-    }
+    await seedItemForSource(inserted, env);
+    ctx.waitUntil(hydrateSourceItems(inserted, env));
   }
 
   return json({ ok: true }, { status: 201 });
@@ -802,6 +863,26 @@ async function seedItemForSource(
   ).run();
 }
 
+async function hydrateSourceItems(
+  source: { id: number; name: string; url: string; type: SourceType },
+  env: Env,
+) {
+  const inserted = await ingestItemsForSource(source, env);
+  if (inserted <= 0) return;
+
+  await env.DB.prepare(`
+    DELETE FROM items
+    WHERE source_id = ?
+      AND RTRIM(url, '/') = RTRIM(?, '/')
+      AND NOT EXISTS (
+        SELECT 1
+        FROM notes n
+        WHERE n.item_id = items.id
+          AND trim(n.content) != ''
+      )
+  `).bind(source.id, source.url).run();
+}
+
 async function ingestItemsForSource(
   source: { id: number; name: string; url: string; type: SourceType },
   env: Env,
@@ -811,8 +892,25 @@ async function ingestItemsForSource(
 
   let inserted = 0;
   for (const entry of entries.slice(0, ENTRY_LIMIT_PER_SOURCE)) {
-    const resolvedTitle = normalizeDisplayText(entry.title || deriveTitleFromUrl(entry.url) || source.name);
-    const resolvedSummary = entry.summary ? normalizeDisplayText(entry.summary) : null;
+    let resolvedTitle = normalizeDisplayText(entry.title || deriveTitleFromUrl(entry.url) || source.name);
+    let resolvedSummary = entry.summary ? normalizeDisplayText(entry.summary) : null;
+
+    if (isWeakEntryTitle(resolvedTitle, source.name)) {
+      const html = await fetchSourceText(entry.url, "text/html,application/xhtml+xml");
+      if (html) {
+        const htmlTitle = normalizeDisplayText((extractHtmlTitle(html) ?? "").replace(/\|\s*Substack.*$/i, "").trim());
+        if (htmlTitle && !isWeakEntryTitle(htmlTitle, source.name)) {
+          resolvedTitle = htmlTitle;
+        }
+        if (!resolvedSummary || !isUsableSummary(resolvedSummary)) {
+          const metaSummary = normalizeDisplayText(extractMetaDescription(html) ?? "");
+          if (isUsableSummary(metaSummary)) {
+            resolvedSummary = metaSummary;
+          }
+        }
+      }
+    }
+
     const result = await env.DB.prepare(`
       INSERT INTO items (source_id, title, url, summary, thumbnail_url, status, shown_date)
       VALUES (?, ?, ?, ?, ?, 'active', NULL)
@@ -821,10 +919,14 @@ async function ingestItemsForSource(
           WHEN items.title IS NULL OR trim(items.title) = '' THEN excluded.title
           WHEN lower(trim(items.title)) = lower(trim(?)) THEN excluded.title
           WHEN items.title LIKE 'http://%' OR items.title LIKE 'https://%' THEN excluded.title
+          WHEN items.title LIKE '%&#%' THEN excluded.title
           ELSE items.title
         END,
         summary = CASE
           WHEN items.summary IS NULL OR trim(items.summary) = '' THEN excluded.summary
+          WHEN items.summary LIKE '%&#%' THEN excluded.summary
+          WHEN trim(items.summary) = '*' THEN excluded.summary
+          WHEN trim(items.summary) = '-' THEN excluded.summary
           ELSE items.summary
         END,
         thumbnail_url = COALESCE(items.thumbnail_url, excluded.thumbnail_url)
@@ -956,7 +1058,11 @@ function parseRssEntries(xml: string, baseUrl: string) {
   for (const block of itemBlocks) {
     const title = normalizeDisplayText(decodeXml(stripTags(matchTag(block, "title"))).trim());
     const linkRaw = decodeXml(matchTag(block, "link")).trim();
-    const description = normalizeDisplayText(decodeXml(stripTags(matchTag(block, "description"))).trim());
+    const descriptionRaw = matchTag(block, "description");
+    const contentRaw = matchTag(block, "content:encoded");
+    const description = normalizeDisplayText(decodeXml(stripTags(descriptionRaw)).trim());
+    const contentSummary = normalizeDisplayText(decodeXml(stripTags(contentRaw)).trim());
+    const summary = pickBestSummary(description, contentSummary);
     const descriptionHtml = matchTag(block, "description");
     const thumbnailRaw =
       getAttr((block.match(/<media:content[^>]*>/i) || [""])[0], "url") ||
@@ -969,7 +1075,7 @@ function parseRssEntries(xml: string, baseUrl: string) {
     entries.push({
       title,
       url: link,
-      summary: description || undefined,
+      summary: summary || undefined,
       thumbnailUrl: thumbnailUrl || undefined,
     });
   }
@@ -1057,11 +1163,37 @@ function decodeHtmlEntities(text: string) {
 
 function normalizeDisplayText(text: string) {
   return text
+    .replace(/\u00a0/g, " ")
     .replace(/[“”]/g, '"')
     .replace(/[‘’]/g, "'")
     .replace(/[–—]/g, "-")
+    .replace(/^\s*[\-*•·]+\s*/, "")
+    .replace(/\s+\*\s+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function isWeakEntryTitle(title: string, sourceName: string) {
+  const normalized = normalizeDisplayText(title).toLowerCase();
+  if (!normalized) return true;
+  if (normalized === sourceName.toLowerCase()) return true;
+  if (normalized.startsWith("http://") || normalized.startsWith("https://")) return true;
+  if (/^[a-z0-9-]{1,8}$/i.test(normalized)) return true;
+  return false;
+}
+
+function pickBestSummary(primary: string, fallback: string) {
+  const cleanedPrimary = normalizeDisplayText(primary);
+  if (isUsableSummary(cleanedPrimary)) return cleanedPrimary;
+  const cleanedFallback = normalizeDisplayText(fallback);
+  return isUsableSummary(cleanedFallback) ? cleanedFallback : "";
+}
+
+function isUsableSummary(summary: string) {
+  if (!summary) return false;
+  if (summary === "*" || summary === "-") return false;
+  if (summary.length < 8) return false;
+  return true;
 }
 
 function deriveTitleFromUrl(url: string) {
