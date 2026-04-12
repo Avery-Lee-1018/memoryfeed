@@ -9,6 +9,7 @@ type SourceLevel = "core" | "focus" | "light";
 const FEED_START_DATE = "2026-04-01";
 const ENTRY_LIMIT_PER_SOURCE = 18;
 const KOREAN_ACCEPT_LANGUAGE = "ko-KR,ko;q=0.95,en-US;q=0.7,en;q=0.6";
+const CRAWLER_USER_AGENT = "Mozilla/5.0 (compatible; MemoryFeedBot/1.0)";
 
 const json = (data: unknown, init: ResponseInit = {}) =>
   new Response(JSON.stringify(data), {
@@ -92,12 +93,8 @@ async function handleGetThumbnail(request: Request, url: URL, ctx: ExecutionCont
   }
 
   // 2) Resolve OG/Twitter image from page HTML.
-    const pageRes = await fetch(pageUrl, {
-      headers: {
-        "user-agent": "Mozilla/5.0 (compatible; MemoryFeedBot/1.0)",
-        accept: "text/html,application/xhtml+xml",
-        "accept-language": KOREAN_ACCEPT_LANGUAGE,
-      },
+  const pageRes = await fetch(pageUrl, {
+    headers: buildCrawlerHeaders("text/html,application/xhtml+xml"),
     cf: {
       cacheEverything: true,
       cacheTtl: 60 * 30
@@ -146,12 +143,7 @@ async function handleGetThumbnail(request: Request, url: URL, ctx: ExecutionCont
 
 async function fetchImage(targetUrl: string, referer?: string) {
   const upstream = await fetch(targetUrl, {
-    headers: {
-      "user-agent": "Mozilla/5.0 (compatible; MemoryFeedBot/1.0)",
-      accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-      "accept-language": KOREAN_ACCEPT_LANGUAGE,
-      ...(referer ? { referer } : {})
-    },
+    headers: buildCrawlerHeaders("image/avif,image/webp,image/apng,image/*,*/*;q=0.8", referer),
     cf: {
       cacheEverything: true,
       cacheTtl: 60 * 60 * 12
@@ -188,6 +180,15 @@ function extractMetaImage(html: string, pageUrl: string): string | null {
   } catch {
     return null;
   }
+}
+
+function buildCrawlerHeaders(accept: string, referer?: string) {
+  return {
+    "user-agent": CRAWLER_USER_AGENT,
+    accept,
+    "accept-language": KOREAN_ACCEPT_LANGUAGE,
+    ...(referer ? { referer } : {}),
+  };
 }
 
 function getDateParamOrToday(value: string | null): string {
@@ -663,12 +664,8 @@ function normalizeUrl(input: string): string | null {
 }
 
 function extractDomain(sourceUrl: string) {
-  try {
-    const host = new URL(sourceUrl).hostname.toLowerCase();
-    return host.replace(/^www\./, "");
-  } catch {
-    return "unknown";
-  }
+  const host = extractSourceHost(sourceUrl);
+  return host || "unknown";
 }
 
 function extractSourceHost(sourceUrl: string) {
@@ -687,36 +684,9 @@ function inferSourceType(sourceUrl: string): SourceType {
   return "blog";
 }
 
-async function resolveSourceName(sourceUrl: string, sourceType: SourceType) {
-  const fallback = extractDomain(sourceUrl);
-  try {
-    const res = await fetch(sourceUrl, {
-      headers: {
-        "user-agent": "Mozilla/5.0 (compatible; MemoryFeedBot/1.0)",
-        accept: sourceType === "rss" ? "application/rss+xml,application/xml,text/xml,text/html" : "text/html,application/xhtml+xml,application/xml",
-        "accept-language": KOREAN_ACCEPT_LANGUAGE,
-      },
-      cf: { cacheEverything: true, cacheTtl: 60 * 30 },
-    });
-    if (!res.ok) return fallback;
-    const text = await res.text();
-    const extracted = sourceType === "rss" ? extractFeedTitle(text) : extractHtmlTitle(text);
-    return extracted || fallback;
-  } catch {
-    return fallback;
-  }
-}
-
 function extractHtmlTitle(html: string) {
   const match = html.match(/<title[^>]*>([^<]+)<\/title>/i);
   return match?.[1]?.trim() || null;
-}
-
-function extractFeedTitle(xml: string) {
-  const channel = xml.match(/<channel[\s\S]*?<title>([^<]+)<\/title>/i);
-  if (channel?.[1]) return channel[1].trim();
-  const atom = xml.match(/<feed[\s\S]*?<title[^>]*>([^<]+)<\/title>/i);
-  return atom?.[1]?.trim() || null;
 }
 
 function nextIsoDate(isoDate: string) {
@@ -1075,11 +1045,7 @@ async function fetchSourceText(targetUrl: string, accept = "text/html,applicatio
   const timeout = setTimeout(() => controller.abort(), 7000);
   try {
     const res = await fetch(targetUrl, {
-      headers: {
-        "user-agent": "Mozilla/5.0 (compatible; MemoryFeedBot/1.0)",
-        accept,
-        "accept-language": KOREAN_ACCEPT_LANGUAGE,
-      },
+      headers: buildCrawlerHeaders(accept),
       signal: controller.signal,
       cf: { cacheEverything: true, cacheTtl: 60 * 30 },
     });
@@ -1532,11 +1498,7 @@ function normalizeDisplayText(text: string) {
 }
 
 function safeHost(url: string) {
-  try {
-    return new URL(url).hostname.toLowerCase();
-  } catch {
-    return "";
-  }
+  return extractSourceHost(url);
 }
 
 function canonicalEntryKey(url: string) {
