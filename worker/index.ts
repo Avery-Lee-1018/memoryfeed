@@ -80,7 +80,6 @@ export default {
 function isProtectedRoute(method: string, pathname: string) {
   if (method === "POST" && pathname === "/api/reaction") return true;
   if (method === "POST" && pathname === "/api/feed/replacement") return true;
-  if (method === "GET" && pathname === "/api/sources") return true;
   if (method === "POST" && pathname === "/api/sources") return true;
   if ((method === "PATCH" || method === "DELETE") && /^\/api\/sources\/\d+$/.test(pathname)) return true;
   if ((method === "GET" || method === "POST" || method === "DELETE") && /^\/api\/notes\/\d+$/.test(pathname)) return true;
