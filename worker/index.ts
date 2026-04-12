@@ -269,6 +269,7 @@ async function rehydrateWeakShownSources(rows: Record<string, unknown>[], env: E
           OR title LIKE 'http://%'
           OR title LIKE 'https://%'
           OR title LIKE '%&#%'
+          OR title LIKE '%!%%' ESCAPE '!'
           OR summary LIKE '%&#%'
         )
     `).bind(sourceId, source.name).first<{ weakCount?: number }>();
@@ -290,6 +291,7 @@ async function rehydrateRandomWeakSource(env: Env) {
         OR i.title LIKE 'http://%'
         OR i.title LIKE 'https://%'
         OR i.title LIKE '%&#%'
+        OR i.title LIKE '%!%%' ESCAPE '!'
         OR i.summary LIKE '%&#%'
         OR trim(COALESCE(i.summary, '')) IN ('*', '-')
       )
@@ -1041,7 +1043,7 @@ async function ingestItemsForSource(
           WHEN lower(trim(items.title)) = lower(trim(?)) THEN excluded.title
           WHEN items.title LIKE 'http://%' OR items.title LIKE 'https://%' THEN excluded.title
           WHEN items.title LIKE '%&#%' THEN excluded.title
-          WHEN items.title GLOB '*%[0-9A-Fa-f][0-9A-Fa-f]*' THEN excluded.title
+          WHEN items.title LIKE '%!%%' ESCAPE '!' THEN excluded.title
           ELSE items.title
         END,
         summary = CASE
@@ -1497,8 +1499,26 @@ function decodeHtmlEntities(text: string) {
   });
 }
 
+/**
+ * Safely decode percent-encoded sequences (e.g. %ED%85%8C → 테).
+ * Handles multi-byte UTF-8 runs and silently skips malformed sequences
+ * rather than throwing, so legitimate titles containing “%” are preserved.
+ */
+function safeDecodePercent(text: string): string {
+  if (!/%[0-9A-Fa-f]{2}/.test(text)) return text;
+  // Try full decode first (fast path).
+  try {
+    return decodeURIComponent(text);
+  } catch {
+    // Partial decode: greedily decode valid consecutive %XX runs (multi-byte aware).
+    return text.replace(/((?:%[0-9A-Fa-f]{2})+)/g, (seq) => {
+      try { return decodeURIComponent(seq); } catch { return seq; }
+    });
+  }
+}
+
 function normalizeDisplayText(text: string) {
-  return text
+  return safeDecodePercent(text)
     .replace(/\u00a0/g, " ")
     .replace(/[“”]/g, '"')
     .replace(/[‘’]/g, "'")
@@ -1592,6 +1612,8 @@ function isLikelyArticleUrl(url: string, seedHost: string) {
 }
 
 function isWeakEntryTitle(title: string, sourceName: string) {
+  // Detect un-decoded percent-encoding before normalizing (e.g. "%ED%85%8C").
+  if (/%[0-9A-Fa-f]{2}/.test(title)) return true;
   const normalized = normalizeDisplayText(title).toLowerCase();
   if (!normalized) return true;
   if (normalized === sourceName.toLowerCase()) return true;
