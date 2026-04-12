@@ -39,24 +39,24 @@ const SAFE_INSET_PX = 20;
 
 const LAYOUT_PATTERNS = [
   [
-    { left: 20, top: 13, z: 1 },
-    { left: 80, top: 13, z: 2 },
-    { left: 24, top: 29, z: 3 },
+    { left: 8, top: 9, z: 1 },
+    { left: 92, top: 10, z: 2 },
+    { left: 16, top: 18, z: 3 },
   ],
   [
-    { left: 18, top: 11, z: 2 },
-    { left: 78, top: 16, z: 1 },
-    { left: 74, top: 31, z: 3 },
+    { left: 10, top: 8, z: 2 },
+    { left: 90, top: 13, z: 1 },
+    { left: 84, top: 20, z: 3 },
   ],
   [
-    { left: 24, top: 15, z: 3 },
-    { left: 76, top: 11, z: 2 },
-    { left: 50, top: 28, z: 1 },
+    { left: 14, top: 11, z: 3 },
+    { left: 86, top: 9, z: 2 },
+    { left: 50, top: 8, z: 1 },
   ],
   [
-    { left: 16, top: 16, z: 1 },
-    { left: 82, top: 12, z: 3 },
-    { left: 52, top: 30, z: 2 },
+    { left: 8, top: 13, z: 1 },
+    { left: 92, top: 9, z: 3 },
+    { left: 50, top: 10, z: 2 },
   ],
 ] as const;
 
@@ -76,13 +76,14 @@ function buildStamps(dateKey: string): Stamp[] {
   return picked.map((shape, i) => {
     const r = (n: number) => rand(dateKey, i * 30 + n + 50);
     const base = pattern[i % pattern.length];
-    const leftPct = Math.min(84, Math.max(16, base.left + (r(0) * 2 - 1) * 4.5));
-    const topPct = Math.min(33, Math.max(10, base.top + (r(1) * 2 - 1) * 3.2));
+    // Keep stamps outside the central card rail to avoid heavy overlap with content cards.
+    const leftPct = Math.min(94, Math.max(6, base.left + (r(0) * 2 - 1) * 2.2));
+    const topPct = Math.min(22, Math.max(6, base.top + (r(1) * 2 - 1) * 2.4));
 
     const zIndex = base.z;
 
-    // size: 52–96 px
-    const size = 52 + r(3) * 44;
+    // size: 42–74 px (smaller to reduce card overlap risk)
+    const size = 42 + r(3) * 32;
 
     // rotation: -20..+20 deg
     const rotate = r(4) * 40 - 20;
