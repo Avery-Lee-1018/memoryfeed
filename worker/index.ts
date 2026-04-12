@@ -282,7 +282,8 @@ async function handleGetFeedToday(url: URL, env: Env) {
     }
   }
 
-  return json({ date: targetDate, items });
+  const enrichedItems = await enrichFeedItems(items, env);
+  return json({ date: targetDate, items: enrichedItems });
 }
 
 async function handlePostFeedReplacement(request: Request, env: Env) {
@@ -372,7 +373,9 @@ async function handlePostFeedReplacement(request: Request, env: Env) {
     }
   }
 
-  return json({ item: finalReplacement ?? null });
+  if (!finalReplacement) return json({ item: null });
+  const [enriched] = await enrichFeedItems([finalReplacement], env);
+  return json({ item: enriched ?? finalReplacement });
 }
 
 async function handlePostReaction(request: Request, env: Env) {
@@ -767,15 +770,30 @@ async function ingestItemsForSource(
 
   let inserted = 0;
   for (const entry of entries.slice(0, ENTRY_LIMIT_PER_SOURCE)) {
+    const resolvedTitle = normalizeDisplayText(entry.title || deriveTitleFromUrl(entry.url) || source.name);
+    const resolvedSummary = entry.summary ? normalizeDisplayText(entry.summary) : null;
     const result = await env.DB.prepare(`
-      INSERT OR IGNORE INTO items (source_id, title, url, summary, thumbnail_url, status, shown_date)
+      INSERT INTO items (source_id, title, url, summary, thumbnail_url, status, shown_date)
       VALUES (?, ?, ?, ?, ?, 'active', NULL)
+      ON CONFLICT(url) DO UPDATE SET
+        title = CASE
+          WHEN items.title IS NULL OR trim(items.title) = '' THEN excluded.title
+          WHEN lower(trim(items.title)) = lower(trim(?)) THEN excluded.title
+          WHEN items.title LIKE 'http://%' OR items.title LIKE 'https://%' THEN excluded.title
+          ELSE items.title
+        END,
+        summary = CASE
+          WHEN items.summary IS NULL OR trim(items.summary) = '' THEN excluded.summary
+          ELSE items.summary
+        END,
+        thumbnail_url = COALESCE(items.thumbnail_url, excluded.thumbnail_url)
     `).bind(
       source.id,
-      normalizeDisplayText(entry.title || deriveTitleFromUrl(entry.url) || source.name),
+      resolvedTitle,
       entry.url,
-      entry.summary ? normalizeDisplayText(entry.summary) : null,
+      resolvedSummary,
       entry.thumbnailUrl ?? null,
+      source.name,
     ).run();
     inserted += Number(result.meta?.changes ?? 0);
   }
@@ -1018,6 +1036,58 @@ function deriveTitleFromUrl(url: string) {
   } catch {
     return "";
   }
+}
+
+function isWeakTitle(title: string, sourceName: string) {
+  const normalized = title.trim().toLowerCase();
+  if (!normalized) return true;
+  if (normalized === sourceName.trim().toLowerCase()) return true;
+  if (normalized.startsWith("http://") || normalized.startsWith("https://")) return true;
+  return false;
+}
+
+type DbFeedRow = Record<string, unknown>;
+
+async function enrichFeedItems(items: DbFeedRow[], env: Env) {
+  const next: DbFeedRow[] = [];
+  for (const item of items) {
+    const id = Number(item.id);
+    const pageUrl = String(item.url ?? "");
+    const sourceName = String(item.sourceName ?? "");
+    const currentTitle = String(item.title ?? "");
+    const currentSummary = typeof item.summary === "string" ? item.summary : "";
+
+    let title = normalizeDisplayText(currentTitle);
+    let summary = typeof currentSummary === "string" ? normalizeDisplayText(currentSummary) : "";
+
+    const needTitle = isWeakTitle(title, sourceName);
+    const needSummary = !summary;
+
+    if (needTitle || needSummary) {
+      const html = await fetchSourceText(pageUrl, "text/html,application/xhtml+xml");
+      if (html) {
+        const htmlTitle = normalizeDisplayText(extractHtmlTitle(html) ?? "");
+        const metaSummary = normalizeDisplayText(extractMetaDescription(html) ?? "");
+        if (needTitle && htmlTitle) title = htmlTitle;
+        if (needSummary && metaSummary) summary = metaSummary;
+      }
+      if (needTitle && isWeakTitle(title, sourceName)) {
+        const fromUrl = normalizeDisplayText(deriveTitleFromUrl(pageUrl));
+        if (fromUrl) title = fromUrl;
+      }
+    }
+
+    if (title && title !== currentTitle) {
+      await env.DB.prepare("UPDATE items SET title = ? WHERE id = ?").bind(title, id).run();
+      item.title = title;
+    }
+    if (summary && summary !== currentSummary) {
+      await env.DB.prepare("UPDATE items SET summary = ? WHERE id = ?").bind(summary, id).run();
+      item.summary = summary;
+    }
+    next.push(item);
+  }
+  return next;
 }
 
 function normalizeEntryUrl(url: string, baseUrl: string) {
