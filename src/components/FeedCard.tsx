@@ -210,7 +210,7 @@ export default function FeedCard({
                 <button
                   onClick={handleSave}
                   disabled={memoSaving || !draftMemo.trim()}
-                  className="rounded-full bg-foreground px-3.5 py-1.5 text-xs font-medium text-white transition-colors hover:bg-foreground/80 disabled:bg-zinc-300 disabled:cursor-not-allowed"
+                  className="rounded-full bg-foreground px-3.5 py-1.5 text-xs font-medium text-white transition-colors hover:bg-foreground/80 disabled:bg-zinc-100 disabled:text-zinc-400 disabled:cursor-not-allowed"
                 >
                   {memoSaving ? "저장 중…" : "저장"}
                 </button>
