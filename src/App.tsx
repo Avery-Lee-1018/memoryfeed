@@ -178,7 +178,8 @@ export default function App() {
 
   useEffect(() => {
     if (!toast) return;
-    const timeout = window.setTimeout(() => setToast(null), toast.retryUrls?.length ? 8000 : 4500);
+    const duration = toast.undoFn ? 1500 : toast.retryUrls?.length ? 8000 : 4500;
+    const timeout = window.setTimeout(() => setToast(null), duration);
     return () => window.clearTimeout(timeout);
   }, [toast]);
 
@@ -401,12 +402,12 @@ export default function App() {
     };
 
     setToast({
-      tone: "success",
+      tone: "error",
       title: "북마크가 떠나갔어요!",
       undoFn: doUndo,
     });
 
-    // Actually delete after 4 s (matches toast auto-dismiss)
+    // Actually delete after 1.5 s (matches toast auto-dismiss)
     deleteTimer = setTimeout(async () => {
       if (undone) return;
       const res = await fetch(`/api/sources/${sourceId}`, { method: "DELETE" });
@@ -421,7 +422,7 @@ export default function App() {
           description: "잠시 후 다시 시도해 주세요.",
         });
       }
-    }, 4000);
+    }, 1500);
   };
 
   const moveSourceLevel = async (sourceId: number, level: "core" | "focus" | "light") => {
@@ -621,13 +622,15 @@ export default function App() {
                   <p className="mt-0.5 text-xs opacity-80">{toast.description}</p>
                 )}
               </div>
-              <button
-                onClick={() => setToast(null)}
-                className="mt-0.5 text-xs opacity-70 hover:opacity-100"
-                aria-label="토스트 닫기"
-              >
-                닫기
-              </button>
+              {!toast.undoFn && (
+                <button
+                  onClick={() => setToast(null)}
+                  className="mt-0.5 text-xs opacity-70 hover:opacity-100"
+                  aria-label="토스트 닫기"
+                >
+                  닫기
+                </button>
+              )}
             </div>
             {toast.undoFn && (
               <div className="mt-2">
