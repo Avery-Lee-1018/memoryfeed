@@ -178,17 +178,18 @@ export default function FeedCard({
           )}
 
           {/* Card footer — memo button sits here, fully below content */}
-          <div className="flex justify-end px-4 pb-3 pt-1">
+          <div className="flex justify-end px-4 pb-4 pt-1">
             <button
               onClick={openMemo}
-              className={`flex h-9 w-9 items-center justify-center rounded-full transition-colors ${
+              className={`flex items-center justify-center rounded-xl px-2 py-2 transition-colors ${
                 hasMemo
                   ? "bg-amber-50 text-amber-500 hover:bg-amber-100"
-                  : "text-muted-foreground/35 hover:bg-accent hover:text-muted-foreground/70"
+                  : "bg-[#EBEBEC] text-muted-foreground/50 hover:bg-zinc-200 hover:text-muted-foreground/80"
               }`}
+              style={{ minWidth: 44, minHeight: 44 }}
               aria-label="메모"
             >
-              <i className={`text-base ${hasMemo ? "ri-sticky-note-2-fill" : "ri-sticky-note-2-line"}`} />
+              <i className={`text-base ${hasMemo ? "ri-sticky-note-2-fill" : "ri-sticky-note-add-line"}`} />
             </button>
           </div>
         </Card>
