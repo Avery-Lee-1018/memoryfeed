@@ -8,6 +8,7 @@ type SourceType = "rss" | "blog";
 type SourceLevel = "core" | "focus" | "light";
 const FEED_START_DATE = "2026-04-01";
 const ENTRY_LIMIT_PER_SOURCE = 18;
+const KOREAN_ACCEPT_LANGUAGE = "ko-KR,ko;q=0.95,en-US;q=0.7,en;q=0.6";
 
 const json = (data: unknown, init: ResponseInit = {}) =>
   new Response(JSON.stringify(data), {
@@ -91,11 +92,12 @@ async function handleGetThumbnail(request: Request, url: URL, ctx: ExecutionCont
   }
 
   // 2) Resolve OG/Twitter image from page HTML.
-  const pageRes = await fetch(pageUrl, {
-    headers: {
-      "user-agent": "Mozilla/5.0 (compatible; MemoryFeedBot/1.0)",
-      accept: "text/html,application/xhtml+xml"
-    },
+    const pageRes = await fetch(pageUrl, {
+      headers: {
+        "user-agent": "Mozilla/5.0 (compatible; MemoryFeedBot/1.0)",
+        accept: "text/html,application/xhtml+xml",
+        "accept-language": KOREAN_ACCEPT_LANGUAGE,
+      },
     cf: {
       cacheEverything: true,
       cacheTtl: 60 * 30
@@ -147,6 +149,7 @@ async function fetchImage(targetUrl: string, referer?: string) {
     headers: {
       "user-agent": "Mozilla/5.0 (compatible; MemoryFeedBot/1.0)",
       accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+      "accept-language": KOREAN_ACCEPT_LANGUAGE,
       ...(referer ? { referer } : {})
     },
     cf: {
@@ -689,6 +692,7 @@ async function resolveSourceName(sourceUrl: string, sourceType: SourceType) {
       headers: {
         "user-agent": "Mozilla/5.0 (compatible; MemoryFeedBot/1.0)",
         accept: sourceType === "rss" ? "application/rss+xml,application/xml,text/xml,text/html" : "text/html,application/xhtml+xml,application/xml",
+        "accept-language": KOREAN_ACCEPT_LANGUAGE,
       },
       cf: { cacheEverything: true, cacheTtl: 60 * 30 },
     });
@@ -1072,6 +1076,7 @@ async function fetchSourceText(targetUrl: string, accept = "text/html,applicatio
       headers: {
         "user-agent": "Mozilla/5.0 (compatible; MemoryFeedBot/1.0)",
         accept,
+        "accept-language": KOREAN_ACCEPT_LANGUAGE,
       },
       signal: controller.signal,
       cf: { cacheEverything: true, cacheTtl: 60 * 30 },
