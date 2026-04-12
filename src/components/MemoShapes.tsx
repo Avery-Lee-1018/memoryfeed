@@ -120,7 +120,7 @@ export default function MemoShapes({ show, dateKey }: Props) {
   return (
     <div
       style={{
-        position: "fixed",
+        position: "absolute",
         top: SAFE_INSET_PX,
         right: SAFE_INSET_PX,
         bottom: SAFE_INSET_PX,
