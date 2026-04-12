@@ -1,6 +1,7 @@
 interface Env {
   DB: D1Database;
   ASSETS: Fetcher;
+  ADMIN_TOKEN?: string;
 }
 
 type ReactionType = "keep" | "skip";
@@ -10,6 +11,7 @@ const FEED_START_DATE = "2026-04-01";
 const ENTRY_LIMIT_PER_SOURCE = 18;
 const KOREAN_ACCEPT_LANGUAGE = "ko-KR,ko;q=0.95,en-US;q=0.7,en;q=0.6";
 const CRAWLER_USER_AGENT = "Mozilla/5.0 (compatible; MemoryFeedBot/1.0)";
+const ADMIN_HEADER = "x-memoryfeed-key";
 
 const json = (data: unknown, init: ResponseInit = {}) =>
   new Response(JSON.stringify(data), {
@@ -24,9 +26,12 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     try {
       const url = new URL(request.url);
+      if (isProtectedRoute(request.method, url.pathname) && !isAuthorizedRequest(request, env)) {
+        return json({ error: "UNAUTHORIZED" }, { status: 401 });
+      }
 
       if (request.method === "GET" && url.pathname === "/api/thumbnail") {
-        return handleGetThumbnail(request, url, ctx);
+        return handleGetThumbnail(request, url, ctx, env);
       }
       if (request.method === "GET" && url.pathname === "/api/feed/today") {
         return handleGetFeedToday(url, env, ctx);
@@ -55,6 +60,10 @@ export default {
         const itemId = parseInt(url.pathname.split("/")[3]);
         return handlePostNote(itemId, request, env);
       }
+      if (request.method === "GET" && /^\/api\/notes\/\d+$/.test(url.pathname)) {
+        const itemId = parseInt(url.pathname.split("/")[3]);
+        return handleGetNote(itemId, env);
+      }
       if (request.method === "DELETE" && /^\/api\/notes\/\d+$/.test(url.pathname)) {
         const itemId = parseInt(url.pathname.split("/")[3]);
         return handleDeleteNote(itemId, env);
@@ -68,12 +77,76 @@ export default {
   }
 } satisfies ExportedHandler<Env>;
 
-async function handleGetThumbnail(request: Request, url: URL, ctx: ExecutionContext) {
+function isProtectedRoute(method: string, pathname: string) {
+  if (method === "POST" && pathname === "/api/reaction") return true;
+  if (method === "POST" && pathname === "/api/feed/replacement") return true;
+  if (method === "GET" && pathname === "/api/sources") return true;
+  if (method === "POST" && pathname === "/api/sources") return true;
+  if ((method === "PATCH" || method === "DELETE") && /^\/api\/sources\/\d+$/.test(pathname)) return true;
+  if ((method === "GET" || method === "POST" || method === "DELETE") && /^\/api\/notes\/\d+$/.test(pathname)) return true;
+  return false;
+}
+
+function isAuthorizedRequest(request: Request, env: Env) {
+  const expected = env.ADMIN_TOKEN?.trim();
+  if (!expected) return true;
+  const headerToken = request.headers.get(ADMIN_HEADER)?.trim();
+  const authHeader = request.headers.get("authorization")?.trim();
+  const bearerToken = authHeader?.toLowerCase().startsWith("bearer ")
+    ? authHeader.slice(7).trim()
+    : "";
+  const provided = headerToken || bearerToken;
+  return provided === expected;
+}
+
+function normalizeHost(host: string) {
+  return host.toLowerCase().replace(/^www\./, "");
+}
+
+function isHostRelated(hostA: string, hostB: string) {
+  const a = normalizeHost(hostA);
+  const b = normalizeHost(hostB);
+  return a === b || a.endsWith(`.${b}`) || b.endsWith(`.${a}`);
+}
+
+async function isAllowedSourcePageUrl(targetUrl: string, env: Env) {
+  let targetHost: string;
+  try {
+    targetHost = new URL(targetUrl).hostname;
+  } catch {
+    return false;
+  }
+  const rows = await env.DB.prepare("SELECT url FROM sources").all<{ url: string }>();
+  for (const row of rows.results ?? []) {
+    try {
+      const sourceHost = new URL(row.url).hostname;
+      if (isHostRelated(targetHost, sourceHost)) return true;
+    } catch {
+      // ignore malformed source URL
+    }
+  }
+  return false;
+}
+
+function isSafeImageHost(imageUrl: string, pageUrl: string) {
+  try {
+    const pageHost = new URL(pageUrl).hostname;
+    const imageHost = new URL(imageUrl).hostname;
+    return isHostRelated(imageHost, pageHost);
+  } catch {
+    return false;
+  }
+}
+
+async function handleGetThumbnail(request: Request, url: URL, ctx: ExecutionContext, env: Env) {
   const pageUrl = url.searchParams.get("pageUrl");
   const imageUrl = url.searchParams.get("imageUrl");
 
   if (!pageUrl || !/^https?:\/\//i.test(pageUrl)) {
     return new Response("Bad Request", { status: 400 });
+  }
+  if (!(await isAllowedSourcePageUrl(pageUrl, env))) {
+    return new Response("Forbidden", { status: 403 });
   }
 
   const cache = caches.default;
@@ -84,7 +157,7 @@ async function handleGetThumbnail(request: Request, url: URL, ctx: ExecutionCont
   }
 
   // 1) Prefer explicit imageUrl if provided and reachable.
-  if (imageUrl && /^https?:\/\//i.test(imageUrl)) {
+  if (imageUrl && /^https?:\/\//i.test(imageUrl) && isSafeImageHost(imageUrl, pageUrl)) {
     const direct = await fetchImage(imageUrl, pageUrl);
     if (direct) {
       ctx.waitUntil(cache.put(cacheKey, direct.clone()));
@@ -309,7 +382,7 @@ async function queryDistinctDateItems(targetDate: string, env: Env) {
     SELECT i.id, i.title, i.url, i.summary, i.thumbnail_url,
            s.name AS sourceName, s.type AS sourceType, s.level AS sourceLevel,
            i.source_id AS sourceId,
-           n.content AS note,
+           CASE WHEN n.id IS NULL THEN 0 ELSE 1 END AS hasNote,
            fs.slot_index AS slotIndex
     FROM feed_slots fs
     JOIN items i ON i.id = fs.item_id
@@ -431,7 +504,7 @@ async function handlePostFeedReplacement(request: Request, env: Env) {
   const finalReplacement = await env.DB.prepare(`
     SELECT i.id, i.title, i.url, i.summary, i.thumbnail_url,
            s.name AS sourceName, s.type AS sourceType, s.level AS sourceLevel,
-           n.content AS note
+           CASE WHEN n.id IS NULL THEN 0 ELSE 1 END AS hasNote
     FROM items i
     JOIN sources s ON i.source_id = s.id
     LEFT JOIN notes n ON n.item_id = i.id
@@ -1668,6 +1741,14 @@ async function handlePostNote(itemId: number, request: Request, env: Env) {
   `).bind(itemId, body.content).run();
 
   return json({ ok: true });
+}
+
+async function handleGetNote(itemId: number, env: Env) {
+  const row = await env.DB
+    .prepare("SELECT content FROM notes WHERE item_id = ? LIMIT 1")
+    .bind(itemId)
+    .first<{ content?: string }>();
+  return json({ content: row?.content ?? "" });
 }
 
 async function handleDeleteNote(itemId: number, env: Env) {

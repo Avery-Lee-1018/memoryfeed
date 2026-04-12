@@ -4,6 +4,7 @@ import FeedCard, { FeedItem } from "@/components/FeedCard";
 import CardSkeleton from "@/components/CardSkeleton";
 import MemoShapes from "@/components/MemoShapes";
 import MySourcesView, { SourceEntry } from "@/components/MySourcesView";
+import { authorizedFetch, readJson } from "@/lib/api";
 
 const SKELETON_MIN_MS = 500;
 const FEED_START_DATE = "2026-04-01";
@@ -160,7 +161,7 @@ export default function App() {
         setItems(nextItems);
         setInitialItemCount(nextItems.length);
         setReplacingIds(new Set());
-        setMemoItemIds(new Set(nextItems.filter(i => !!i.note?.trim()).map(i => i.id)));
+        setMemoItemIds(new Set(nextItems.filter((i) => i.hasNote).map((i) => i.id)));
       })
       .catch(console.error)
       .finally(() => setLoading(false));
@@ -169,8 +170,8 @@ export default function App() {
   const loadSources = async (showLoading = true) => {
     if (showLoading) setSourcesLoading(true);
     try {
-      const res = await fetch("/api/sources");
-      const data = (await res.json()) as { sources?: Record<string, unknown>[] };
+      const res = await authorizedFetch("/api/sources");
+      const data = await readJson<{ sources?: Record<string, unknown>[] }>(res);
       const next = (data.sources ?? []).map(normalizeSourceEntry);
       setSources(next);
     } catch (error) {
@@ -199,13 +200,13 @@ export default function App() {
     const startedAt = Date.now();
     setReplacingIds((prev) => new Set(prev).add(id));
 
-    await fetch("/api/reaction", {
+    await authorizedFetch("/api/reaction", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ itemId: id, type: "skip" }),
     });
 
-    const res = await fetch("/api/feed/replacement", {
+    const res = await authorizedFetch("/api/feed/replacement", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ excludeItemIds: currentItemIds, date: selectedDate, replaceItemId: id }),
@@ -314,7 +315,7 @@ export default function App() {
   const postSources = async (payload: { rawText?: string; urls?: string[] }) => {
     setSourceSubmitting(true);
     try {
-      const res = await fetch("/api/sources", {
+      const res = await authorizedFetch("/api/sources", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(payload),
@@ -382,7 +383,7 @@ export default function App() {
     setSources((prev) =>
       prev.map((s) => (s.id === source.id ? { ...s, is_active: nextActive } : s))
     );
-    const res = await fetch(`/api/sources/${source.id}`, {
+    const res = await authorizedFetch(`/api/sources/${source.id}`, {
       method: "PATCH",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ isActive: nextActive === 1 }),
@@ -426,7 +427,7 @@ export default function App() {
     // Actually delete after 1.5 s (matches toast auto-dismiss)
     deleteTimer = setTimeout(async () => {
       if (undone) return;
-      const res = await fetch(`/api/sources/${sourceId}`, { method: "DELETE" });
+      const res = await authorizedFetch(`/api/sources/${sourceId}`, { method: "DELETE" });
       if (!res.ok) {
         setSources((prev) => {
           if (prev.some((s) => s.id === deleted.id)) return prev;
@@ -445,7 +446,7 @@ export default function App() {
     setSources((prev) =>
       prev.map((source) => (source.id === sourceId ? { ...source, level } : source))
     );
-    const res = await fetch(`/api/sources/${sourceId}`, {
+    const res = await authorizedFetch(`/api/sources/${sourceId}`, {
       method: "PATCH",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ level }),

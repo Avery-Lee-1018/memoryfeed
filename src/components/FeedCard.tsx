@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
-import { marked } from "marked";
+import { authorizedFetch, readJson } from "@/lib/api";
 
 const THUMBNAIL_FALLBACK_TIMEOUT_MS = 2600;
 
@@ -16,7 +16,7 @@ export type FeedItem = {
   url: string;
   summary?: string | null;
   thumbnail_url?: string | null;
-  note?: string | null;
+  hasNote?: boolean;
   sourceName: string;
   sourceType: "rss" | "blog";
 };
@@ -33,7 +33,7 @@ export default function FeedCard({
   url,
   summary,
   thumbnail_url,
-  note,
+  hasNote,
   sourceName,
   sourceType,
   index = 0,
@@ -43,8 +43,9 @@ export default function FeedCard({
   const [expanded, setExpanded] = useState(false);
   const [memoOpen, setMemoOpen] = useState(false);
   const [memoEditing, setMemoEditing] = useState(false);
-  const [savedMemo, setSavedMemo] = useState(note?.trim() ?? "");
-  const [draftMemo, setDraftMemo] = useState(note?.trim() ?? "");
+  const [savedMemo, setSavedMemo] = useState("");
+  const [draftMemo, setDraftMemo] = useState("");
+  const [memoLoaded, setMemoLoaded] = useState(!hasNote);
   const [memoSaving, setMemoSaving] = useState(false);
 
   const fallbackThumbnail = FALLBACK_THUMBNAILS[id % 3];
@@ -73,11 +74,31 @@ export default function FeedCard({
   // suppress unused-var warning for index kept for future use
   void index;
 
-  const hasMemo = savedMemo.length > 0;
+  const hasMemo = savedMemo.length > 0 || !!hasNote;
 
-  const openMemo = (e: React.MouseEvent) => {
+  const loadNote = async () => {
+    if (memoLoaded) return;
+    try {
+      const res = await authorizedFetch(`/api/notes/${id}`);
+      if (res.ok) {
+        const data = await readJson<{ content?: string }>(res);
+        const content = (data.content ?? "").trim();
+        setSavedMemo(content);
+        setDraftMemo(content);
+      }
+    } catch (error) {
+      console.error(error);
+    } finally {
+      setMemoLoaded(true);
+    }
+  };
+
+  const openMemo = async (e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
+    if (!memoOpen) {
+      await loadNote();
+    }
     if (!memoOpen) {
       setDraftMemo(savedMemo);
       setMemoEditing(!hasMemo); // open in edit mode if no memo yet
@@ -89,13 +110,14 @@ export default function FeedCard({
     if (!draftMemo.trim()) return;
     setMemoSaving(true);
     try {
-      await fetch(`/api/notes/${id}`, {
+      await authorizedFetch(`/api/notes/${id}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ content: draftMemo.trim() }),
       });
       setSavedMemo(draftMemo.trim());
       setMemoEditing(false);
+      setMemoLoaded(true);
       onMemoSaved?.();
     } finally {
       setMemoSaving(false);
@@ -103,9 +125,10 @@ export default function FeedCard({
   };
 
   const handleDelete = async () => {
-    await fetch(`/api/notes/${id}`, { method: "DELETE" });
+    await authorizedFetch(`/api/notes/${id}`, { method: "DELETE" });
     setSavedMemo("");
     setDraftMemo("");
+    setMemoLoaded(true);
     setMemoEditing(false);
     setMemoOpen(false);
     onMemoDeleted?.();
@@ -230,10 +253,7 @@ export default function FeedCard({
             </div>
           ) : (
             <div>
-              <div
-                className="prose prose-sm max-w-none text-sm leading-relaxed text-foreground/80"
-                dangerouslySetInnerHTML={{ __html: marked.parse(savedMemo) as string }}
-              />
+              <p className="whitespace-pre-wrap text-sm leading-relaxed text-foreground/80">{savedMemo}</p>
               <div className="mt-2 flex items-center gap-3">
                 <button
                   onClick={() => { setDraftMemo(savedMemo); setMemoEditing(true); }}
