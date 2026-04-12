@@ -15,5 +15,5 @@ jobs:
 
       - name: Push to Org repo
         run: |
-          git remote add org https://x-access-token:${{ secrets.ORG_TOKEN }}@github.com/BF-D-challenge/[make-own-product2].git
-          git push org HEAD:refs/heads/members/[이예서-memoryfeed] --force
+          git remote add org https://x-access-token:${{ secrets.ORG_TOKEN }}@github.com/BF-D-challenge/make-own-product2.git
+          git push org HEAD:refs/heads/members/이예서-memoryfeed --force
