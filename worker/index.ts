@@ -394,12 +394,14 @@ async function handlePostFeedReplacement(request: Request, env: Env) {
   }
 
   if (!replacementId) {
+    // Last-resort: allow any item even if already used on another date.
     const fallbackAny = await selectCandidateItemIds(env, {
       limit: 1,
       excludeItemIds: excludedIds,
       excludeSourceIds: [],
       requireNoMemo: false,
       distinctBySource: false,
+      excludeAssigned: false,
     });
     if (fallbackAny.length > 0) replacementId = fallbackAny[0];
   }
@@ -541,6 +543,11 @@ async function handlePostSources(request: Request, env: Env, ctx: ExecutionConte
           }
         } else {
           duplicateUrls.push(sourceUrl);
+          const existing = await env.DB
+            .prepare("SELECT id, name, url, type FROM sources WHERE url = ? LIMIT 1")
+            .bind(sourceUrl)
+            .first<{ id: number; name: string; url: string; type: SourceType }>();
+          if (existing) ctx.waitUntil(hydrateSourceItems(existing, env));
         }
       } catch {
         failedUrls.push(sourceUrl);
@@ -681,6 +688,8 @@ type CandidateQueryOptions = {
   excludeSourceIds: number[];
   requireNoMemo: boolean;
   distinctBySource: boolean;
+  /** When true (default), skip items already assigned to any feed_slot on any date. */
+  excludeAssigned?: boolean;
 };
 
 function buildInClause(column: string, values: number[]) {
@@ -695,6 +704,10 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
   const itemExclusion = buildInClause("i.id", options.excludeItemIds);
   const sourceExclusion = buildInClause("i.source_id", options.excludeSourceIds);
   const memoClause = options.requireNoMemo ? "AND (n.content IS NULL OR trim(n.content) = '')" : "";
+  // Exclude items already scheduled on ANY date unless caller explicitly allows reuse.
+  const assignedClause = options.excludeAssigned !== false
+    ? "AND NOT EXISTS (SELECT 1 FROM feed_slots fs_chk WHERE fs_chk.item_id = i.id)"
+    : "";
   const limit = Math.max(0, options.limit);
   if (limit === 0) return [] as number[];
 
@@ -721,6 +734,7 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
         WHERE i.status = 'active'
           AND s.is_active = 1
           ${memoClause}
+          ${assignedClause}
           ${itemExclusion.sql}
           ${sourceExclusion.sql}
       )
@@ -748,6 +762,7 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
     WHERE i.status = 'active'
       AND s.is_active = 1
       ${memoClause}
+      ${assignedClause}
       ${itemExclusion.sql}
       ${sourceExclusion.sql}
     ORDER BY (ABS(RANDOM()) % 1000000) * 1.0 /
@@ -848,12 +863,14 @@ async function fillDateIfNeeded(targetDate: string, env: Env) {
   const finalMissing = [0, 1, 2].filter((slot) => !finalSet.has(slot));
   if (finalMissing.length <= 0) return;
 
+  // Last-resort pass: allow reuse of items already on other dates if pool is exhausted.
   const relaxed = await selectCandidateItemIds(env, {
     limit: finalMissing.length,
     excludeItemIds: currentIds,
     excludeSourceIds: [],
     requireNoMemo: true,
     distinctBySource: false,
+    excludeAssigned: false,
   });
 
   let relaxedCursor = 0;
@@ -950,19 +967,26 @@ async function ingestItemsForSource(
   for (const entry of entries.slice(0, ENTRY_LIMIT_PER_SOURCE)) {
     let resolvedTitle = normalizeDisplayText(entry.title || deriveTitleFromUrl(entry.url) || source.name);
     let resolvedSummary = entry.summary ? normalizeDisplayText(entry.summary) : null;
+    let resolvedThumbnail = entry.thumbnailUrl ?? null;
 
-    if (isWeakEntryTitle(resolvedTitle, source.name)) {
+    if (isWeakEntryTitle(resolvedTitle, source.name) || !isUsableSummary(resolvedSummary ?? "") || !resolvedThumbnail) {
       const html = await fetchSourceText(entry.url, "text/html,application/xhtml+xml");
       if (html) {
-        const htmlTitle = normalizeDisplayText((extractHtmlTitle(html) ?? "").replace(/\|\s*Substack.*$/i, "").trim());
-        if (htmlTitle && !isWeakEntryTitle(htmlTitle, source.name)) {
-          resolvedTitle = htmlTitle;
+        if (isWeakEntryTitle(resolvedTitle, source.name)) {
+          const htmlTitle = normalizeDisplayText((extractHtmlTitle(html) ?? "").replace(/\|\s*Substack.*$/i, "").trim());
+          if (htmlTitle && !isWeakEntryTitle(htmlTitle, source.name)) {
+            resolvedTitle = htmlTitle;
+          }
         }
         if (!resolvedSummary || !isUsableSummary(resolvedSummary)) {
           const metaSummary = normalizeDisplayText(extractMetaDescription(html) ?? "");
           if (isUsableSummary(metaSummary)) {
             resolvedSummary = metaSummary;
           }
+        }
+        if (!resolvedThumbnail) {
+          const metaImage = extractMetaImage(html, entry.url);
+          if (metaImage) resolvedThumbnail = metaImage;
         }
       }
     }
@@ -994,7 +1018,7 @@ async function ingestItemsForSource(
       resolvedTitle,
       entry.url,
       resolvedSummary,
-      entry.thumbnailUrl ?? null,
+      resolvedThumbnail,
       source.name,
     ).run();
     inserted += Number(result.meta?.changes ?? 0);
@@ -1028,7 +1052,9 @@ type SourceEntry = { title: string; url: string; summary?: string; thumbnailUrl?
 async function collectSourceEntries(source: { url: string; type: SourceType }): Promise<SourceEntry[]> {
   if (source.type === "rss") {
     const text = await fetchSourceText(source.url, "application/rss+xml,application/atom+xml,application/xml,text/xml,text/html");
-    return text ? dedupeEntries(parseRssEntries(text, source.url)) : [];
+    const parsed = text ? dedupeEntries(parseRssEntries(text, source.url)) : [];
+    if (parsed.length > 0) return parsed;
+    return text ? collectEntriesFromSitemap(source.url, text) : [];
   }
 
   const html = await fetchSourceText(source.url, "text/html,application/xhtml+xml,application/xml,text/xml");
@@ -1042,7 +1068,7 @@ async function collectSourceEntries(source: { url: string; type: SourceType }): 
     if (entries.length > 0) return entries;
   }
 
-  return [];
+  return collectEntriesFromSitemap(source.url, html);
 }
 
 function discoverFeedUrlsFromHtml(html: string, pageUrl: string) {
@@ -1124,10 +1150,10 @@ function parseRssEntries(xml: string, baseUrl: string) {
     const summary = pickBestSummary(description, contentSummary);
     const descriptionHtml = matchTag(block, "description");
     const thumbnailRaw =
-      getAttr((block.match(/<media:content[^>]*>/i) || [""])[0], "url") ||
-      getAttr((block.match(/<media:thumbnail[^>]*>/i) || [""])[0], "url") ||
-      getAttr((block.match(/<enclosure[^>]+type=["'][^"']*image[^"']*["'][^>]*>/i) || [""])[0], "url") ||
-      extractFirstImageSrc(descriptionHtml);
+      extractRssImageMedia(block) ||
+      extractRssImageEnclosure(block) ||
+      extractFirstImageSrc(descriptionHtml) ||
+      extractFirstImageSrc(contentRaw);
     const thumbnailUrl = thumbnailRaw ? normalizeEntryUrl(decodeXml(thumbnailRaw), baseUrl) : null;
     const link = normalizeEntryUrl(linkRaw, baseUrl);
     if (!link) continue;
@@ -1148,8 +1174,7 @@ function parseRssEntries(xml: string, baseUrl: string) {
     const linkRaw = (altMatch?.[1] || hrefMatch?.[1] || "").trim();
     const summaryRaw = matchTag(block, "summary") || matchTag(block, "content");
     const summary = normalizeDisplayText(stripTags(decodeXml(summaryRaw)).trim());
-    const enclosureMatch = block.match(/<link[^>]+rel=["']enclosure["'][^>]+href=["']([^"']+)["'][^>]*>/i);
-    const thumbnailRaw = enclosureMatch?.[1] || extractFirstImageSrc(summaryRaw);
+    const thumbnailRaw = extractAtomImageEnclosure(block) || extractFirstImageSrc(summaryRaw);
     const thumbnailUrl = thumbnailRaw ? normalizeEntryUrl(decodeXml(thumbnailRaw), baseUrl) : null;
     const link = normalizeEntryUrl(linkRaw, baseUrl);
     if (!link) continue;
@@ -1163,9 +1188,141 @@ function parseRssEntries(xml: string, baseUrl: string) {
   return entries;
 }
 
+async function collectEntriesFromSitemap(pageUrl: string, pageHtml?: string) {
+  const sitemapUrls = discoverSitemapUrlsFromHtml(pageHtml ?? "", pageUrl);
+  if (sitemapUrls.length === 0) return [];
+
+  const collected: SourceEntry[] = [];
+  for (const sitemapUrl of sitemapUrls.slice(0, 6)) {
+    const sitemapText = await fetchSourceText(sitemapUrl, "application/xml,text/xml,text/html");
+    if (!sitemapText) continue;
+
+    const nestedLocs = parseSitemapLocs(sitemapText, sitemapUrl);
+    const hasNestedSitemaps = /<sitemapindex[\s>]/i.test(sitemapText);
+    if (hasNestedSitemaps && nestedLocs.length > 0) {
+      for (const nested of nestedLocs.slice(0, 8)) {
+        const nestedText = await fetchSourceText(nested, "application/xml,text/xml,text/html");
+        if (!nestedText) continue;
+        collected.push(...buildSitemapEntries(parseSitemapLocs(nestedText, nested), pageUrl));
+      }
+    } else {
+      collected.push(...buildSitemapEntries(nestedLocs, pageUrl));
+    }
+    if (collected.length >= ENTRY_LIMIT_PER_SOURCE) break;
+  }
+
+  return dedupeEntries(collected).slice(0, ENTRY_LIMIT_PER_SOURCE);
+}
+
+function buildSitemapEntries(urls: string[], seedUrl: string) {
+  const seedHost = safeHost(seedUrl);
+  const seenKey = new Set<string>();
+  const entries: SourceEntry[] = [];
+
+  for (const candidate of urls) {
+    if (!isLikelyArticleUrl(candidate, seedHost)) continue;
+    const key = canonicalEntryKey(candidate);
+    if (!key || seenKey.has(key)) continue;
+    seenKey.add(key);
+    entries.push({
+      title: deriveTitleFromUrl(candidate),
+      url: candidate,
+    });
+  }
+
+  return entries;
+}
+
+function discoverSitemapUrlsFromHtml(html: string, pageUrl: string) {
+  const urls = new Set<string>();
+
+  if (html) {
+    const sitemapLinkTags = html.match(/<link[^>]+rel=["'][^"']*sitemap[^"']*["'][^>]*>/gi) || [];
+    for (const tag of sitemapLinkTags) {
+      const href = getAttr(tag, "href");
+      const normalized = href ? normalizeEntryUrl(href, pageUrl) : null;
+      if (normalized) urls.add(normalized);
+    }
+  }
+
+  try {
+    const parsed = new URL(pageUrl);
+    const origin = parsed.origin;
+    const preferred = parsed.hostname.includes("newneek.co")
+      ? ["/sitemap/article-sitemap.xml", "/sitemap.xml"]
+      : ["/sitemap.xml", "/sitemap_index.xml", "/sitemap-index.xml"];
+    for (const path of preferred) {
+      urls.add(new URL(path, origin).toString());
+    }
+  } catch {
+    // ignore invalid url
+  }
+
+  return [...urls];
+}
+
+function parseSitemapLocs(xml: string, baseUrl: string) {
+  const locs: string[] = [];
+  const re = /<loc>([\s\S]*?)<\/loc>/gi;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(xml))) {
+    const normalized = normalizeEntryUrl(decodeXml(match[1].trim()), baseUrl);
+    if (normalized) locs.push(normalized);
+  }
+  return locs;
+}
+
 function extractFirstImageSrc(html: string) {
   const img = html.match(/<img[^>]+src=["']([^"']+)["'][^>]*>/i);
   return img?.[1] ?? null;
+}
+
+function extractRssImageMedia(block: string) {
+  const thumbTag = block.match(/<media:thumbnail[^>]*>/i)?.[0];
+  const thumbUrl = thumbTag ? getAttr(thumbTag, "url") : null;
+  if (thumbUrl) return thumbUrl;
+
+  const mediaTags = block.match(/<media:content[^>]*>/gi) || [];
+  for (const tag of mediaTags) {
+    const type = getAttr(tag, "type")?.toLowerCase() || "";
+    const medium = getAttr(tag, "medium")?.toLowerCase() || "";
+    const url = getAttr(tag, "url");
+    if (!url) continue;
+    if (type.includes("image") || medium === "image" || isLikelyImageUrl(url)) {
+      return url;
+    }
+  }
+  return null;
+}
+
+function extractRssImageEnclosure(block: string) {
+  const enclosureTags = block.match(/<enclosure[^>]*>/gi) || [];
+  for (const tag of enclosureTags) {
+    const type = getAttr(tag, "type")?.toLowerCase() || "";
+    const url = getAttr(tag, "url");
+    if (!url) continue;
+    if (type.includes("image") || isLikelyImageUrl(url)) {
+      return url;
+    }
+  }
+  return null;
+}
+
+function extractAtomImageEnclosure(block: string) {
+  const enclosureTags = block.match(/<link[^>]+rel=["']enclosure["'][^>]*>/gi) || [];
+  for (const tag of enclosureTags) {
+    const href = getAttr(tag, "href");
+    const type = getAttr(tag, "type")?.toLowerCase() || "";
+    if (!href) continue;
+    if (type.includes("image") || isLikelyImageUrl(href)) {
+      return href;
+    }
+  }
+  return null;
+}
+
+function isLikelyImageUrl(url: string) {
+  return /\.(avif|webp|png|jpe?g|gif|bmp|svg)(?:$|[?#])/i.test(url);
 }
 
 function matchTag(text: string, tagName: string) {
@@ -1232,6 +1389,55 @@ function normalizeDisplayText(text: string) {
     .replace(/https?:\/\/\S+/gi, "")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function safeHost(url: string) {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function canonicalEntryKey(url: string) {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    const normalizedPath = parsed.pathname.replace(/\/+$/, "");
+    if (host.includes("bucketplace.com")) {
+      const localized = normalizedPath.match(/^\/(ko|en|ja)\/post\/(.+)$/);
+      if (localized?.[2]) return `${host}/post/${localized[2]}`;
+    }
+    return `${host}${normalizedPath}`;
+  } catch {
+    return null;
+  }
+}
+
+function isLikelyArticleUrl(url: string, seedHost: string) {
+  try {
+    const parsed = new URL(url);
+    if (!["http:", "https:"].includes(parsed.protocol)) return false;
+    const host = parsed.hostname.toLowerCase();
+    const path = parsed.pathname.replace(/\/+$/, "");
+    if (seedHost && host !== seedHost) return false;
+    if (!path || path === "/") return false;
+    if (path.startsWith("/tag/") || path.startsWith("/category/")) return false;
+
+    if (host.includes("bucketplace.com")) {
+      return /\/(ko|en|ja)\/post\//.test(path) || /\/post\//.test(path);
+    }
+    if (host.includes("newneek.co")) {
+      return /\/article\/\d+/.test(path);
+    }
+    if (host.includes("generalist.com")) {
+      return /^\/p\/[^/]+/.test(path);
+    }
+
+    return /(\/post\/|\/article\/|\/stories\/|\/story\/|\/p\/)/.test(path);
+  } catch {
+    return false;
+  }
 }
 
 function isWeakEntryTitle(title: string, sourceName: string) {
