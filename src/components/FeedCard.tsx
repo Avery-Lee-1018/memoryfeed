@@ -34,6 +34,7 @@ export default function FeedCard({
   thumbnail_url,
   note,
   sourceName,
+  sourceType,
   onMemoSaved,
   onMemoDeleted,
   index = 0,
@@ -130,7 +131,7 @@ export default function FeedCard({
 
       {/* Header */}
       <CardHeader className="pb-2 pt-4">
-        <p className="text-xs text-muted-foreground">{sourceName}</p>
+        <p className="flex items-center gap-1 text-xs text-muted-foreground">{sourceType === "rss" && <i className="ri-rss-line opacity-50" />}{sourceName}</p>
         <h2 className="line-clamp-2 text-base font-semibold leading-snug tracking-tight">
           {title}
         </h2>
@@ -184,7 +185,7 @@ export default function FeedCard({
           {memoEditing ? (
             <>
               <textarea
-                className="w-full resize-none rounded-lg border border-border bg-muted/40 p-3 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-ring"
+                className="w-full resize-none rounded-lg border border-zinc-200 bg-muted/40 p-3 text-sm text-foreground placeholder:text-zinc-500 focus:outline-none focus:ring-1 focus:ring-ring"
                 rows={4}
                 placeholder={"읽고 떠오른 것들을 모두 남겨 주세요.\n큰 생각, 작은 생각 모두 괜찮아요."}
                 value={memoValue}
