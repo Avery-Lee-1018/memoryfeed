@@ -7,6 +7,8 @@ type ReactionType = "keep" | "skip";
 type SourceType = "rss" | "blog";
 type SourceLevel = "core" | "focus" | "light";
 const FEED_START_DATE = "2026-04-01";
+const SOURCE_HYDRATE_LIMIT_PER_REQUEST = 2;
+const ENTRY_LIMIT_PER_SOURCE = 18;
 
 const json = (data: unknown, init: ResponseInit = {}) =>
   new Response(JSON.stringify(data), {
@@ -518,7 +520,10 @@ async function handlePostSources(request: Request, env: Env) {
     .bind(body.url)
     .first<{ id: number; name: string; url: string; type: SourceType }>();
   if (inserted) {
-    await ingestItemsForSource(inserted, env);
+    const count = await ingestItemsForSource(inserted, env);
+    if (count === 0) {
+      await seedItemForSource(inserted, env);
+    }
   }
 
   return json({ ok: true }, { status: 201 });
@@ -673,21 +678,66 @@ async function cleanupDemoData(env: Env) {
 
 async function ensureItemsFromSources(env: Env) {
   const rows = await env.DB.prepare(`
-    SELECT s.id, s.name, s.url, s.type, COUNT(i.id) AS itemCount
+    SELECT
+      s.id,
+      s.name,
+      s.url,
+      s.type,
+      COUNT(i.id) AS itemCount,
+      COALESCE(SUM(CASE WHEN RTRIM(i.url, '/') = RTRIM(s.url, '/') THEN 1 ELSE 0 END), 0) AS seedCount
     FROM sources s
     LEFT JOIN items i ON i.source_id = s.id
     WHERE s.is_active = 1
     GROUP BY s.id
   `).all();
+
+  const hydrateCandidates: { id: number; name: string; url: string; type: SourceType }[] = [];
+
   for (const row of (rows.results ?? []) as Record<string, unknown>[]) {
-    const itemCount = Number(row.itemCount ?? 0);
-    if (itemCount > 0) continue;
-    await seedItemForSource({
+    const source = {
       id: Number(row.id),
       name: String(row.name ?? ""),
       url: String(row.url ?? ""),
-      type: (row.type === "rss" ? "rss" : "blog"),
-    }, env);
+      type: (row.type === "rss" ? "rss" : "blog") as SourceType,
+    };
+    const itemCount = Number(row.itemCount ?? 0);
+    const seedCount = Number(row.seedCount ?? 0);
+
+    if (itemCount === 0) {
+      await seedItemForSource(source, env);
+      hydrateCandidates.push(source);
+      continue;
+    }
+
+    // If this source still has only fallback rows, try upgrading to article-level entries.
+    if (seedCount === itemCount) {
+      hydrateCandidates.push(source);
+    }
+  }
+
+  for (const source of hydrateCandidates.slice(0, SOURCE_HYDRATE_LIMIT_PER_REQUEST)) {
+    await hydrateSourceItems(source, env);
+  }
+}
+
+async function hydrateSourceItems(
+  source: { id: number; name: string; url: string; type: SourceType },
+  env: Env,
+) {
+  const inserted = await ingestItemsForSource(source, env);
+  if (inserted > 0) {
+    // Remove fallback source-url rows when article rows were successfully generated.
+    await env.DB.prepare(`
+      DELETE FROM items
+      WHERE source_id = ?
+        AND RTRIM(url, '/') = RTRIM(?, '/')
+        AND NOT EXISTS (
+          SELECT 1
+          FROM notes n
+          WHERE n.item_id = items.id
+            AND trim(n.content) != ''
+        )
+    `).bind(source.id, source.url).run();
   }
 }
 
@@ -711,60 +761,134 @@ async function ingestItemsForSource(
   source: { id: number; name: string; url: string; type: SourceType },
   env: Env,
 ) {
-  if (source.type === "rss") {
-    const text = await fetchSourceText(source.url);
-    const rssItems = text ? parseRssEntries(text, source.url) : [];
-    if (rssItems.length > 0) {
-      for (const entry of rssItems.slice(0, 12)) {
-        await env.DB.prepare(`
-          INSERT OR IGNORE INTO items (source_id, title, url, summary, thumbnail_url, status, shown_date)
-          VALUES (?, ?, ?, ?, NULL, 'active', NULL)
-        `).bind(
-          source.id,
-          entry.title || source.name,
-          entry.url,
-          entry.summary ?? null,
-        ).run();
-      }
-      return;
-    }
-  }
+  const entries = await collectSourceEntries(source);
+  if (entries.length === 0) return 0;
 
-  const html = await fetchSourceText(source.url);
-  const title = html ? extractHtmlTitle(html) : null;
-  const summary = html ? extractMetaDescription(html) : null;
-  await env.DB.prepare(`
-    INSERT OR IGNORE INTO items (source_id, title, url, summary, thumbnail_url, status, shown_date)
-    VALUES (?, ?, ?, ?, NULL, 'active', NULL)
-  `).bind(source.id, title || source.name, source.url, summary).run();
+  let inserted = 0;
+  for (const entry of entries.slice(0, ENTRY_LIMIT_PER_SOURCE)) {
+    const result = await env.DB.prepare(`
+      INSERT OR IGNORE INTO items (source_id, title, url, summary, thumbnail_url, status, shown_date)
+      VALUES (?, ?, ?, ?, ?, 'active', NULL)
+    `).bind(
+      source.id,
+      entry.title || source.name,
+      entry.url,
+      entry.summary ?? null,
+      entry.thumbnailUrl ?? null,
+    ).run();
+    inserted += Number(result.meta?.changes ?? 0);
+  }
+  return inserted;
 }
 
-async function fetchSourceText(targetUrl: string) {
+async function fetchSourceText(targetUrl: string, accept = "text/html,application/xhtml+xml,application/xml,text/xml") {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 7000);
   try {
     const res = await fetch(targetUrl, {
       headers: {
         "user-agent": "Mozilla/5.0 (compatible; MemoryFeedBot/1.0)",
-        accept: "text/html,application/xhtml+xml,application/xml,text/xml",
+        accept,
       },
+      signal: controller.signal,
       cf: { cacheEverything: true, cacheTtl: 60 * 30 },
     });
     if (!res.ok) return null;
     return await res.text();
   } catch {
     return null;
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
+type SourceEntry = { title: string; url: string; summary?: string; thumbnailUrl?: string };
+
+async function collectSourceEntries(source: { url: string; type: SourceType }): Promise<SourceEntry[]> {
+  if (source.type === "rss") {
+    const text = await fetchSourceText(source.url, "application/rss+xml,application/atom+xml,application/xml,text/xml,text/html");
+    return text ? dedupeEntries(parseRssEntries(text, source.url)) : [];
+  }
+
+  const html = await fetchSourceText(source.url, "text/html,application/xhtml+xml,application/xml,text/xml");
+  if (!html) return [];
+
+  const feedUrls = discoverFeedUrlsFromHtml(html, source.url);
+  for (const feedUrl of feedUrls) {
+    const feedText = await fetchSourceText(feedUrl, "application/rss+xml,application/atom+xml,application/xml,text/xml,text/html");
+    if (!feedText) continue;
+    const entries = dedupeEntries(parseRssEntries(feedText, feedUrl));
+    if (entries.length > 0) return entries;
+  }
+
+  return [];
+}
+
+function discoverFeedUrlsFromHtml(html: string, pageUrl: string) {
+  const urls = new Set<string>();
+  const linkTags = html.match(/<link[^>]+>/gi) || [];
+
+  for (const tag of linkTags) {
+    const rel = getAttr(tag, "rel")?.toLowerCase() || "";
+    if (!rel.includes("alternate")) continue;
+    const type = getAttr(tag, "type")?.toLowerCase() || "";
+    if (!(type.includes("rss") || type.includes("atom") || type.includes("xml"))) continue;
+    const href = getAttr(tag, "href");
+    const normalized = href ? normalizeEntryUrl(href, pageUrl) : null;
+    if (normalized) urls.add(normalized);
+  }
+
+  const commonPaths = ["/feed", "/rss", "/atom.xml", "/feed.xml", "/rss.xml"];
+  for (const path of commonPaths) {
+    try {
+      urls.add(new URL(path, pageUrl).toString());
+    } catch {
+      // ignore
+    }
+  }
+
+  return [...urls];
+}
+
+function getAttr(tag: string, attr: string) {
+  const match = tag.match(new RegExp(`${attr}=["']([^"']+)["']`, "i"));
+  return match?.[1] ?? null;
+}
+
+function dedupeEntries(entries: SourceEntry[]) {
+  const seen = new Set<string>();
+  const cleaned: SourceEntry[] = [];
+  for (const entry of entries) {
+    const normalized = normalizeUrl(entry.url);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    cleaned.push({ ...entry, url: normalized });
+  }
+  return cleaned;
+}
+
 function parseRssEntries(xml: string, baseUrl: string) {
-  const entries: { title: string; url: string; summary?: string }[] = [];
+  const entries: SourceEntry[] = [];
   const itemBlocks = xml.match(/<item[\s\S]*?<\/item>/gi) || [];
   for (const block of itemBlocks) {
     const title = decodeXml(stripTags(matchTag(block, "title"))).trim();
     const linkRaw = decodeXml(matchTag(block, "link")).trim();
     const description = decodeXml(stripTags(matchTag(block, "description"))).trim();
+    const descriptionHtml = matchTag(block, "description");
+    const thumbnailRaw =
+      getAttr((block.match(/<media:content[^>]*>/i) || [""])[0], "url") ||
+      getAttr((block.match(/<media:thumbnail[^>]*>/i) || [""])[0], "url") ||
+      getAttr((block.match(/<enclosure[^>]+type=["'][^"']*image[^"']*["'][^>]*>/i) || [""])[0], "url") ||
+      extractFirstImageSrc(descriptionHtml);
+    const thumbnailUrl = thumbnailRaw ? normalizeEntryUrl(decodeXml(thumbnailRaw), baseUrl) : null;
     const link = normalizeEntryUrl(linkRaw, baseUrl);
     if (!link) continue;
-    entries.push({ title, url: link, summary: description || undefined });
+    entries.push({
+      title,
+      url: link,
+      summary: description || undefined,
+      thumbnailUrl: thumbnailUrl || undefined,
+    });
   }
   if (entries.length > 0) return entries;
 
@@ -776,11 +900,24 @@ function parseRssEntries(xml: string, baseUrl: string) {
     const linkRaw = (altMatch?.[1] || hrefMatch?.[1] || "").trim();
     const summaryRaw = matchTag(block, "summary") || matchTag(block, "content");
     const summary = decodeXml(stripTags(summaryRaw)).trim();
+    const enclosureMatch = block.match(/<link[^>]+rel=["']enclosure["'][^>]+href=["']([^"']+)["'][^>]*>/i);
+    const thumbnailRaw = enclosureMatch?.[1] || extractFirstImageSrc(summaryRaw);
+    const thumbnailUrl = thumbnailRaw ? normalizeEntryUrl(decodeXml(thumbnailRaw), baseUrl) : null;
     const link = normalizeEntryUrl(linkRaw, baseUrl);
     if (!link) continue;
-    entries.push({ title, url: link, summary: summary || undefined });
+    entries.push({
+      title,
+      url: link,
+      summary: summary || undefined,
+      thumbnailUrl: thumbnailUrl || undefined,
+    });
   }
   return entries;
+}
+
+function extractFirstImageSrc(html: string) {
+  const img = html.match(/<img[^>]+src=["']([^"']+)["'][^>]*>/i);
+  return img?.[1] ?? null;
 }
 
 function matchTag(text: string, tagName: string) {
