@@ -162,7 +162,7 @@ export default function FeedCard({
 
           {/* Summary */}
           {summary && (
-            <CardContent className="pb-5 pt-0">
+            <CardContent className="pb-3 pt-0">
               <p className={`text-sm text-muted-foreground/80 ${expanded ? "" : "line-clamp-4"}`}>
                 {summary}
               </p>
@@ -177,18 +177,20 @@ export default function FeedCard({
             </CardContent>
           )}
 
-          {/* Memo toggle — floating bottom-right, inside card but stops propagation */}
-          <button
-            onClick={openMemo}
-            className={`absolute bottom-3 right-3 flex h-7 w-7 items-center justify-center rounded-full transition-colors ${
-              hasMemo
-                ? "bg-amber-50 text-amber-500 hover:bg-amber-100"
-                : "text-muted-foreground/35 hover:bg-accent hover:text-muted-foreground/70"
-            }`}
-            aria-label="메모"
-          >
-            <i className={`text-sm ${hasMemo ? "ri-sticky-note-2-fill" : "ri-sticky-note-2-line"}`} />
-          </button>
+          {/* Card footer — memo button sits here, fully below content */}
+          <div className="flex justify-end px-4 pb-3 pt-1">
+            <button
+              onClick={openMemo}
+              className={`flex h-9 w-9 items-center justify-center rounded-full transition-colors ${
+                hasMemo
+                  ? "bg-amber-50 text-amber-500 hover:bg-amber-100"
+                  : "text-muted-foreground/35 hover:bg-accent hover:text-muted-foreground/70"
+              }`}
+              aria-label="메모"
+            >
+              <i className={`text-base ${hasMemo ? "ri-sticky-note-2-fill" : "ri-sticky-note-2-line"}`} />
+            </button>
+          </div>
         </Card>
       </a>
 
