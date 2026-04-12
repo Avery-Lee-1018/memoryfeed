@@ -1088,6 +1088,7 @@ function discoverFeedUrlsFromHtml(html: string, pageUrl: string) {
   const parsed = new URL(pageUrl);
   const origin = parsed.origin;
   const normalizedPath = parsed.pathname.replace(/\/+$/, "");
+  const ancestors = buildPathAncestors(normalizedPath);
   const pathCandidates = [
     "/feed",
     "/feed/",
@@ -1095,12 +1096,16 @@ function discoverFeedUrlsFromHtml(html: string, pageUrl: string) {
     "/rss.xml",
     "/atom.xml",
     "/feed.xml",
-    normalizedPath ? `${normalizedPath}/feed` : "",
-    normalizedPath ? `${normalizedPath}/feed/` : "",
-    normalizedPath ? `${normalizedPath}/rss.xml` : "",
-    normalizedPath ? `${normalizedPath}/atom.xml` : "",
-    normalizedPath ? `${normalizedPath}.rss` : "",
-    normalizedPath ? `${normalizedPath}.xml` : "",
+    ...ancestors.flatMap((path) => [
+      `${path}/feed`,
+      `${path}/feed/`,
+      `${path}/rss`,
+      `${path}/rss.xml`,
+      `${path}/atom.xml`,
+      `${path}/feed.xml`,
+      `${path}.rss`,
+      `${path}.xml`,
+    ]),
   ].filter(Boolean);
 
   for (const path of pathCandidates) {
@@ -1118,6 +1123,16 @@ function discoverFeedUrlsFromHtml(html: string, pageUrl: string) {
   }
 
   return [...urls];
+}
+
+function buildPathAncestors(pathname: string) {
+  if (!pathname || pathname === "/") return [];
+  const parts = pathname.split("/").filter(Boolean);
+  const ancestors: string[] = [];
+  for (let i = parts.length; i >= 1; i -= 1) {
+    ancestors.push(`/${parts.slice(0, i).join("/")}`);
+  }
+  return ancestors;
 }
 
 function getAttr(tag: string, attr: string) {
@@ -1420,9 +1435,21 @@ function isLikelyArticleUrl(url: string, seedHost: string) {
     if (!["http:", "https:"].includes(parsed.protocol)) return false;
     const host = parsed.hostname.toLowerCase();
     const path = parsed.pathname.replace(/\/+$/, "");
+    const parts = path.split("/").filter(Boolean);
+    const tail = parts[parts.length - 1]?.toLowerCase() || "";
     if (seedHost && host !== seedHost) return false;
     if (!path || path === "/") return false;
-    if (path.startsWith("/tag/") || path.startsWith("/category/")) return false;
+    if (
+      path.startsWith("/tag/") ||
+      path.startsWith("/tags/") ||
+      path.startsWith("/category/") ||
+      path.startsWith("/categories/") ||
+      path.startsWith("/author/") ||
+      path.startsWith("/authors/") ||
+      path.startsWith("/topic/") ||
+      path.startsWith("/topics/")
+    ) return false;
+    if (["page", "index", "feed", "rss", "atom", "everything"].includes(tail)) return false;
 
     if (host.includes("bucketplace.com")) {
       return /\/(ko|en|ja)\/post\//.test(path) || /\/post\//.test(path);
@@ -1434,7 +1461,26 @@ function isLikelyArticleUrl(url: string, seedHost: string) {
       return /^\/p\/[^/]+/.test(path);
     }
 
-    return /(\/post\/|\/article\/|\/stories\/|\/story\/|\/p\/)/.test(path);
+    if (/\/articles\/[^/]+/.test(path)) return true;
+    if (/\/article\/[^/]+/.test(path)) return true;
+    if (/\/post\/[^/]+/.test(path)) return true;
+    if (/\/stories\/[^/]+/.test(path) || /\/story\/[^/]+/.test(path)) return true;
+    if (/\/p\/[^/]+/.test(path)) return true;
+    if (/\/blog\/[^/]+/.test(path)) {
+      const blockedBlogSlugs = new Set([
+        "everything",
+        "design-systems",
+        "product-updates",
+        "operations",
+        "infrastructure",
+        "diagramming",
+        "portfolio",
+        "thought-leadership",
+        "corpcore",
+      ]);
+      return !blockedBlogSlugs.has(tail);
+    }
+    return false;
   } catch {
     return false;
   }
