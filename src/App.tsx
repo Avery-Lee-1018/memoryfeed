@@ -184,6 +184,7 @@ export default function App() {
   }, [toast]);
 
   const skip = async (id: number) => {
+    if (selectedDate !== toIsoDate(new Date())) return;
     const currentItemIds = items.map((item) => item.id);
     const startedAt = Date.now();
     setReplacingIds((prev) => new Set(prev).add(id));
@@ -587,7 +588,7 @@ export default function App() {
                         }
                       />
                     )}
-                    {!memoItemIds.has(item.id) && (
+                    {isToday && !memoItemIds.has(item.id) && (
                       <button
                         onClick={() => skip(item.id)}
                         disabled={replacingIds.has(item.id)}

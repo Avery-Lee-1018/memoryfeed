@@ -194,7 +194,30 @@ function getDateParamOrToday(value: string | null): string {
   return parsed;
 }
 
+function getTodayIso() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+async function ensureFeedSlotsTable(env: Env) {
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS feed_slots (
+      date TEXT NOT NULL,
+      slot_index INTEGER NOT NULL CHECK (slot_index IN (0, 1, 2)),
+      item_id INTEGER NOT NULL,
+      source_id INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (date, slot_index),
+      UNIQUE (date, item_id),
+      FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE,
+      FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE
+    )
+  `).run();
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_feed_slots_date ON feed_slots(date)").run();
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_feed_slots_source_date ON feed_slots(source_id, date)").run();
+}
+
 async function handleGetFeedToday(url: URL, env: Env, ctx: ExecutionContext) {
+  await ensureFeedSlotsTable(env);
   await cleanupDemoData(env);
   await ensureItemsFromSources(env);
   const targetDate = getDateParamOrToday(url.searchParams.get("date"));
@@ -205,39 +228,7 @@ async function handleGetFeedToday(url: URL, env: Env, ctx: ExecutionContext) {
 
   // Always guarantee 3 items — prioritize source diversity for the same date.
   if (items.length < 3) {
-    const existingIds = items.map((i) => Number(i.id)).filter(Number.isFinite);
-    const existingSourceIds = items.map((i) => Number(i.sourceId)).filter(Number.isFinite);
-    const neededDistinct = 3 - items.length;
-
-    const diverse = await selectCandidateItemIds(env, {
-      limit: neededDistinct,
-      excludeItemIds: existingIds,
-      excludeSourceIds: existingSourceIds,
-      requireUnassigned: true,
-      requireNoMemo: true,
-      distinctBySource: true,
-    });
-    for (const id of diverse) {
-      await env.DB.prepare("UPDATE items SET shown_date = ? WHERE id = ?").bind(targetDate, id).run();
-      existingIds.push(id);
-    }
-
-    if (existingIds.length < 3) {
-      const neededFallback = 3 - existingIds.length;
-      const fallback = await selectCandidateItemIds(env, {
-        limit: neededFallback,
-        excludeItemIds: existingIds,
-        excludeSourceIds: [],
-        requireUnassigned: true,
-        requireNoMemo: true,
-        distinctBySource: false,
-      });
-      for (const id of fallback) {
-        await env.DB.prepare("UPDATE items SET shown_date = ? WHERE id = ?").bind(targetDate, id).run();
-        existingIds.push(id);
-      }
-    }
-
+    await fillDateIfNeeded(targetDate, env);
     result = await queryDistinctDateItems(targetDate, env);
   }
 
@@ -309,26 +300,24 @@ async function rehydrateRandomWeakSource(env: Env) {
 
 async function queryDistinctDateItems(targetDate: string, env: Env) {
   return env.DB.prepare(`
-    WITH shown AS (
-      SELECT i.id, i.title, i.url, i.summary, i.thumbnail_url,
-             s.name AS sourceName, s.type AS sourceType, s.level AS sourceLevel,
-             i.source_id AS sourceId,
-             n.content AS note,
-             ROW_NUMBER() OVER (PARTITION BY i.source_id ORDER BY i.id DESC) AS source_rank
-      FROM items i
-      JOIN sources s ON i.source_id = s.id
-      LEFT JOIN notes n ON n.item_id = i.id
-      WHERE i.shown_date = ?
-        AND s.is_active = 1
-    )
-    SELECT id, title, url, summary, thumbnail_url, sourceName, sourceType, sourceLevel, sourceId, note
-    FROM shown
-    WHERE source_rank = 1
+    SELECT i.id, i.title, i.url, i.summary, i.thumbnail_url,
+           s.name AS sourceName, s.type AS sourceType, s.level AS sourceLevel,
+           i.source_id AS sourceId,
+           n.content AS note,
+           fs.slot_index AS slotIndex
+    FROM feed_slots fs
+    JOIN items i ON i.id = fs.item_id
+    JOIN sources s ON s.id = i.source_id
+    LEFT JOIN notes n ON n.item_id = i.id
+    WHERE fs.date = ?
+      AND s.is_active = 1
+    ORDER BY fs.slot_index ASC
     LIMIT 3
   `).bind(targetDate).all();
 }
 
 async function handlePostFeedReplacement(request: Request, env: Env) {
+  await ensureFeedSlotsTable(env);
   let body: { excludeItemIds?: number[]; date?: string; replaceItemId?: number };
   try {
     body = (await request.json()) as { excludeItemIds?: number[]; date?: string; replaceItemId?: number };
@@ -341,25 +330,53 @@ async function handlePostFeedReplacement(request: Request, env: Env) {
     : [];
 
   const targetDate = getDateParamOrToday(body.date ?? null);
+  if (targetDate !== getTodayIso()) {
+    return json({ item: null, reason: "replacement_allowed_only_for_today" });
+  }
 
-  const excludedSourceRows = excludeItemIds.length > 0
+  const slot = Number.isInteger(body.replaceItemId)
     ? await env.DB.prepare(`
-      SELECT DISTINCT source_id
-      FROM items
-      WHERE id IN (${excludeItemIds.map(() => "?").join(", ")})
-    `).bind(...excludeItemIds).all()
-    : { results: [] as Record<string, unknown>[] };
-  const excludedSourceIds = ((excludedSourceRows.results ?? []) as Record<string, unknown>[])
+      SELECT slot_index
+      FROM feed_slots
+      WHERE date = ? AND item_id = ?
+      LIMIT 1
+    `).bind(targetDate, body.replaceItemId).first<{ slot_index: number }>()
+    : null;
+  if (!slot) {
+    return json({ item: null, reason: "item_not_in_today_slots" });
+  }
+
+  const todayRows = await env.DB.prepare(`
+    SELECT item_id, source_id
+    FROM feed_slots
+    WHERE date = ?
+  `).bind(targetDate).all();
+  const todayItems = ((todayRows.results ?? []) as Record<string, unknown>[])
+    .map((row) => Number(row.item_id))
+    .filter(Number.isFinite);
+  const todaySources = ((todayRows.results ?? []) as Record<string, unknown>[])
     .map((row) => Number(row.source_id))
     .filter(Number.isFinite);
+
+  const fatigueRows = await env.DB.prepare(`
+    SELECT DISTINCT source_id
+    FROM feed_slots
+    WHERE date < ?
+      AND date >= date(?, '-3 day')
+  `).bind(targetDate, targetDate).all();
+  const fatiguedSources = ((fatigueRows.results ?? []) as Record<string, unknown>[])
+    .map((row) => Number(row.source_id))
+    .filter(Number.isFinite);
+
+  const excludedIds = [...new Set([...excludeItemIds, ...todayItems])];
+  const excludedSources = [...new Set([...todaySources, ...fatiguedSources])];
 
   let replacementId: number | null = null;
 
   const preferred = await selectCandidateItemIds(env, {
     limit: 1,
-    excludeItemIds,
-    excludeSourceIds: excludedSourceIds,
-    requireUnassigned: true,
+    excludeItemIds: excludedIds,
+    excludeSourceIds: excludedSources,
     requireNoMemo: true,
     distinctBySource: false,
   });
@@ -368,9 +385,8 @@ async function handlePostFeedReplacement(request: Request, env: Env) {
   if (!replacementId) {
     const fallbackUnassigned = await selectCandidateItemIds(env, {
       limit: 1,
-      excludeItemIds,
-      excludeSourceIds: [],
-      requireUnassigned: true,
+      excludeItemIds: excludedIds,
+      excludeSourceIds: todaySources,
       requireNoMemo: true,
       distinctBySource: false,
     });
@@ -380,9 +396,8 @@ async function handlePostFeedReplacement(request: Request, env: Env) {
   if (!replacementId) {
     const fallbackAny = await selectCandidateItemIds(env, {
       limit: 1,
-      excludeItemIds,
+      excludeItemIds: excludedIds,
       excludeSourceIds: [],
-      requireUnassigned: false,
       requireNoMemo: false,
       distinctBySource: false,
     });
@@ -390,24 +405,18 @@ async function handlePostFeedReplacement(request: Request, env: Env) {
   }
 
   if (replacementId) {
-    await env.DB.prepare("UPDATE items SET shown_date = ? WHERE id = ?")
-      .bind(targetDate, replacementId)
+    const replacementSource = await env.DB.prepare("SELECT source_id FROM items WHERE id = ? LIMIT 1")
+      .bind(replacementId)
+      .first<{ source_id: number }>();
+    if (!replacementSource) return json({ item: null });
+
+    await env.DB.prepare(`
+      UPDATE feed_slots
+      SET item_id = ?, source_id = ?
+      WHERE date = ? AND slot_index = ?
+    `)
+      .bind(replacementId, replacementSource.source_id, targetDate, slot.slot_index)
       .run();
-    if (Number.isInteger(body.replaceItemId)) {
-      await env.DB.prepare(`
-        UPDATE items
-        SET shown_date = NULL
-        WHERE id = ?
-          AND NOT EXISTS (
-            SELECT 1
-            FROM notes n
-            WHERE n.item_id = items.id
-              AND trim(n.content) != ''
-          )
-      `)
-        .bind(body.replaceItemId)
-        .run();
-    }
   }
 
   if (!replacementId) return json({ item: null });
@@ -458,21 +467,22 @@ async function handleGetSources(env: Env) {
       s.type,
       s.level,
       s.is_active,
-      COALESCE(COUNT(DISTINCT CASE WHEN i.shown_date IS NOT NULL THEN i.id END), 0) AS exposureCount,
+      COALESCE(COUNT(DISTINCT CASE WHEN fs.date IS NOT NULL THEN fs.date || ':' || fs.slot_index END), 0) AS exposureCount,
       COALESCE(COUNT(DISTINCT CASE WHEN n.content IS NOT NULL AND trim(n.content) != '' THEN n.id END), 0) AS memoCount,
-      MAX(i.shown_date) AS lastExposedAt,
+      MAX(fs.date) AS lastExposedAt,
       COALESCE(
         MAX(CASE
           WHEN n.updated_at IS NOT NULL
-               AND (i.shown_date IS NULL OR n.updated_at > i.shown_date)
+               AND (fs.date IS NULL OR n.updated_at > fs.date)
           THEN n.updated_at
-          ELSE i.shown_date
+          ELSE fs.date
         END),
-        MAX(i.shown_date),
+        MAX(fs.date),
         MAX(n.updated_at)
       ) AS lastActivityAt
     FROM sources s
     LEFT JOIN items i ON i.source_id = s.id
+    LEFT JOIN feed_slots fs ON fs.item_id = i.id
     LEFT JOIN notes n ON n.item_id = i.id
     GROUP BY s.id
     ORDER BY s.id DESC
@@ -669,7 +679,6 @@ type CandidateQueryOptions = {
   limit: number;
   excludeItemIds: number[];
   excludeSourceIds: number[];
-  requireUnassigned: boolean;
   requireNoMemo: boolean;
   distinctBySource: boolean;
 };
@@ -685,7 +694,6 @@ function buildInClause(column: string, values: number[]) {
 async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) {
   const itemExclusion = buildInClause("i.id", options.excludeItemIds);
   const sourceExclusion = buildInClause("i.source_id", options.excludeSourceIds);
-  const shownClause = options.requireUnassigned ? "AND i.shown_date IS NULL" : "";
   const memoClause = options.requireNoMemo ? "AND (n.content IS NULL OR trim(n.content) = '')" : "";
   const limit = Math.max(0, options.limit);
   if (limit === 0) return [] as number[];
@@ -712,7 +720,6 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
         LEFT JOIN notes n ON n.item_id = i.id
         WHERE i.status = 'active'
           AND s.is_active = 1
-          ${shownClause}
           ${memoClause}
           ${itemExclusion.sql}
           ${sourceExclusion.sql}
@@ -740,7 +747,6 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
     LEFT JOIN notes n ON n.item_id = i.id
     WHERE i.status = 'active'
       AND s.is_active = 1
-      ${shownClause}
       ${memoClause}
       ${itemExclusion.sql}
       ${sourceExclusion.sql}
@@ -765,51 +771,101 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
 
 async function fillDateIfNeeded(targetDate: string, env: Env) {
   const existing = await env.DB.prepare(`
-    SELECT i.id, i.source_id
-    FROM items i
-    JOIN sources s ON s.id = i.source_id
-    WHERE i.shown_date = ?
-      AND s.is_active = 1
+    SELECT slot_index, item_id, source_id
+    FROM feed_slots
+    WHERE date = ?
+    ORDER BY slot_index
     LIMIT 3
   `).bind(targetDate).all();
   const currentRows = (existing.results ?? []) as Record<string, unknown>[];
-  const currentIds = currentRows.map((row) => Number(row.id)).filter(Number.isFinite);
+  const currentIds = currentRows.map((row) => Number(row.item_id)).filter(Number.isFinite);
   const currentSourceIds = currentRows.map((row) => Number(row.source_id)).filter(Number.isFinite);
-  const uniqueSourceCount = new Set(currentSourceIds).size;
-  const needed = 3 - uniqueSourceCount;
-  if (needed <= 0) return;
+  const existingSlots = new Set(currentRows.map((row) => Number(row.slot_index)).filter(Number.isFinite));
+  const missingSlots = [0, 1, 2].filter((slot) => !existingSlots.has(slot));
+  if (missingSlots.length <= 0) return;
+
+  const fatigueRows = await env.DB.prepare(`
+    SELECT DISTINCT source_id
+    FROM feed_slots
+    WHERE date < ?
+      AND date >= date(?, '-3 day')
+  `).bind(targetDate, targetDate).all();
+  const fatiguedSourceIds = ((fatigueRows.results ?? []) as Record<string, unknown>[])
+    .map((row) => Number(row.source_id))
+    .filter(Number.isFinite);
 
   const diverse = await selectCandidateItemIds(env, {
-    limit: needed,
+    limit: missingSlots.length,
     excludeItemIds: currentIds,
-    excludeSourceIds: currentSourceIds,
-    requireUnassigned: true,
+    excludeSourceIds: [...new Set([...currentSourceIds, ...fatiguedSourceIds])],
     requireNoMemo: true,
     distinctBySource: true,
   });
 
+  let slotCursor = 0;
   for (const id of diverse) {
-    await env.DB.prepare("UPDATE items SET shown_date = ? WHERE id = ?")
-      .bind(targetDate, id)
-      .run();
+    const slot = missingSlots[slotCursor++];
+    if (slot === undefined) break;
+    const sourceRow = await env.DB.prepare("SELECT source_id FROM items WHERE id = ? LIMIT 1").bind(id).first<{ source_id: number }>();
+    if (!sourceRow) continue;
+    await env.DB.prepare(`
+      INSERT OR REPLACE INTO feed_slots (date, slot_index, item_id, source_id)
+      VALUES (?, ?, ?, ?)
+    `).bind(targetDate, slot, id, sourceRow.source_id).run();
     currentIds.push(id);
+    currentSourceIds.push(sourceRow.source_id);
   }
 
-  if (currentIds.length >= 3) return;
+  const filledSlots = await env.DB.prepare("SELECT slot_index FROM feed_slots WHERE date = ?").bind(targetDate).all();
+  const filledSet = new Set(((filledSlots.results ?? []) as Record<string, unknown>[]).map((r) => Number(r.slot_index)));
+  const stillMissing = [0, 1, 2].filter((slot) => !filledSet.has(slot));
+  if (stillMissing.length <= 0) return;
 
   const fallback = await selectCandidateItemIds(env, {
-    limit: 3 - currentIds.length,
+    limit: stillMissing.length,
+    excludeItemIds: currentIds,
+    excludeSourceIds: currentSourceIds,
+    requireNoMemo: true,
+    distinctBySource: true,
+  });
+
+  let fallbackCursor = 0;
+  for (const id of fallback) {
+    const slot = stillMissing[fallbackCursor++];
+    if (slot === undefined) break;
+    const sourceRow = await env.DB.prepare("SELECT source_id FROM items WHERE id = ? LIMIT 1").bind(id).first<{ source_id: number }>();
+    if (!sourceRow) continue;
+    await env.DB.prepare(`
+      INSERT OR REPLACE INTO feed_slots (date, slot_index, item_id, source_id)
+      VALUES (?, ?, ?, ?)
+    `).bind(targetDate, slot, id, sourceRow.source_id).run();
+    currentIds.push(id);
+    currentSourceIds.push(sourceRow.source_id);
+  }
+
+  const finalSlots = await env.DB.prepare("SELECT slot_index FROM feed_slots WHERE date = ?").bind(targetDate).all();
+  const finalSet = new Set(((finalSlots.results ?? []) as Record<string, unknown>[]).map((r) => Number(r.slot_index)));
+  const finalMissing = [0, 1, 2].filter((slot) => !finalSet.has(slot));
+  if (finalMissing.length <= 0) return;
+
+  const relaxed = await selectCandidateItemIds(env, {
+    limit: finalMissing.length,
     excludeItemIds: currentIds,
     excludeSourceIds: [],
-    requireUnassigned: true,
     requireNoMemo: true,
     distinctBySource: false,
   });
 
-  for (const id of fallback) {
-    await env.DB.prepare("UPDATE items SET shown_date = ? WHERE id = ?")
-      .bind(targetDate, id)
-      .run();
+  let relaxedCursor = 0;
+  for (const id of relaxed) {
+    const slot = finalMissing[relaxedCursor++];
+    if (slot === undefined) break;
+    const sourceRow = await env.DB.prepare("SELECT source_id FROM items WHERE id = ? LIMIT 1").bind(id).first<{ source_id: number }>();
+    if (!sourceRow) continue;
+    await env.DB.prepare(`
+      INSERT OR REPLACE INTO feed_slots (date, slot_index, item_id, source_id)
+      VALUES (?, ?, ?, ?)
+    `).bind(targetDate, slot, id, sourceRow.source_id).run();
   }
 }
 
@@ -927,6 +983,9 @@ async function ingestItemsForSource(
           WHEN items.summary LIKE '%&#%' THEN excluded.summary
           WHEN trim(items.summary) = '*' THEN excluded.summary
           WHEN trim(items.summary) = '-' THEN excluded.summary
+          WHEN items.summary LIKE '%<%>%' THEN excluded.summary
+          WHEN items.summary LIKE '%Discussion | Link%' THEN excluded.summary
+          WHEN items.summary LIKE '%utm_campaign=%' THEN excluded.summary
           ELSE items.summary
         END,
         thumbnail_url = COALESCE(items.thumbnail_url, excluded.thumbnail_url)
@@ -1060,8 +1119,8 @@ function parseRssEntries(xml: string, baseUrl: string) {
     const linkRaw = decodeXml(matchTag(block, "link")).trim();
     const descriptionRaw = matchTag(block, "description");
     const contentRaw = matchTag(block, "content:encoded");
-    const description = normalizeDisplayText(decodeXml(stripTags(descriptionRaw)).trim());
-    const contentSummary = normalizeDisplayText(decodeXml(stripTags(contentRaw)).trim());
+    const description = normalizeDisplayText(stripTags(decodeXml(descriptionRaw)).trim());
+    const contentSummary = normalizeDisplayText(stripTags(decodeXml(contentRaw)).trim());
     const summary = pickBestSummary(description, contentSummary);
     const descriptionHtml = matchTag(block, "description");
     const thumbnailRaw =
@@ -1088,7 +1147,7 @@ function parseRssEntries(xml: string, baseUrl: string) {
     const altMatch = block.match(/<link[^>]+rel=["']alternate["'][^>]+href=["']([^"']+)["'][^>]*>/i);
     const linkRaw = (altMatch?.[1] || hrefMatch?.[1] || "").trim();
     const summaryRaw = matchTag(block, "summary") || matchTag(block, "content");
-    const summary = normalizeDisplayText(decodeXml(stripTags(summaryRaw)).trim());
+    const summary = normalizeDisplayText(stripTags(decodeXml(summaryRaw)).trim());
     const enclosureMatch = block.match(/<link[^>]+rel=["']enclosure["'][^>]+href=["']([^"']+)["'][^>]*>/i);
     const thumbnailRaw = enclosureMatch?.[1] || extractFirstImageSrc(summaryRaw);
     const thumbnailUrl = thumbnailRaw ? normalizeEntryUrl(decodeXml(thumbnailRaw), baseUrl) : null;
@@ -1169,6 +1228,8 @@ function normalizeDisplayText(text: string) {
     .replace(/[–—]/g, "-")
     .replace(/^\s*[\-*•·]+\s*/, "")
     .replace(/\s+\*\s+/g, " ")
+    .replace(/\bDiscussion\s*\|\s*Link\b/gi, "")
+    .replace(/https?:\/\/\S+/gi, "")
     .replace(/\s+/g, " ")
     .trim();
 }
