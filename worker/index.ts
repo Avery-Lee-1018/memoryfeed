@@ -1054,7 +1054,9 @@ async function collectSourceEntries(source: { url: string; type: SourceType }): 
     const text = await fetchSourceText(source.url, "application/rss+xml,application/atom+xml,application/xml,text/xml,text/html");
     const parsed = text ? dedupeEntries(parseRssEntries(text, source.url)) : [];
     if (parsed.length > 0) return parsed;
-    return text ? collectEntriesFromSitemap(source.url, text) : [];
+    const fromSitemap = text ? await collectEntriesFromSitemap(source.url, text) : [];
+    if (fromSitemap.length > 0) return fromSitemap;
+    return text ? collectEntriesFromHtmlLinks(text, source.url) : [];
   }
 
   const html = await fetchSourceText(source.url, "text/html,application/xhtml+xml,application/xml,text/xml");
@@ -1068,7 +1070,9 @@ async function collectSourceEntries(source: { url: string; type: SourceType }): 
     if (entries.length > 0) return entries;
   }
 
-  return collectEntriesFromSitemap(source.url, html);
+  const fromSitemap = await collectEntriesFromSitemap(source.url, html);
+  if (fromSitemap.length > 0) return fromSitemap;
+  return collectEntriesFromHtmlLinks(html, source.url);
 }
 
 function discoverFeedUrlsFromHtml(html: string, pageUrl: string) {
@@ -1227,6 +1231,64 @@ async function collectEntriesFromSitemap(pageUrl: string, pageHtml?: string) {
   }
 
   return dedupeEntries(collected).slice(0, ENTRY_LIMIT_PER_SOURCE);
+}
+
+function collectEntriesFromHtmlLinks(html: string, pageUrl: string) {
+  const host = safeHost(pageUrl);
+  if (!html || !host) return [] as SourceEntry[];
+
+  const seen = new Set<string>();
+  const entries: SourceEntry[] = [];
+
+  const appendEntry = (rawUrl: string) => {
+    if (entries.length >= ENTRY_LIMIT_PER_SOURCE) return;
+    const normalized = normalizeEntryUrl(decodeXml(rawUrl.trim()), pageUrl);
+    if (!normalized) return;
+    if (!isLikelyArticleUrl(normalized, host)) return;
+    const key = canonicalEntryKey(normalized);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    entries.push({
+      title: deriveTitleFromUrl(normalized),
+      url: normalized,
+    });
+  };
+
+  const hrefRe = /<a[^>]+href=["']([^"']+)["'][^>]*>/gi;
+  let match: RegExpExecArray | null;
+  while ((match = hrefRe.exec(html))) {
+    appendEntry(match[1]);
+  }
+
+  if (entries.length < ENTRY_LIMIT_PER_SOURCE) {
+    for (const raw of extractUrlLikeTokens(html)) {
+      appendEntry(raw);
+      if (entries.length >= ENTRY_LIMIT_PER_SOURCE) break;
+    }
+  }
+
+  return entries;
+}
+
+function extractUrlLikeTokens(text: string) {
+  const candidates: string[] = [];
+  const plainText = text.replace(/\\\//g, "/");
+
+  const absoluteRe = /https?:\/\/[^\s"'<>\\]+/gi;
+  let match: RegExpExecArray | null;
+  while ((match = absoluteRe.exec(plainText))) {
+    candidates.push(match[0]);
+  }
+
+  const pathRe = /\/[a-z0-9\-_/]{6,}/gi;
+  while ((match = pathRe.exec(plainText))) {
+    const token = match[0];
+    if (token.includes("/blog/") || token.includes("/article/") || token.includes("/articles/") || token.includes("/post/") || token.includes("/story/") || token.includes("/stories/") || token.includes("/p/")) {
+      candidates.push(token);
+    }
+  }
+
+  return candidates;
 }
 
 function buildSitemapEntries(urls: string[], seedUrl: string) {
