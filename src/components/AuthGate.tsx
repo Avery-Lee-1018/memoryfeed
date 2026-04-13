@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { loginWithGoogleIdToken, type AuthUser } from "@/lib/auth-session";
 
 const WEB_CLIENT_ID_KEY = "memoryfeed_google_web_client_id";
+const DEFAULT_WEB_CLIENT_ID = "380812389397-lk5kr88gujudk3j6ks7rb04piua1u1nr.apps.googleusercontent.com";
 
 type Props = {
   onSignedIn: (user: AuthUser) => void;
@@ -13,8 +14,8 @@ export default function AuthGate({ onSignedIn }: Props) {
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
-    const stored = localStorage.getItem(WEB_CLIENT_ID_KEY) ?? "";
-    setClientId(stored);
+    const stored = localStorage.getItem(WEB_CLIENT_ID_KEY)?.trim() ?? "";
+    setClientId(stored || DEFAULT_WEB_CLIENT_ID);
   }, []);
 
   useEffect(() => {
