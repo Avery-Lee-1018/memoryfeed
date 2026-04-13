@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Memoryfeed Login</title>
+    <link rel="stylesheet" href="./popup.css" />
+  </head>
+  <body>
+    <main class="container">
+      <p class="label">Memoryfeed Account</p>
+      <h1 id="title" class="title">로그인이 필요해요</h1>
+      <p id="desc" class="desc">Google 계정으로 연동해 주세요.</p>
+      <div class="actions">
+        <button id="loginBtn" class="btn primary">Google로 로그인</button>
+        <button id="logoutBtn" class="btn" hidden>로그아웃</button>
+      </div>
+      <p id="error" class="error"></p>
+    </main>
+    <script type="module" src="./popup.js"></script>
+  </body>
+</html>

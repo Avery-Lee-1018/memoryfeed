@@ -1,7 +1,12 @@
+import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
+
 interface Env {
   DB: D1Database;
   ASSETS: Fetcher;
   ADMIN_TOKEN?: string;
+  AUTH_JWT_SECRET?: string;
+  GOOGLE_CLIENT_IDS?: string;
+  EXTENSION_ORIGINS?: string;
 }
 
 type ReactionType = "keep" | "skip";
@@ -12,6 +17,15 @@ const ENTRY_LIMIT_PER_SOURCE = 18;
 const KOREAN_ACCEPT_LANGUAGE = "ko-KR,ko;q=0.95,en-US;q=0.7,en;q=0.6";
 const CRAWLER_USER_AGENT = "Mozilla/5.0 (compatible; MemoryFeedBot/1.0)";
 const ADMIN_HEADER = "x-memoryfeed-key";
+const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30;
+const GOOGLE_JWKS = createRemoteJWKSet(new URL("https://www.googleapis.com/oauth2/v3/certs"));
+const GOOGLE_ISSUERS = ["https://accounts.google.com", "accounts.google.com"];
+
+type AuthTokenPayload = JWTPayload & {
+  sub: string;
+  sid: string;
+  email: string;
+};
 
 const json = (data: unknown, init: ResponseInit = {}) =>
   new Response(JSON.stringify(data), {
@@ -26,47 +40,72 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     try {
       const url = new URL(request.url);
+      let sessionUserId: number | null = null;
+      if (isUserScopedRoute(request.method, url.pathname)) {
+        await ensureAuthTables(env);
+        await ensureUserScopedTables(env);
+        const auth = await authenticateSession(request, env);
+        if (!auth.ok) {
+          return withCorsIfNeeded(request, env, json({ error: auth.error }, { status: 401 }));
+        }
+        sessionUserId = auth.user.id;
+      }
+      if (request.method === "OPTIONS" && isAuthPath(url.pathname)) {
+        return buildCorsPreflight(request, env);
+      }
       if (isProtectedRoute(request.method, url.pathname) && !isAuthorizedRequest(request, env)) {
-        return json({ error: "UNAUTHORIZED" }, { status: 401 });
+        return withCorsIfNeeded(request, env, json({ error: "UNAUTHORIZED" }, { status: 401 }));
       }
 
       if (request.method === "GET" && url.pathname === "/api/thumbnail") {
-        return handleGetThumbnail(request, url, ctx, env);
+        return handleGetThumbnail(request, url, ctx, env, sessionUserId ?? 0);
       }
       if (request.method === "GET" && url.pathname === "/api/feed/today") {
-        return handleGetFeedToday(url, env, ctx);
+        return handleGetFeedToday(url, env, ctx, sessionUserId ?? 0);
       }
       if (request.method === "POST" && url.pathname === "/api/feed/replacement") {
-        return handlePostFeedReplacement(request, env);
+        return handlePostFeedReplacement(request, env, sessionUserId ?? 0);
       }
       if (request.method === "POST" && url.pathname === "/api/reaction") {
-        return handlePostReaction(request, env);
+        return handlePostReaction(request, env, sessionUserId ?? 0);
       }
       if (request.method === "GET" && url.pathname === "/api/sources") {
-        return handleGetSources(env);
+        return handleGetSources(env, sessionUserId ?? 0);
       }
       if (request.method === "POST" && url.pathname === "/api/sources") {
-        return handlePostSources(request, env, ctx);
+        return handlePostSources(request, env, ctx, sessionUserId ?? 0);
       }
       if (request.method === "PATCH" && /^\/api\/sources\/\d+$/.test(url.pathname)) {
         const sourceId = parseInt(url.pathname.split("/")[3]);
-        return handlePatchSource(sourceId, request, env);
+        return handlePatchSource(sourceId, request, env, sessionUserId ?? 0);
       }
       if (request.method === "DELETE" && /^\/api\/sources\/\d+$/.test(url.pathname)) {
         const sourceId = parseInt(url.pathname.split("/")[3]);
-        return handleDeleteSource(sourceId, env);
+        return handleDeleteSource(sourceId, env, sessionUserId ?? 0);
       }
       if (request.method === "POST" && /^\/api\/notes\/\d+$/.test(url.pathname)) {
         const itemId = parseInt(url.pathname.split("/")[3]);
-        return handlePostNote(itemId, request, env);
+        return handlePostNote(itemId, request, env, sessionUserId ?? 0);
       }
       if (request.method === "GET" && /^\/api\/notes\/\d+$/.test(url.pathname)) {
         const itemId = parseInt(url.pathname.split("/")[3]);
-        return handleGetNote(itemId, env);
+        return handleGetNote(itemId, env, sessionUserId ?? 0);
       }
       if (request.method === "DELETE" && /^\/api\/notes\/\d+$/.test(url.pathname)) {
         const itemId = parseInt(url.pathname.split("/")[3]);
-        return handleDeleteNote(itemId, env);
+        return handleDeleteNote(itemId, env, sessionUserId ?? 0);
+      }
+      if (request.method === "POST" && url.pathname === "/api/auth/google") {
+        const response = await handlePostAuthGoogle(request, env);
+        return withCorsIfNeeded(request, env, response);
+      }
+      if (request.method === "GET" && url.pathname === "/api/auth/me") {
+        const response = await handleGetAuthMe(request, env);
+        return withCorsIfNeeded(request, env, response);
+      }
+      if (request.method === "POST" && url.pathname === "/api/auth/logout") {
+        const response = await handlePostAuthLogout(request, env);
+        return withCorsIfNeeded(request, env, response);
       }
 
       return env.ASSETS.fetch(request);
@@ -78,12 +117,79 @@ export default {
 } satisfies ExportedHandler<Env>;
 
 function isProtectedRoute(method: string, pathname: string) {
-  if (method === "POST" && pathname === "/api/reaction") return true;
+  void method;
+  void pathname;
+  return false;
+}
+
+function isUserScopedRoute(method: string, pathname: string) {
+  if (method === "GET" && pathname === "/api/thumbnail") return true;
+  if (method === "GET" && pathname === "/api/feed/today") return true;
   if (method === "POST" && pathname === "/api/feed/replacement") return true;
-  if (method === "POST" && pathname === "/api/sources") return true;
+  if (method === "POST" && pathname === "/api/reaction") return true;
+  if ((method === "GET" || method === "POST") && pathname === "/api/sources") return true;
   if ((method === "PATCH" || method === "DELETE") && /^\/api\/sources\/\d+$/.test(pathname)) return true;
   if ((method === "GET" || method === "POST" || method === "DELETE") && /^\/api\/notes\/\d+$/.test(pathname)) return true;
   return false;
+}
+
+function isAuthPath(pathname: string) {
+  return pathname === "/api/auth/google" || pathname === "/api/auth/me" || pathname === "/api/auth/logout";
+}
+
+function parseAllowedOrigins(env: Env) {
+  return (env.EXTENSION_ORIGINS ?? "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
+function resolveCorsOrigin(request: Request, env: Env) {
+  const origin = request.headers.get("origin");
+  if (!origin) return null;
+
+  if (
+    origin === "http://localhost:5173" ||
+    origin === "http://127.0.0.1:5173" ||
+    origin.startsWith("chrome-extension://")
+  ) {
+    return origin;
+  }
+
+  const allowed = parseAllowedOrigins(env);
+  if (allowed.includes(origin)) return origin;
+  return null;
+}
+
+function buildCorsHeaders(request: Request, env: Env) {
+  const origin = resolveCorsOrigin(request, env);
+  if (!origin) return null;
+  return {
+    "access-control-allow-origin": origin,
+    "access-control-allow-methods": "GET,POST,OPTIONS",
+    "access-control-allow-headers": "content-type,authorization,x-memoryfeed-key",
+    "access-control-max-age": "86400",
+    vary: "Origin",
+  };
+}
+
+function withCorsIfNeeded(request: Request, env: Env, response: Response) {
+  if (!isAuthPath(new URL(request.url).pathname)) return response;
+  const corsHeaders = buildCorsHeaders(request, env);
+  if (!corsHeaders) return response;
+  const headers = new Headers(response.headers);
+  for (const [key, value] of Object.entries(corsHeaders)) headers.set(key, value);
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+function buildCorsPreflight(request: Request, env: Env) {
+  const corsHeaders = buildCorsHeaders(request, env);
+  if (!corsHeaders) return new Response("Forbidden", { status: 403 });
+  return new Response(null, { status: 204, headers: corsHeaders });
 }
 
 function isAuthorizedRequest(request: Request, env: Env) {
@@ -108,14 +214,19 @@ function isHostRelated(hostA: string, hostB: string) {
   return a === b || a.endsWith(`.${b}`) || b.endsWith(`.${a}`);
 }
 
-async function isAllowedSourcePageUrl(targetUrl: string, env: Env) {
+async function isAllowedSourcePageUrl(targetUrl: string, env: Env, userId: number) {
   let targetHost: string;
   try {
     targetHost = new URL(targetUrl).hostname;
   } catch {
     return false;
   }
-  const rows = await env.DB.prepare("SELECT url FROM sources").all<{ url: string }>();
+  const rows = await env.DB.prepare(`
+    SELECT s.url AS url
+    FROM user_sources us
+    JOIN sources s ON s.id = us.source_id
+    WHERE us.user_id = ? AND us.is_active = 1
+  `).bind(userId).all<{ url: string }>();
   for (const row of rows.results ?? []) {
     try {
       const sourceHost = new URL(row.url).hostname;
@@ -137,14 +248,14 @@ function isSafeImageHost(imageUrl: string, pageUrl: string) {
   }
 }
 
-async function handleGetThumbnail(request: Request, url: URL, ctx: ExecutionContext, env: Env) {
+async function handleGetThumbnail(request: Request, url: URL, ctx: ExecutionContext, env: Env, userId: number) {
   const pageUrl = url.searchParams.get("pageUrl");
   const imageUrl = url.searchParams.get("imageUrl");
 
   if (!pageUrl || !/^https?:\/\//i.test(pageUrl)) {
     return new Response("Bad Request", { status: 400 });
   }
-  if (!(await isAllowedSourcePageUrl(pageUrl, env))) {
+  if (!(await isAllowedSourcePageUrl(pageUrl, env, userId))) {
     return new Response("Forbidden", { status: 403 });
   }
 
@@ -276,43 +387,45 @@ function getTodayIso() {
 
 async function ensureFeedSlotsTable(env: Env) {
   await env.DB.prepare(`
-    CREATE TABLE IF NOT EXISTS feed_slots (
+    CREATE TABLE IF NOT EXISTS user_feed_slots (
+      user_id INTEGER NOT NULL,
       date TEXT NOT NULL,
       slot_index INTEGER NOT NULL CHECK (slot_index IN (0, 1, 2)),
       item_id INTEGER NOT NULL,
       source_id INTEGER NOT NULL,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      PRIMARY KEY (date, slot_index),
-      UNIQUE (date, item_id),
+      PRIMARY KEY (user_id, date, slot_index),
+      UNIQUE (user_id, date, item_id),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
       FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE,
       FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE
     )
   `).run();
-  await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_feed_slots_date ON feed_slots(date)").run();
-  await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_feed_slots_source_date ON feed_slots(source_id, date)").run();
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_user_feed_slots_user_date ON user_feed_slots(user_id, date)").run();
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_user_feed_slots_user_source_date ON user_feed_slots(user_id, source_id, date)").run();
 }
 
-async function handleGetFeedToday(url: URL, env: Env, ctx: ExecutionContext) {
+async function handleGetFeedToday(url: URL, env: Env, ctx: ExecutionContext, userId: number) {
   await ensureFeedSlotsTable(env);
   await cleanupDemoData(env);
-  await ensureItemsFromSources(env);
+  await ensureItemsFromSources(env, userId);
   const targetDate = getDateParamOrToday(url.searchParams.get("date"));
-  await backfillFeedsUntilDate(targetDate, env);
-  let result = await queryDistinctDateItems(targetDate, env);
+  await backfillFeedsUntilDate(targetDate, env, userId);
+  let result = await queryDistinctDateItems(targetDate, env, userId);
 
   const items = (result.results ?? []) as Record<string, unknown>[];
 
   // Always guarantee 3 items — prioritize source diversity for the same date.
   if (items.length < 3) {
-    await fillDateIfNeeded(targetDate, env);
-    result = await queryDistinctDateItems(targetDate, env);
+    await fillDateIfNeeded(targetDate, env, userId);
+    result = await queryDistinctDateItems(targetDate, env, userId);
   }
 
   const rows = (result.results ?? []) as Record<string, unknown>[];
   ctx.waitUntil((async () => {
     await Promise.allSettled([
       rehydrateWeakShownSources(rows, env),
-      rehydrateRandomWeakSource(env),
+      rehydrateRandomWeakSource(env, userId),
     ]);
   })());
   const finalItems = rows.map(({ sourceId, ...rest }) => rest);
@@ -352,12 +465,14 @@ async function rehydrateWeakShownSources(rows: Record<string, unknown>[], env: E
   }
 }
 
-async function rehydrateRandomWeakSource(env: Env) {
+async function rehydrateRandomWeakSource(env: Env, userId: number) {
   const source = await env.DB.prepare(`
     SELECT s.id, s.name, s.url, s.type
-    FROM sources s
+    FROM user_sources us
+    JOIN sources s ON s.id = us.source_id
     JOIN items i ON i.source_id = s.id
-    WHERE s.is_active = 1
+    WHERE us.user_id = ?
+      AND us.is_active = 1
       AND (
         i.title IS NULL OR trim(i.title) = ''
         OR lower(trim(i.title)) = lower(trim(s.name))
@@ -370,31 +485,33 @@ async function rehydrateRandomWeakSource(env: Env) {
       )
     ORDER BY RANDOM()
     LIMIT 1
-  `).first<{ id: number; name: string; url: string; type: SourceType }>();
+  `).bind(userId).first<{ id: number; name: string; url: string; type: SourceType }>();
 
   if (!source) return;
   await hydrateSourceItems(source, env);
 }
 
-async function queryDistinctDateItems(targetDate: string, env: Env) {
+async function queryDistinctDateItems(targetDate: string, env: Env, userId: number) {
   return env.DB.prepare(`
     SELECT i.id, i.title, i.url, i.summary, i.thumbnail_url,
-           s.name AS sourceName, s.type AS sourceType, s.level AS sourceLevel,
+           s.name AS sourceName, s.type AS sourceType, us.level AS sourceLevel,
            i.source_id AS sourceId,
            CASE WHEN n.id IS NULL THEN 0 ELSE 1 END AS hasNote,
            fs.slot_index AS slotIndex
-    FROM feed_slots fs
+    FROM user_feed_slots fs
     JOIN items i ON i.id = fs.item_id
     JOIN sources s ON s.id = i.source_id
-    LEFT JOIN notes n ON n.item_id = i.id
+    JOIN user_sources us ON us.user_id = fs.user_id AND us.source_id = s.id
+    LEFT JOIN user_notes n ON n.item_id = i.id AND n.user_id = fs.user_id
     WHERE fs.date = ?
-      AND s.is_active = 1
+      AND fs.user_id = ?
+      AND us.is_active = 1
     ORDER BY fs.slot_index ASC
     LIMIT 3
-  `).bind(targetDate).all();
+  `).bind(targetDate, userId).all();
 }
 
-async function handlePostFeedReplacement(request: Request, env: Env) {
+async function handlePostFeedReplacement(request: Request, env: Env, userId: number) {
   await ensureFeedSlotsTable(env);
   let body: { excludeItemIds?: number[]; date?: string; replaceItemId?: number };
   try {
@@ -415,10 +532,10 @@ async function handlePostFeedReplacement(request: Request, env: Env) {
   const slot = Number.isInteger(body.replaceItemId)
     ? await env.DB.prepare(`
       SELECT slot_index
-      FROM feed_slots
-      WHERE date = ? AND item_id = ?
+      FROM user_feed_slots
+      WHERE user_id = ? AND date = ? AND item_id = ?
       LIMIT 1
-    `).bind(targetDate, body.replaceItemId).first<{ slot_index: number }>()
+    `).bind(userId, targetDate, body.replaceItemId).first<{ slot_index: number }>()
     : null;
   if (!slot) {
     return json({ item: null, reason: "item_not_in_today_slots" });
@@ -426,9 +543,9 @@ async function handlePostFeedReplacement(request: Request, env: Env) {
 
   const todayRows = await env.DB.prepare(`
     SELECT item_id, source_id
-    FROM feed_slots
-    WHERE date = ?
-  `).bind(targetDate).all();
+    FROM user_feed_slots
+    WHERE user_id = ? AND date = ?
+  `).bind(userId, targetDate).all();
   const todayItems = ((todayRows.results ?? []) as Record<string, unknown>[])
     .map((row) => Number(row.item_id))
     .filter(Number.isFinite);
@@ -438,10 +555,11 @@ async function handlePostFeedReplacement(request: Request, env: Env) {
 
   const fatigueRows = await env.DB.prepare(`
     SELECT DISTINCT source_id
-    FROM feed_slots
-    WHERE date < ?
+    FROM user_feed_slots
+    WHERE user_id = ?
+      AND date < ?
       AND date >= date(?, '-3 day')
-  `).bind(targetDate, targetDate).all();
+  `).bind(userId, targetDate, targetDate).all();
   const fatiguedSources = ((fatigueRows.results ?? []) as Record<string, unknown>[])
     .map((row) => Number(row.source_id))
     .filter(Number.isFinite);
@@ -452,6 +570,7 @@ async function handlePostFeedReplacement(request: Request, env: Env) {
   let replacementId: number | null = null;
 
   const preferred = await selectCandidateItemIds(env, {
+    userId,
     limit: 1,
     excludeItemIds: excludedIds,
     excludeSourceIds: excludedSources,
@@ -462,6 +581,7 @@ async function handlePostFeedReplacement(request: Request, env: Env) {
 
   if (!replacementId) {
     const fallbackUnassigned = await selectCandidateItemIds(env, {
+      userId,
       limit: 1,
       excludeItemIds: excludedIds,
       excludeSourceIds: todaySources,
@@ -474,6 +594,7 @@ async function handlePostFeedReplacement(request: Request, env: Env) {
   if (!replacementId) {
     // Last-resort: allow any item even if already used on another date.
     const fallbackAny = await selectCandidateItemIds(env, {
+      userId,
       limit: 1,
       excludeItemIds: excludedIds,
       excludeSourceIds: [],
@@ -491,29 +612,30 @@ async function handlePostFeedReplacement(request: Request, env: Env) {
     if (!replacementSource) return json({ item: null });
 
     await env.DB.prepare(`
-      UPDATE feed_slots
+      UPDATE user_feed_slots
       SET item_id = ?, source_id = ?
-      WHERE date = ? AND slot_index = ?
+      WHERE user_id = ? AND date = ? AND slot_index = ?
     `)
-      .bind(replacementId, replacementSource.source_id, targetDate, slot.slot_index)
+      .bind(replacementId, replacementSource.source_id, userId, targetDate, slot.slot_index)
       .run();
   }
 
   if (!replacementId) return json({ item: null });
   const finalReplacement = await env.DB.prepare(`
     SELECT i.id, i.title, i.url, i.summary, i.thumbnail_url,
-           s.name AS sourceName, s.type AS sourceType, s.level AS sourceLevel,
+           s.name AS sourceName, s.type AS sourceType, us.level AS sourceLevel,
            CASE WHEN n.id IS NULL THEN 0 ELSE 1 END AS hasNote
     FROM items i
     JOIN sources s ON i.source_id = s.id
-    LEFT JOIN notes n ON n.item_id = i.id
+    JOIN user_sources us ON us.user_id = ? AND us.source_id = s.id
+    LEFT JOIN user_notes n ON n.item_id = i.id AND n.user_id = ?
     WHERE i.id = ?
     LIMIT 1
-  `).bind(replacementId).first();
+  `).bind(userId, userId, replacementId).first();
   return json({ item: finalReplacement ?? null });
 }
 
-async function handlePostReaction(request: Request, env: Env) {
+async function handlePostReaction(request: Request, env: Env, userId: number) {
   let body: { itemId?: number; type?: ReactionType };
   try {
     body = (await request.json()) as { itemId?: number; type?: ReactionType };
@@ -532,21 +654,21 @@ async function handlePostReaction(request: Request, env: Env) {
     .bind(body.itemId).first();
   if (!itemExists) return json({ error: "item not found" }, { status: 404 });
 
-  await env.DB.prepare("INSERT INTO reactions (item_id, type) VALUES (?, ?)")
-    .bind(body.itemId, body.type).run();
+  await env.DB.prepare("INSERT INTO user_reactions (user_id, item_id, type) VALUES (?, ?, ?)")
+    .bind(userId, body.itemId, body.type).run();
 
   return json({ ok: true });
 }
 
-async function handleGetSources(env: Env) {
+async function handleGetSources(env: Env, userId: number) {
   const result = await env.DB.prepare(`
     SELECT
       s.id,
       s.name,
       s.url,
       s.type,
-      s.level,
-      s.is_active,
+      us.level,
+      us.is_active,
       COALESCE(COUNT(DISTINCT CASE WHEN fs.date IS NOT NULL THEN fs.date || ':' || fs.slot_index END), 0) AS exposureCount,
       COALESCE(COUNT(DISTINCT CASE WHEN n.content IS NOT NULL AND trim(n.content) != '' THEN n.id END), 0) AS memoCount,
       MAX(fs.date) AS lastExposedAt,
@@ -560,17 +682,19 @@ async function handleGetSources(env: Env) {
         MAX(fs.date),
         MAX(n.updated_at)
       ) AS lastActivityAt
-    FROM sources s
+    FROM user_sources us
+    JOIN sources s ON s.id = us.source_id
     LEFT JOIN items i ON i.source_id = s.id
-    LEFT JOIN feed_slots fs ON fs.item_id = i.id
-    LEFT JOIN notes n ON n.item_id = i.id
-    GROUP BY s.id
+    LEFT JOIN user_feed_slots fs ON fs.item_id = i.id AND fs.user_id = us.user_id
+    LEFT JOIN user_notes n ON n.item_id = i.id AND n.user_id = us.user_id
+    WHERE us.user_id = ?
+    GROUP BY s.id, us.level, us.is_active
     ORDER BY s.id DESC
-  `).all();
+  `).bind(userId).all();
   return json({ sources: result.results ?? [] });
 }
 
-async function handlePostSources(request: Request, env: Env, ctx: ExecutionContext) {
+async function handlePostSources(request: Request, env: Env, ctx: ExecutionContext, userId: number) {
   let body: { name?: string; url?: string; type?: SourceType; rawText?: string; urls?: string[] };
   try {
     body = (await request.json()) as { name?: string; url?: string; type?: SourceType; rawText?: string; urls?: string[] };
@@ -581,7 +705,13 @@ async function handlePostSources(request: Request, env: Env, ctx: ExecutionConte
   if (typeof body.rawText === "string" || Array.isArray(body.urls)) {
     const { urls, totalCandidates, invalidTokens } = parseSourceUrls(body.rawText, body.urls);
     const existingRows = await env.DB
-      .prepare("SELECT id, name, url, type FROM sources")
+      .prepare(`
+        SELECT s.id, s.name, s.url, s.type
+        FROM user_sources us
+        JOIN sources s ON s.id = us.source_id
+        WHERE us.user_id = ?
+      `)
+      .bind(userId)
       .all<{ id: number; name: string; url: string; type: SourceType }>();
     const sourceByHost = new Map<string, { id: number; name: string; url: string; type: SourceType }>();
     for (const row of existingRows.results ?? []) {
@@ -631,6 +761,10 @@ async function handlePostSources(request: Request, env: Env, ctx: ExecutionConte
             .bind(sourceUrl)
             .first<{ id: number; name: string; url: string; type: SourceType }>();
           if (inserted) {
+            await env.DB.prepare(`
+              INSERT OR IGNORE INTO user_sources (user_id, source_id, is_active, level)
+              VALUES (?, ?, 1, 'focus')
+            `).bind(userId, inserted.id).run();
             await seedItemForSource(inserted, env);
             ctx.waitUntil(hydrateSourceItems(inserted, env));
             const insertedHost = extractSourceHost(inserted.url);
@@ -642,7 +776,13 @@ async function handlePostSources(request: Request, env: Env, ctx: ExecutionConte
             .prepare("SELECT id, name, url, type FROM sources WHERE url = ? LIMIT 1")
             .bind(sourceUrl)
             .first<{ id: number; name: string; url: string; type: SourceType }>();
-          if (existing) ctx.waitUntil(hydrateSourceItems(existing, env));
+          if (existing) {
+            await env.DB.prepare(`
+              INSERT OR IGNORE INTO user_sources (user_id, source_id, is_active, level)
+              VALUES (?, ?, 1, 'focus')
+            `).bind(userId, existing.id).run();
+            ctx.waitUntil(hydrateSourceItems(existing, env));
+          }
         }
       } catch {
         failedUrls.push(sourceUrl);
@@ -678,7 +818,13 @@ async function handlePostSources(request: Request, env: Env, ctx: ExecutionConte
   const incomingHost = extractSourceHost(body.url);
   if (incomingHost) {
     const existing = await env.DB
-      .prepare("SELECT id, name, url, type FROM sources")
+      .prepare(`
+        SELECT s.id, s.name, s.url, s.type
+        FROM user_sources us
+        JOIN sources s ON s.id = us.source_id
+        WHERE us.user_id = ?
+      `)
+      .bind(userId)
       .all<{ id: number; name: string; url: string; type: SourceType }>();
     const match = (existing.results ?? []).find((row) => extractSourceHost(row.url) === incomingHost);
     if (match) {
@@ -687,13 +833,17 @@ async function handlePostSources(request: Request, env: Env, ctx: ExecutionConte
     }
   }
 
-  await env.DB.prepare("INSERT INTO sources (name, url, type) VALUES (?, ?, ?)")
+  await env.DB.prepare("INSERT OR IGNORE INTO sources (name, url, type) VALUES (?, ?, ?)")
     .bind(body.name, body.url, body.type).run();
   const inserted = await env.DB
     .prepare("SELECT id, name, url, type FROM sources WHERE url = ? LIMIT 1")
     .bind(body.url)
     .first<{ id: number; name: string; url: string; type: SourceType }>();
   if (inserted) {
+    await env.DB.prepare(`
+      INSERT OR IGNORE INTO user_sources (user_id, source_id, is_active, level)
+      VALUES (?, ?, 1, 'focus')
+    `).bind(userId, inserted.id).run();
     await seedItemForSource(inserted, env);
     ctx.waitUntil(hydrateSourceItems(inserted, env));
   }
@@ -768,6 +918,7 @@ function nextIsoDate(isoDate: string) {
 }
 
 type CandidateQueryOptions = {
+  userId: number;
   limit: number;
   excludeItemIds: number[];
   excludeSourceIds: number[];
@@ -786,12 +937,13 @@ function buildInClause(column: string, values: number[]) {
 }
 
 async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) {
+  const { userId } = options;
   const itemExclusion = buildInClause("i.id", options.excludeItemIds);
   const sourceExclusion = buildInClause("i.source_id", options.excludeSourceIds);
   const memoClause = options.requireNoMemo ? "AND (n.content IS NULL OR trim(n.content) = '')" : "";
   // Exclude items already scheduled on ANY date unless caller explicitly allows reuse.
   const assignedClause = options.excludeAssigned !== false
-    ? "AND NOT EXISTS (SELECT 1 FROM feed_slots fs_chk WHERE fs_chk.item_id = i.id)"
+    ? "AND NOT EXISTS (SELECT 1 FROM user_feed_slots fs_chk WHERE fs_chk.item_id = i.id AND fs_chk.user_id = ?)"
     : "";
   const limit = Math.max(0, options.limit);
   if (limit === 0) return [] as number[];
@@ -803,7 +955,7 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
           i.id,
           i.source_id,
           (ABS(RANDOM()) % 1000000) * 1.0 /
-            CASE COALESCE(s.level, 'focus')
+            CASE COALESCE(us.level, 'focus')
               WHEN 'core' THEN 3.0
               WHEN 'focus' THEN 2.0
               WHEN 'light' THEN 1.0
@@ -814,10 +966,10 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
             ORDER BY (ABS(RANDOM()) % 1000000)
           ) AS source_rank
         FROM items i
-        JOIN sources s ON i.source_id = s.id
-        LEFT JOIN notes n ON n.item_id = i.id
+        JOIN user_sources us ON us.user_id = ? AND us.source_id = i.source_id
+        LEFT JOIN user_notes n ON n.item_id = i.id AND n.user_id = ?
         WHERE i.status = 'active'
-          AND s.is_active = 1
+          AND us.is_active = 1
           ${memoClause}
           ${assignedClause}
           ${itemExclusion.sql}
@@ -829,6 +981,9 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
       ORDER BY score
       LIMIT ?
     `).bind(
+      userId,
+      userId,
+      ...(options.excludeAssigned !== false ? [userId] : []),
       ...itemExclusion.params,
       ...sourceExclusion.params,
       limit,
@@ -842,16 +997,16 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
   const rows = await env.DB.prepare(`
     SELECT i.id
     FROM items i
-    JOIN sources s ON i.source_id = s.id
-    LEFT JOIN notes n ON n.item_id = i.id
+    JOIN user_sources us ON us.user_id = ? AND us.source_id = i.source_id
+    LEFT JOIN user_notes n ON n.item_id = i.id AND n.user_id = ?
     WHERE i.status = 'active'
-      AND s.is_active = 1
+      AND us.is_active = 1
       ${memoClause}
       ${assignedClause}
       ${itemExclusion.sql}
       ${sourceExclusion.sql}
     ORDER BY (ABS(RANDOM()) % 1000000) * 1.0 /
-      CASE COALESCE(s.level, 'focus')
+      CASE COALESCE(us.level, 'focus')
         WHEN 'core' THEN 3.0
         WHEN 'focus' THEN 2.0
         WHEN 'light' THEN 1.0
@@ -859,6 +1014,9 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
       END
     LIMIT ?
   `).bind(
+    userId,
+    userId,
+    ...(options.excludeAssigned !== false ? [userId] : []),
     ...itemExclusion.params,
     ...sourceExclusion.params,
     limit,
@@ -869,14 +1027,14 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
     .filter(Number.isFinite);
 }
 
-async function fillDateIfNeeded(targetDate: string, env: Env) {
+async function fillDateIfNeeded(targetDate: string, env: Env, userId: number) {
   const existing = await env.DB.prepare(`
     SELECT slot_index, item_id, source_id
-    FROM feed_slots
-    WHERE date = ?
+    FROM user_feed_slots
+    WHERE user_id = ? AND date = ?
     ORDER BY slot_index
     LIMIT 3
-  `).bind(targetDate).all();
+  `).bind(userId, targetDate).all();
   const currentRows = (existing.results ?? []) as Record<string, unknown>[];
   const currentIds = currentRows.map((row) => Number(row.item_id)).filter(Number.isFinite);
   const currentSourceIds = currentRows.map((row) => Number(row.source_id)).filter(Number.isFinite);
@@ -886,15 +1044,17 @@ async function fillDateIfNeeded(targetDate: string, env: Env) {
 
   const fatigueRows = await env.DB.prepare(`
     SELECT DISTINCT source_id
-    FROM feed_slots
-    WHERE date < ?
+    FROM user_feed_slots
+    WHERE user_id = ?
+      AND date < ?
       AND date >= date(?, '-3 day')
-  `).bind(targetDate, targetDate).all();
+  `).bind(userId, targetDate, targetDate).all();
   const fatiguedSourceIds = ((fatigueRows.results ?? []) as Record<string, unknown>[])
     .map((row) => Number(row.source_id))
     .filter(Number.isFinite);
 
   const diverse = await selectCandidateItemIds(env, {
+    userId,
     limit: missingSlots.length,
     excludeItemIds: currentIds,
     excludeSourceIds: [...new Set([...currentSourceIds, ...fatiguedSourceIds])],
@@ -909,19 +1069,20 @@ async function fillDateIfNeeded(targetDate: string, env: Env) {
     const sourceRow = await env.DB.prepare("SELECT source_id FROM items WHERE id = ? LIMIT 1").bind(id).first<{ source_id: number }>();
     if (!sourceRow) continue;
     await env.DB.prepare(`
-      INSERT OR REPLACE INTO feed_slots (date, slot_index, item_id, source_id)
+      INSERT OR REPLACE INTO user_feed_slots (user_id, date, slot_index, item_id, source_id)
       VALUES (?, ?, ?, ?)
-    `).bind(targetDate, slot, id, sourceRow.source_id).run();
+    `).bind(userId, targetDate, slot, id, sourceRow.source_id).run();
     currentIds.push(id);
     currentSourceIds.push(sourceRow.source_id);
   }
 
-  const filledSlots = await env.DB.prepare("SELECT slot_index FROM feed_slots WHERE date = ?").bind(targetDate).all();
+  const filledSlots = await env.DB.prepare("SELECT slot_index FROM user_feed_slots WHERE user_id = ? AND date = ?").bind(userId, targetDate).all();
   const filledSet = new Set(((filledSlots.results ?? []) as Record<string, unknown>[]).map((r) => Number(r.slot_index)));
   const stillMissing = [0, 1, 2].filter((slot) => !filledSet.has(slot));
   if (stillMissing.length <= 0) return;
 
   const fallback = await selectCandidateItemIds(env, {
+    userId,
     limit: stillMissing.length,
     excludeItemIds: currentIds,
     excludeSourceIds: currentSourceIds,
@@ -936,20 +1097,21 @@ async function fillDateIfNeeded(targetDate: string, env: Env) {
     const sourceRow = await env.DB.prepare("SELECT source_id FROM items WHERE id = ? LIMIT 1").bind(id).first<{ source_id: number }>();
     if (!sourceRow) continue;
     await env.DB.prepare(`
-      INSERT OR REPLACE INTO feed_slots (date, slot_index, item_id, source_id)
+      INSERT OR REPLACE INTO user_feed_slots (user_id, date, slot_index, item_id, source_id)
       VALUES (?, ?, ?, ?)
-    `).bind(targetDate, slot, id, sourceRow.source_id).run();
+    `).bind(userId, targetDate, slot, id, sourceRow.source_id).run();
     currentIds.push(id);
     currentSourceIds.push(sourceRow.source_id);
   }
 
-  const finalSlots = await env.DB.prepare("SELECT slot_index FROM feed_slots WHERE date = ?").bind(targetDate).all();
+  const finalSlots = await env.DB.prepare("SELECT slot_index FROM user_feed_slots WHERE user_id = ? AND date = ?").bind(userId, targetDate).all();
   const finalSet = new Set(((finalSlots.results ?? []) as Record<string, unknown>[]).map((r) => Number(r.slot_index)));
   const finalMissing = [0, 1, 2].filter((slot) => !finalSet.has(slot));
   if (finalMissing.length <= 0) return;
 
   // Last-resort pass: allow reuse of items already on other dates if pool is exhausted.
   const relaxed = await selectCandidateItemIds(env, {
+    userId,
     limit: finalMissing.length,
     excludeItemIds: currentIds,
     excludeSourceIds: [],
@@ -965,16 +1127,16 @@ async function fillDateIfNeeded(targetDate: string, env: Env) {
     const sourceRow = await env.DB.prepare("SELECT source_id FROM items WHERE id = ? LIMIT 1").bind(id).first<{ source_id: number }>();
     if (!sourceRow) continue;
     await env.DB.prepare(`
-      INSERT OR REPLACE INTO feed_slots (date, slot_index, item_id, source_id)
+      INSERT OR REPLACE INTO user_feed_slots (user_id, date, slot_index, item_id, source_id)
       VALUES (?, ?, ?, ?)
-    `).bind(targetDate, slot, id, sourceRow.source_id).run();
+    `).bind(userId, targetDate, slot, id, sourceRow.source_id).run();
   }
 }
 
-async function backfillFeedsUntilDate(targetDate: string, env: Env) {
+async function backfillFeedsUntilDate(targetDate: string, env: Env, userId: number) {
   const today = new Date().toISOString().slice(0, 10);
   const maxDate = targetDate > today ? today : targetDate;
-  await fillDateIfNeeded(maxDate, env);
+  await fillDateIfNeeded(maxDate, env, userId);
 }
 
 async function cleanupDemoData(env: Env) {
@@ -982,14 +1144,15 @@ async function cleanupDemoData(env: Env) {
   await env.DB.prepare("DELETE FROM sources WHERE url LIKE 'https://memoryfeed.local/%'").run();
 }
 
-async function ensureItemsFromSources(env: Env) {
+async function ensureItemsFromSources(env: Env, userId: number) {
   const rows = await env.DB.prepare(`
     SELECT s.id, s.name, s.url, s.type, COUNT(i.id) AS itemCount
-    FROM sources s
+    FROM user_sources us
+    JOIN sources s ON s.id = us.source_id
     LEFT JOIN items i ON i.source_id = s.id
-    WHERE s.is_active = 1
+    WHERE us.user_id = ? AND us.is_active = 1
     GROUP BY s.id
-  `).all();
+  `).bind(userId).all();
 
   for (const row of (rows.results ?? []) as Record<string, unknown>[]) {
     const source = {
@@ -1034,7 +1197,7 @@ async function hydrateSourceItems(
       AND RTRIM(url, '/') = RTRIM(?, '/')
       AND NOT EXISTS (
         SELECT 1
-        FROM notes n
+        FROM user_notes n
         WHERE n.item_id = items.id
           AND trim(n.content) != ''
       )
@@ -1721,7 +1884,351 @@ function extractMetaDescription(html: string) {
   return m?.[1]?.trim() || null;
 }
 
-async function handlePostNote(itemId: number, request: Request, env: Env) {
+async function ensureAuthTables(env: Env) {
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT NOT NULL UNIQUE,
+      display_name TEXT,
+      avatar_url TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      last_login_at TEXT
+    )
+  `).run();
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS auth_identities (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      provider TEXT NOT NULL,
+      provider_sub TEXT NOT NULL,
+      client_id TEXT,
+      email TEXT,
+      email_verified INTEGER NOT NULL DEFAULT 0 CHECK (email_verified IN (0, 1)),
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      last_used_at TEXT,
+      UNIQUE(provider, provider_sub),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    )
+  `).run();
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      id TEXT PRIMARY KEY,
+      user_id INTEGER NOT NULL,
+      issued_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      expires_at TEXT NOT NULL,
+      revoked_at TEXT,
+      user_agent TEXT,
+      ip_hint TEXT,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    )
+  `).run();
+}
+
+async function ensureUserScopedTables(env: Env) {
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS user_sources (
+      user_id INTEGER NOT NULL,
+      source_id INTEGER NOT NULL,
+      is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+      level TEXT NOT NULL DEFAULT 'focus' CHECK (level IN ('core', 'focus', 'light')),
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (user_id, source_id),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE
+    )
+  `).run();
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS user_feed_slots (
+      user_id INTEGER NOT NULL,
+      date TEXT NOT NULL,
+      slot_index INTEGER NOT NULL CHECK (slot_index IN (0, 1, 2)),
+      item_id INTEGER NOT NULL,
+      source_id INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (user_id, date, slot_index),
+      UNIQUE (user_id, date, item_id),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE,
+      FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE
+    )
+  `).run();
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS user_notes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      item_id INTEGER NOT NULL,
+      content TEXT NOT NULL DEFAULT '',
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (user_id, item_id),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
+    )
+  `).run();
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS user_reactions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      item_id INTEGER NOT NULL,
+      type TEXT NOT NULL CHECK (type IN ('keep', 'skip')),
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
+    )
+  `).run();
+}
+
+function parseGoogleAudiences(env: Env) {
+  return (env.GOOGLE_CLIENT_IDS ?? "")
+    .split(",")
+    .map((v) => v.trim())
+    .filter(Boolean);
+}
+
+async function handlePostAuthGoogle(request: Request, env: Env) {
+  await ensureAuthTables(env);
+
+  const secret = env.AUTH_JWT_SECRET?.trim();
+  if (!secret) {
+    return json({ error: "AUTH_NOT_CONFIGURED", detail: "Missing AUTH_JWT_SECRET" }, { status: 500 });
+  }
+  const audiences = parseGoogleAudiences(env);
+  if (audiences.length === 0) {
+    return json({ error: "AUTH_NOT_CONFIGURED", detail: "Missing GOOGLE_CLIENT_IDS" }, { status: 500 });
+  }
+
+  let body: { idToken?: string };
+  try {
+    body = (await request.json()) as { idToken?: string };
+  } catch {
+    return json({ error: "Invalid JSON body" }, { status: 400 });
+  }
+
+  const idToken = body.idToken?.trim();
+  if (!idToken) return json({ error: "idToken is required" }, { status: 400 });
+
+  let payload: JWTPayload;
+  try {
+    const verified = await jwtVerify(idToken, GOOGLE_JWKS, {
+      issuer: GOOGLE_ISSUERS,
+      audience: audiences,
+    });
+    payload = verified.payload;
+  } catch {
+    return json({ error: "INVALID_GOOGLE_TOKEN" }, { status: 401 });
+  }
+
+  const providerSub = String(payload.sub ?? "");
+  const email = String(payload.email ?? "").trim().toLowerCase();
+  const emailVerified = payload.email_verified === true || payload.email_verified === "true";
+  const displayName = typeof payload.name === "string" ? payload.name.trim() : "";
+  const avatarUrl = typeof payload.picture === "string" ? payload.picture.trim() : "";
+  const aud = typeof payload.aud === "string" ? payload.aud : "";
+  if (!providerSub || !email || !emailVerified) {
+    return json({ error: "INVALID_GOOGLE_CLAIMS" }, { status: 401 });
+  }
+
+  let user = await env.DB.prepare("SELECT id FROM users WHERE email = ? LIMIT 1")
+    .bind(email)
+    .first<{ id: number }>();
+  if (!user) {
+    await env.DB.prepare(`
+      INSERT INTO users (email, display_name, avatar_url, last_login_at)
+      VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+    `).bind(email, displayName || null, avatarUrl || null).run();
+    user = await env.DB.prepare("SELECT id FROM users WHERE email = ? LIMIT 1")
+      .bind(email)
+      .first<{ id: number }>();
+  } else {
+    await env.DB.prepare(`
+      UPDATE users
+      SET display_name = COALESCE(NULLIF(?, ''), display_name),
+          avatar_url = COALESCE(NULLIF(?, ''), avatar_url),
+          last_login_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).bind(displayName, avatarUrl, user.id).run();
+  }
+  if (!user) return json({ error: "AUTH_USER_UPSERT_FAILED" }, { status: 500 });
+
+  await env.DB.prepare(`
+    INSERT INTO auth_identities (user_id, provider, provider_sub, client_id, email, email_verified, last_used_at)
+    VALUES (?, 'google', ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(provider, provider_sub) DO UPDATE SET
+      user_id = excluded.user_id,
+      client_id = excluded.client_id,
+      email = excluded.email,
+      email_verified = excluded.email_verified,
+      last_used_at = CURRENT_TIMESTAMP
+  `).bind(user.id, providerSub, aud || null, email, emailVerified ? 1 : 0).run();
+
+  const sid = crypto.randomUUID();
+  const now = Math.floor(Date.now() / 1000);
+  const exp = now + SESSION_TTL_SECONDS;
+  const token = await signSessionToken({
+    sub: String(user.id),
+    sid,
+    email,
+    iat: now,
+    exp,
+  }, secret);
+
+  const expiresAt = new Date(exp * 1000).toISOString();
+  await env.DB.prepare(`
+    INSERT INTO sessions (id, user_id, expires_at, user_agent, ip_hint)
+    VALUES (?, ?, ?, ?, ?)
+  `).bind(
+    sid,
+    user.id,
+    expiresAt,
+    request.headers.get("user-agent") || null,
+    request.headers.get("cf-connecting-ip") || null
+  ).run();
+
+  return json({
+    ok: true,
+    token,
+    user: {
+      id: user.id,
+      email,
+      displayName: displayName || null,
+      avatarUrl: avatarUrl || null,
+    },
+  });
+}
+
+async function handleGetAuthMe(request: Request, env: Env) {
+  await ensureAuthTables(env);
+  const auth = await authenticateSession(request, env);
+  if (!auth.ok) return json({ error: auth.error }, { status: 401 });
+  return json({ user: auth.user });
+}
+
+async function handlePostAuthLogout(request: Request, env: Env) {
+  await ensureAuthTables(env);
+  const auth = await authenticateSession(request, env);
+  if (!auth.ok) return json({ error: auth.error }, { status: 401 });
+
+  await env.DB.prepare(`
+    UPDATE sessions
+    SET revoked_at = CURRENT_TIMESTAMP
+    WHERE id = ?
+  `).bind(auth.sessionId).run();
+
+  return json({ ok: true });
+}
+
+function readBearerToken(request: Request) {
+  const authHeader = request.headers.get("authorization")?.trim() ?? "";
+  if (!authHeader.toLowerCase().startsWith("bearer ")) return "";
+  return authHeader.slice(7).trim();
+}
+
+function textEncoder() {
+  return new TextEncoder();
+}
+
+function base64UrlEncode(input: Uint8Array) {
+  let binary = "";
+  for (const byte of input) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function base64UrlDecode(input: string) {
+  const normalized = input.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+async function hmacSha256(data: string, secret: string) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    textEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const signature = await crypto.subtle.sign("HMAC", key, textEncoder().encode(data));
+  return new Uint8Array(signature);
+}
+
+async function signSessionToken(payload: AuthTokenPayload, secret: string) {
+  const header = { alg: "HS256", typ: "JWT" };
+  const encodedHeader = base64UrlEncode(textEncoder().encode(JSON.stringify(header)));
+  const encodedPayload = base64UrlEncode(textEncoder().encode(JSON.stringify(payload)));
+  const unsigned = `${encodedHeader}.${encodedPayload}`;
+  const signature = await hmacSha256(unsigned, secret);
+  return `${unsigned}.${base64UrlEncode(signature)}`;
+}
+
+async function verifySessionToken(token: string, secret: string): Promise<AuthTokenPayload | null> {
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  const [headerPart, payloadPart, sigPart] = parts;
+  const unsigned = `${headerPart}.${payloadPart}`;
+  const expectedSig = base64UrlEncode(await hmacSha256(unsigned, secret));
+  if (expectedSig !== sigPart) return null;
+
+  try {
+    const payloadText = new TextDecoder().decode(base64UrlDecode(payloadPart));
+    const payload = JSON.parse(payloadText) as AuthTokenPayload;
+    const now = Math.floor(Date.now() / 1000);
+    if (!payload.exp || payload.exp <= now) return null;
+    if (!payload.sid || !payload.sub) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+async function authenticateSession(request: Request, env: Env): Promise<
+  | { ok: true; user: { id: number; email: string; displayName: string | null; avatarUrl: string | null }; sessionId: string }
+  | { ok: false; error: string }
+> {
+  const secret = env.AUTH_JWT_SECRET?.trim();
+  if (!secret) return { ok: false, error: "AUTH_NOT_CONFIGURED" };
+  const token = readBearerToken(request);
+  if (!token) return { ok: false, error: "AUTH_TOKEN_REQUIRED" };
+  const payload = await verifySessionToken(token, secret);
+  if (!payload) return { ok: false, error: "INVALID_SESSION_TOKEN" };
+
+  const userId = Number(payload.sub);
+  if (!Number.isFinite(userId)) return { ok: false, error: "INVALID_SESSION_TOKEN" };
+
+  const row = await env.DB.prepare(`
+    SELECT s.id AS sessionId, s.expires_at AS expiresAt, s.revoked_at AS revokedAt,
+           u.id AS userId, u.email AS email, u.display_name AS displayName, u.avatar_url AS avatarUrl
+    FROM sessions s
+    JOIN users u ON u.id = s.user_id
+    WHERE s.id = ?
+    LIMIT 1
+  `).bind(payload.sid).first<{
+    sessionId: string;
+    expiresAt: string;
+    revokedAt: string | null;
+    userId: number;
+    email: string;
+    displayName: string | null;
+    avatarUrl: string | null;
+  }>();
+  if (!row || row.revokedAt) return { ok: false, error: "SESSION_NOT_FOUND" };
+  if (new Date(row.expiresAt).getTime() <= Date.now()) return { ok: false, error: "SESSION_EXPIRED" };
+  if (row.userId !== userId) return { ok: false, error: "SESSION_USER_MISMATCH" };
+
+  return {
+    ok: true,
+    sessionId: row.sessionId,
+    user: {
+      id: row.userId,
+      email: row.email,
+      displayName: row.displayName,
+      avatarUrl: row.avatarUrl,
+    },
+  };
+}
+
+async function handlePostNote(itemId: number, request: Request, env: Env, userId: number) {
   let body: { content?: string };
   try {
     body = (await request.json()) as { content?: string };
@@ -1734,28 +2241,28 @@ async function handlePostNote(itemId: number, request: Request, env: Env) {
   }
 
   await env.DB.prepare(`
-    INSERT INTO notes (item_id, content, updated_at)
-    VALUES (?, ?, CURRENT_TIMESTAMP)
-    ON CONFLICT(item_id) DO UPDATE SET content = excluded.content, updated_at = CURRENT_TIMESTAMP
-  `).bind(itemId, body.content).run();
+    INSERT INTO user_notes (user_id, item_id, content, updated_at)
+    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(user_id, item_id) DO UPDATE SET content = excluded.content, updated_at = CURRENT_TIMESTAMP
+  `).bind(userId, itemId, body.content).run();
 
   return json({ ok: true });
 }
 
-async function handleGetNote(itemId: number, env: Env) {
+async function handleGetNote(itemId: number, env: Env, userId: number) {
   const row = await env.DB
-    .prepare("SELECT content FROM notes WHERE item_id = ? LIMIT 1")
-    .bind(itemId)
+    .prepare("SELECT content FROM user_notes WHERE user_id = ? AND item_id = ? LIMIT 1")
+    .bind(userId, itemId)
     .first<{ content?: string }>();
   return json({ content: row?.content ?? "" });
 }
 
-async function handleDeleteNote(itemId: number, env: Env) {
-  await env.DB.prepare("DELETE FROM notes WHERE item_id = ?").bind(itemId).run();
+async function handleDeleteNote(itemId: number, env: Env, userId: number) {
+  await env.DB.prepare("DELETE FROM user_notes WHERE user_id = ? AND item_id = ?").bind(userId, itemId).run();
   return json({ ok: true });
 }
 
-async function handlePatchSource(sourceId: number, request: Request, env: Env) {
+async function handlePatchSource(sourceId: number, request: Request, env: Env, userId: number) {
   let body: { isActive?: boolean; level?: SourceLevel };
   try {
     body = (await request.json()) as { isActive?: boolean; level?: SourceLevel };
@@ -1784,8 +2291,8 @@ async function handlePatchSource(sourceId: number, request: Request, env: Env) {
   }
 
   const result = await env.DB
-    .prepare(`UPDATE sources SET ${updates.join(", ")} WHERE id = ?`)
-    .bind(...params, sourceId)
+    .prepare(`UPDATE user_sources SET ${updates.join(", ")} WHERE user_id = ? AND source_id = ?`)
+    .bind(...params, userId, sourceId)
     .run();
 
   if ((result.meta?.changes ?? 0) === 0) {
@@ -1795,10 +2302,22 @@ async function handlePatchSource(sourceId: number, request: Request, env: Env) {
   return json({ ok: true });
 }
 
-async function handleDeleteSource(sourceId: number, env: Env) {
+async function handleDeleteSource(sourceId: number, env: Env, userId: number) {
+  await env.DB.prepare(`
+    DELETE FROM user_notes
+    WHERE user_id = ?
+      AND item_id IN (SELECT id FROM items WHERE source_id = ?)
+  `).bind(userId, sourceId).run();
+  await env.DB.prepare(`
+    DELETE FROM user_reactions
+    WHERE user_id = ?
+      AND item_id IN (SELECT id FROM items WHERE source_id = ?)
+  `).bind(userId, sourceId).run();
+  await env.DB.prepare("DELETE FROM user_feed_slots WHERE user_id = ? AND source_id = ?").bind(userId, sourceId).run();
+
   const result = await env.DB
-    .prepare("DELETE FROM sources WHERE id = ?")
-    .bind(sourceId)
+    .prepare("DELETE FROM user_sources WHERE user_id = ? AND source_id = ?")
+    .bind(userId, sourceId)
     .run();
 
   if ((result.meta?.changes ?? 0) === 0) {

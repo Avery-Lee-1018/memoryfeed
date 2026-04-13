@@ -1,42 +1,62 @@
 # Architecture
 
 ## Structure
+`React (Vite)`  
+→ `Cloudflare Worker (API + assets)`  
+→ `D1`
 
-Web App (main)
-  ↓
-Cloudflare Worker (API + Cron)
-  ↓
-D1 Database
+## Runtime Flow
+1. 사용자가 Feed 화면 진입
+2. `GET /api/feed/today?date=...` 호출
+3. Worker가 필요한 테이블/슬롯(`feed_slots`)을 보장하고 날짜 데이터 조회
+4. 해당 날짜 슬롯이 부족하면 source/items 기준으로 보충
+5. 카드 3개 + `hasNote` 상태만 반환
+6. 메모는 별도 `GET /api/notes/:itemId`로 지연 조회
 
-## Flow
+## Sources Flow
+1. 사용자가 URL 여러 개를 한 번에 입력
+2. `POST /api/sources` (bulk)
+3. Worker에서 URL 정규화/중복 제거/host 단위 중복 처리
+4. source 생성 후 item 시드 + 비동기 hydration
+5. `GET /api/sources`에서 aggregate(`exposureCount`, `memoCount`, `lastActivityAt`) 반환
 
-1. Source 등록
-2. Cron 실행 (daily)
-   - 콘텐츠 수집
-   - 중복 제거
-   - DB 저장
-   - 오늘의 3개 선정
-3. 사용자 접속
-4. /api/feed/today 호출
-5. 카드 UI 렌더링
-6. 스와이프 반응 저장
+## Account/Auth Flow (Bootstrap)
+1. 클라이언트(웹/익스텐션)가 Google ID Token 획득
+2. `POST /api/auth/google`로 전달
+3. Worker에서 Google JWKS 기반 ID token 검증
+4. `users` / `auth_identities` upsert
+5. Worker 세션 토큰 발급 + `sessions` 저장
+6. 이후 `Authorization: Bearer <token>`로 `GET /api/auth/me` 호출
 
-## API (MVP)
+## User Scope
+- `sources`/`items`는 원본 콘텐츠 저장소(공용 풀)
+- 사용자별 상태/행동은 `user_sources`, `user_feed_slots`, `user_notes`, `user_reactions`에 저장
+- API 응답은 모두 세션의 `user_id` 기준으로 계산
 
-GET /api/feed/today  
-POST /api/reaction  
-GET /api/sources  
-POST /api/sources  
+## API Surface
+Read:
+- `GET /api/feed/today`
+- `GET /api/sources`
+- `GET /api/thumbnail`
+- `GET /api/notes/:itemId`
+- `GET /api/auth/me`
 
-## Cron
+Write:
+- `POST /api/feed/replacement`
+- `POST /api/reaction`
+- `POST /api/sources`
+- `PATCH /api/sources/:id`
+- `DELETE /api/sources/:id`
+- `POST /api/notes/:itemId`
+- `DELETE /api/notes/:itemId`
+- `POST /api/auth/google`
+- `POST /api/auth/logout`
 
-- 하루 1회 실행
-- 역할:
-  - 콘텐츠 수집
-  - 셔플
-  - 3개 선정
+## Security Model
+- `ADMIN_TOKEN`이 설정된 경우, 쓰기/민감 API는 토큰 필요.
+- 피드 응답에서 메모 원문 미노출(`hasNote`만 반환).
+- 썸네일 프록시는 등록 source 도메인 계열만 허용.
 
 ## Principle
-
-백엔드는 단순하게  
-프론트에서 경험 만든다
+백엔드는 최소 규칙과 데이터 무결성에 집중,  
+경험/인터랙션은 프론트에서 빠르게 조정.

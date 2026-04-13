@@ -5,8 +5,7 @@
 - name
 - url
 - type (rss | blog)
-  - `rss`: RSS/Atom 피드 URL → 피드 항목 자동 수집
-  - `blog`: 블로그/채널 URL → 링크 크롤링으로 글 목록 자동 수집
+- level (core | focus | light)
 - is_active
 
 ## items
@@ -14,21 +13,100 @@
 - source_id
 - title
 - url
-- summary
-- thumbnail_url — OG 이미지, 없으면 null (fallback placeholder 사용)
-- status (active | archived) — 수집 상태
-- shown_date — 오늘의 3개로 선정된 날짜 (cron이 기록)
-- snoozed_until — 재노출 대기 날짜 (이 날짜 이후 다시 선정 대상)
+- summary (nullable)
+- thumbnail_url (nullable)
+- status (active | archived)
+- shown_date (legacy)
+- snoozed_until (legacy)
 - last_seen_at
 
 ## reactions
 - id
 - item_id
-- type (keep | skip) — 사용자 반응 로그
+- type (keep | skip)
 - created_at
 
-## Rule
+## notes
+- id
+- item_id (UNIQUE)
+- content
+- updated_at
 
-- daily_feed 테이블 없음 — items.shown_date로 대체
-- 관계 단순하게 유지
-- 태그 없음
+## feed_slots
+- date
+- slot_index (0, 1, 2)
+- item_id
+- source_id
+- created_at
+- PK: (date, slot_index)
+- UNIQUE: (date, item_id)
+
+## user_sources
+- user_id
+- source_id
+- is_active
+- level (core | focus | light)
+- created_at
+- PK: (user_id, source_id)
+
+## user_feed_slots
+- user_id
+- date
+- slot_index (0, 1, 2)
+- item_id
+- source_id
+- created_at
+- PK: (user_id, date, slot_index)
+- UNIQUE: (user_id, date, item_id)
+
+## user_notes
+- id
+- user_id
+- item_id
+- content
+- updated_at
+- UNIQUE: (user_id, item_id)
+
+## user_reactions
+- id
+- user_id
+- item_id
+- type (keep | skip)
+- created_at
+
+## users
+- id
+- email (UNIQUE)
+- display_name
+- avatar_url
+- created_at
+- last_login_at
+
+## auth_identities
+- id
+- user_id
+- provider (`google`)
+- provider_sub (provider 사용자 고유값)
+- client_id
+- email
+- email_verified
+- created_at
+- last_used_at
+- UNIQUE(provider, provider_sub)
+
+## sessions
+- id (session id)
+- user_id
+- issued_at
+- expires_at
+- revoked_at
+- user_agent
+- ip_hint
+
+## Rules
+- 한 날짜 피드는 `feed_slots` 기준 3개.
+- 메모 본문은 피드 응답에 포함하지 않음 (`hasNote`만 전달).
+- source 삭제 시 연관 items/notes/reactions/feed_slots는 FK로 정리됨.
+- source 단위 통계는 조회 시 aggregate 계산.
+- 인증은 `users` + `auth_identities` + `sessions`.
+- 피드/메모/반응/소스 상태는 `user_*` 테이블로 계정별 분리.

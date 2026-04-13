@@ -5,6 +5,7 @@ import CardSkeleton from "@/components/CardSkeleton";
 import MemoShapes from "@/components/MemoShapes";
 import MySourcesView from "@/components/MySourcesView";
 import AppToast, { type AppToastState } from "@/components/AppToast";
+import AuthGate from "@/components/AuthGate";
 import { authorizedFetch, readJson } from "@/lib/api";
 import { FEED_START_DATE, getTitleForDate, shiftDate, toIsoDate } from "@/lib/feed";
 import {
@@ -14,10 +15,13 @@ import {
   parseSourceInput,
 } from "@/lib/sources";
 import type { SourceEntry } from "@/types/source";
+import { fetchMe, logout, type AuthUser } from "@/lib/auth-session";
 
 const SKELETON_MIN_MS = 500;
 
 export default function App() {
+  const [authReady, setAuthReady] = useState(false);
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
   const [view, setView] = useState<"feed" | "sources">("feed");
   const [items, setItems] = useState<FeedItem[]>([]);
   const [initialItemCount, setInitialItemCount] = useState(0);
@@ -42,9 +46,16 @@ export default function App() {
   const [toast, setToast] = useState<AppToastState>(null);
 
   useEffect(() => {
+    fetchMe()
+      .then((user) => setAuthUser(user))
+      .finally(() => setAuthReady(true));
+  }, []);
+
+  useEffect(() => {
+    if (!authUser) return;
     setLoading(true);
-    fetch(`/api/feed/today?date=${selectedDate}`)
-      .then((r) => r.json() as Promise<{ items: FeedItem[] }>)
+    authorizedFetch(`/api/feed/today?date=${selectedDate}`)
+      .then((r) => readJson<{ items: FeedItem[] }>(r))
       .then((data) => {
         const nextItems = data.items ?? [];
         setItems(nextItems);
@@ -54,7 +65,7 @@ export default function App() {
       })
       .catch(console.error)
       .finally(() => setLoading(false));
-  }, [selectedDate]);
+  }, [selectedDate, authUser]);
 
   const loadSources = async (showLoading = true) => {
     if (showLoading) setSourcesLoading(true);
@@ -71,10 +82,11 @@ export default function App() {
   };
 
   useEffect(() => {
+    if (!authUser) return;
     if (view === "sources") {
       void loadSources(true);
     }
-  }, [view]);
+  }, [view, authUser]);
 
   useEffect(() => {
     if (!toast) return;
@@ -312,30 +324,48 @@ export default function App() {
   };
 
   return (
+    !authReady ? (
+      <div className="flex min-h-dvh items-center justify-center text-sm text-zinc-600">세션 확인 중...</div>
+    ) : !authUser ? (
+      <AuthGate onSignedIn={(user) => { setAuthUser(user); setAuthReady(true); }} />
+    ) : (
     <div className="relative isolate min-h-dvh overflow-x-clip bg-background">
       <MemoShapes show={view === "feed" && hasMemoToday} dateKey={selectedDate} />
       <div className="relative z-20 mx-auto flex min-h-dvh w-full max-w-[1160px] flex-col px-3 py-4 md:px-4 md:py-6">
         <div className="mb-12 pt-2 sm:mb-14 sm:pt-4">
-          <div className="flex items-end gap-5 sm:gap-5">
+          <div className="flex items-end justify-between gap-5 sm:gap-5">
+            <div className="flex items-end gap-5 sm:gap-5">
+              <button
+                onClick={() => setView("feed")}
+                className={`p-0 text-3xl font-semibold leading-none tracking-tight transition-colors sm:text-4xl ${
+                  view === "feed"
+                    ? "text-black"
+                    : "text-zinc-400 hover:text-zinc-500 hover:underline hover:underline-offset-4"
+                }`}
+              >
+                Feed
+              </button>
+              <button
+                onClick={() => setView("sources")}
+                className={`p-0 text-3xl font-semibold leading-none tracking-tight transition-colors sm:text-4xl ${
+                  view === "sources"
+                    ? "text-black"
+                    : "text-zinc-400 hover:text-zinc-500 hover:underline hover:underline-offset-4"
+                }`}
+              >
+                My
+              </button>
+            </div>
             <button
-              onClick={() => setView("feed")}
-              className={`p-0 text-3xl font-semibold leading-none tracking-tight transition-colors sm:text-4xl ${
-                view === "feed"
-                  ? "text-black"
-                  : "text-zinc-400 hover:text-zinc-500 hover:underline hover:underline-offset-4"
-              }`}
+              onClick={async () => {
+                await logout();
+                setAuthUser(null);
+                setItems([]);
+                setSources([]);
+              }}
+              className="rounded-full border border-zinc-200 bg-white px-3 py-1.5 text-xs text-zinc-700 hover:bg-zinc-50"
             >
-              Feed
-            </button>
-            <button
-              onClick={() => setView("sources")}
-              className={`p-0 text-3xl font-semibold leading-none tracking-tight transition-colors sm:text-4xl ${
-                view === "sources"
-                  ? "text-black"
-                  : "text-zinc-400 hover:text-zinc-500 hover:underline hover:underline-offset-4"
-              }`}
-            >
-              My
+              로그아웃
             </button>
           </div>
         </div>
@@ -479,6 +509,7 @@ export default function App() {
         onRetry={retryFailedSources}
       />
     </div>
+    )
   );
 }
 
