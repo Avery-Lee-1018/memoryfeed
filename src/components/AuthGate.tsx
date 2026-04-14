@@ -18,11 +18,6 @@ export default function AuthGate({ onSignedIn }: Props) {
     setClientId(stored || DEFAULT_WEB_CLIENT_ID);
   }, []);
 
-  useEffect(() => {
-    if (!clientId) return;
-    localStorage.setItem(WEB_CLIENT_ID_KEY, clientId.trim());
-  }, [clientId]);
-
   const canRenderGoogleButton = useMemo(() => {
     return !!clientId.trim() && !!window.google?.accounts?.id;
   }, [clientId]);
@@ -70,24 +65,11 @@ export default function AuthGate({ onSignedIn }: Props) {
         계정별로 같은 피드/메모/소스를 관리하려면 로그인 후 시작해 주세요.
       </p>
 
-      <div className="mt-6 space-y-2">
-        <label htmlFor="google-client-id" className="text-xs text-zinc-600">
-          Google Web Client ID
-        </label>
-        <input
-          id="google-client-id"
-          value={clientId}
-          onChange={(e) => setClientId(e.target.value)}
-          placeholder="xxxx.apps.googleusercontent.com"
-          className="w-full rounded-xl border border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-900 placeholder:text-zinc-500"
-        />
-      </div>
-
       <div className="mt-4 min-h-[48px]">
         {canRenderGoogleButton ? (
           <div id="google-signin-slot" />
         ) : (
-          <p className="text-xs text-zinc-500">Client ID를 입력하면 Google 로그인 버튼이 나타나요.</p>
+          <p className="text-xs text-zinc-500">로그인 설정을 불러오는 중이에요.</p>
         )}
       </div>
 
