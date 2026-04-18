@@ -738,12 +738,16 @@ async function handlePostSources(request: Request, env: Env, ctx: ExecutionConte
     const addedUrls: string[] = [];
     const duplicateUrls: string[] = [];
     const failedUrls: string[] = [];
+    let registeredOrReactivated = 0;
     for (const sourceUrl of urls) {
       const host = extractSourceHost(sourceUrl);
       const existingByHost = host ? sourceByHost.get(host) : undefined;
       if (existingByHost) {
         duplicateUrls.push(sourceUrl);
+        await upsertUserSourceActive(env, userId, existingByHost.id);
+        await seedItemForSource(existingByHost, env);
         ctx.waitUntil(hydrateSourceItems(existingByHost, env));
+        registeredOrReactivated += 1;
         continue;
       }
       const sourceType = inferSourceType(sourceUrl);
@@ -761,12 +765,10 @@ async function handlePostSources(request: Request, env: Env, ctx: ExecutionConte
             .bind(sourceUrl)
             .first<{ id: number; name: string; url: string; type: SourceType }>();
           if (inserted) {
-            await env.DB.prepare(`
-              INSERT OR IGNORE INTO user_sources (user_id, source_id, is_active, level)
-              VALUES (?, ?, 1, 'focus')
-            `).bind(userId, inserted.id).run();
+            await upsertUserSourceActive(env, userId, inserted.id);
             await seedItemForSource(inserted, env);
             ctx.waitUntil(hydrateSourceItems(inserted, env));
+            registeredOrReactivated += 1;
             const insertedHost = extractSourceHost(inserted.url);
             if (insertedHost && !sourceByHost.has(insertedHost)) sourceByHost.set(insertedHost, inserted);
           }
@@ -777,17 +779,22 @@ async function handlePostSources(request: Request, env: Env, ctx: ExecutionConte
             .bind(sourceUrl)
             .first<{ id: number; name: string; url: string; type: SourceType }>();
           if (existing) {
-            await env.DB.prepare(`
-              INSERT OR IGNORE INTO user_sources (user_id, source_id, is_active, level)
-              VALUES (?, ?, 1, 'focus')
-            `).bind(userId, existing.id).run();
+            await upsertUserSourceActive(env, userId, existing.id);
+            await seedItemForSource(existing, env);
             ctx.waitUntil(hydrateSourceItems(existing, env));
+            registeredOrReactivated += 1;
           }
         }
       } catch {
         failedUrls.push(sourceUrl);
       }
     }
+
+    if (registeredOrReactivated > 0) {
+      await ensureItemsFromSources(env, userId);
+      await backfillFeedsUntilDate(getTodayIso(), env, userId);
+    }
+
     const added = addedUrls.length;
     const duplicateCount = duplicateUrls.length;
     const invalidCount = invalidTokens.length;
@@ -828,6 +835,10 @@ async function handlePostSources(request: Request, env: Env, ctx: ExecutionConte
       .all<{ id: number; name: string; url: string; type: SourceType }>();
     const match = (existing.results ?? []).find((row) => extractSourceHost(row.url) === incomingHost);
     if (match) {
+      await upsertUserSourceActive(env, userId, match.id);
+      await seedItemForSource(match, env);
+      await ensureItemsFromSources(env, userId);
+      await backfillFeedsUntilDate(getTodayIso(), env, userId);
       ctx.waitUntil(hydrateSourceItems(match, env));
       return json({ ok: true, duplicateByHost: true }, { status: 201 });
     }
@@ -840,15 +851,23 @@ async function handlePostSources(request: Request, env: Env, ctx: ExecutionConte
     .bind(body.url)
     .first<{ id: number; name: string; url: string; type: SourceType }>();
   if (inserted) {
-    await env.DB.prepare(`
-      INSERT OR IGNORE INTO user_sources (user_id, source_id, is_active, level)
-      VALUES (?, ?, 1, 'focus')
-    `).bind(userId, inserted.id).run();
+    await upsertUserSourceActive(env, userId, inserted.id);
     await seedItemForSource(inserted, env);
+    await ensureItemsFromSources(env, userId);
+    await backfillFeedsUntilDate(getTodayIso(), env, userId);
     ctx.waitUntil(hydrateSourceItems(inserted, env));
   }
 
   return json({ ok: true }, { status: 201 });
+}
+
+async function upsertUserSourceActive(env: Env, userId: number, sourceId: number) {
+  await env.DB.prepare(`
+    INSERT INTO user_sources (user_id, source_id, is_active, level)
+    VALUES (?, ?, 1, 'focus')
+    ON CONFLICT(user_id, source_id) DO UPDATE SET
+      is_active = 1
+  `).bind(userId, sourceId).run();
 }
 
 function parseSourceUrls(rawText?: string, urlsInput?: string[]) {
@@ -1028,6 +1047,19 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
 }
 
 async function fillDateIfNeeded(targetDate: string, env: Env, userId: number) {
+  // Keep only slots backed by currently active user sources for this user/date.
+  await env.DB.prepare(`
+    DELETE FROM user_feed_slots
+    WHERE user_id = ? AND date = ?
+      AND NOT EXISTS (
+        SELECT 1
+        FROM user_sources us
+        WHERE us.user_id = user_feed_slots.user_id
+          AND us.source_id = user_feed_slots.source_id
+          AND us.is_active = 1
+      )
+  `).bind(userId, targetDate).run();
+
   const existing = await env.DB.prepare(`
     SELECT slot_index, item_id, source_id
     FROM user_feed_slots

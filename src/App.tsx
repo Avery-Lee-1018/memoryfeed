@@ -6,6 +6,7 @@ import MemoShapes from "@/components/MemoShapes";
 import MySourcesView from "@/components/MySourcesView";
 import AppToast, { type AppToastState } from "@/components/AppToast";
 import AuthGate from "@/components/AuthGate";
+import SplashScreen from "@/components/SplashScreen";
 import { authorizedFetch, readJson } from "@/lib/api";
 import { FEED_START_DATE, getTitleForDate, shiftDate, toIsoDate } from "@/lib/feed";
 import {
@@ -51,10 +52,9 @@ export default function App() {
       .finally(() => setAuthReady(true));
   }, []);
 
-  useEffect(() => {
-    if (!authUser) return;
+  const loadFeed = async (date: string) => {
     setLoading(true);
-    authorizedFetch(`/api/feed/today?date=${selectedDate}`)
+    return authorizedFetch(`/api/feed/today?date=${date}`)
       .then((r) => readJson<{ items: FeedItem[] }>(r))
       .then((data) => {
         const nextItems = data.items ?? [];
@@ -65,6 +65,11 @@ export default function App() {
       })
       .catch(console.error)
       .finally(() => setLoading(false));
+  };
+
+  useEffect(() => {
+    if (!authUser) return;
+    void loadFeed(selectedDate);
   }, [selectedDate, authUser]);
 
   const loadSources = async (showLoading = true) => {
@@ -204,6 +209,7 @@ export default function App() {
       setToast(buildSourceResultToast(data));
       if ((data.added ?? 0) > 0 || (data.duplicateCount ?? 0) > 0) {
         void loadSources(false);
+        void loadFeed(selectedDate);
       }
     } catch {
       const isOffline = typeof navigator !== "undefined" && navigator.onLine === false;
@@ -325,7 +331,7 @@ export default function App() {
 
   return (
     !authReady ? (
-      <div className="flex min-h-dvh items-center justify-center text-sm text-zinc-600">세션 확인 중...</div>
+      <SplashScreen />
     ) : !authUser ? (
       <AuthGate onSignedIn={(user) => { setAuthUser(user); setAuthReady(true); }} />
     ) : (
