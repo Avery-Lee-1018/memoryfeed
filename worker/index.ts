@@ -408,6 +408,7 @@ async function ensureFeedSlotsTable(env: Env) {
 async function handleGetFeedToday(url: URL, env: Env, ctx: ExecutionContext, userId: number) {
   await ensureFeedSlotsTable(env);
   await cleanupDemoData(env);
+  await ensureUserSourcesSeeded(env, userId);
   await ensureItemsFromSources(env, userId);
   const targetDate = getDateParamOrToday(url.searchParams.get("date"));
   await backfillFeedsUntilDate(targetDate, env, userId);
@@ -661,6 +662,7 @@ async function handlePostReaction(request: Request, env: Env, userId: number) {
 }
 
 async function handleGetSources(env: Env, userId: number) {
+  await ensureUserSourcesSeeded(env, userId);
   const result = await env.DB.prepare(`
     SELECT
       s.id,
@@ -692,6 +694,34 @@ async function handleGetSources(env: Env, userId: number) {
     ORDER BY s.id DESC
   `).bind(userId).all();
   return json({ sources: result.results ?? [] });
+}
+
+async function ensureUserSourcesSeeded(env: Env, userId: number) {
+  const mapped = await env.DB.prepare(`
+    SELECT COUNT(*) AS count
+    FROM user_sources
+    WHERE user_id = ?
+  `).bind(userId).first<{ count?: number }>();
+  if (Number(mapped?.count ?? 0) > 0) return;
+
+  const total = await env.DB.prepare(`
+    SELECT COUNT(*) AS count
+    FROM sources
+  `).first<{ count?: number }>();
+  if (Number(total?.count ?? 0) <= 0) return;
+
+  await env.DB.prepare(`
+    INSERT OR IGNORE INTO user_sources (user_id, source_id, is_active, level)
+    SELECT
+      ?,
+      s.id,
+      CASE WHEN s.is_active = 0 THEN 0 ELSE 1 END,
+      CASE
+        WHEN s.level IN ('core', 'focus', 'light') THEN s.level
+        ELSE 'focus'
+      END
+    FROM sources s
+  `).bind(userId).run();
 }
 
 async function handlePostSources(request: Request, env: Env, ctx: ExecutionContext, userId: number) {
@@ -1102,7 +1132,7 @@ async function fillDateIfNeeded(targetDate: string, env: Env, userId: number) {
     if (!sourceRow) continue;
     await env.DB.prepare(`
       INSERT OR REPLACE INTO user_feed_slots (user_id, date, slot_index, item_id, source_id)
-      VALUES (?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?)
     `).bind(userId, targetDate, slot, id, sourceRow.source_id).run();
     currentIds.push(id);
     currentSourceIds.push(sourceRow.source_id);
@@ -1130,7 +1160,7 @@ async function fillDateIfNeeded(targetDate: string, env: Env, userId: number) {
     if (!sourceRow) continue;
     await env.DB.prepare(`
       INSERT OR REPLACE INTO user_feed_slots (user_id, date, slot_index, item_id, source_id)
-      VALUES (?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?)
     `).bind(userId, targetDate, slot, id, sourceRow.source_id).run();
     currentIds.push(id);
     currentSourceIds.push(sourceRow.source_id);
@@ -1160,7 +1190,7 @@ async function fillDateIfNeeded(targetDate: string, env: Env, userId: number) {
     if (!sourceRow) continue;
     await env.DB.prepare(`
       INSERT OR REPLACE INTO user_feed_slots (user_id, date, slot_index, item_id, source_id)
-      VALUES (?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?)
     `).bind(userId, targetDate, slot, id, sourceRow.source_id).run();
   }
 }
