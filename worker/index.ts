@@ -408,6 +408,7 @@ async function ensureFeedSlotsTable(env: Env) {
 async function handleGetFeedToday(url: URL, env: Env, ctx: ExecutionContext, userId: number) {
   await ensureFeedSlotsTable(env);
   await cleanupDemoData(env);
+  await cleanupLegacyDisplayArtifacts(env);
   await ensureUserSourcesSeeded(env, userId);
   await ensureItemsFromSources(env, userId);
   const targetDate = getDateParamOrToday(url.searchParams.get("date"));
@@ -1880,6 +1881,51 @@ function sanitizeFeedItemText(item: Record<string, unknown>) {
     next.sourceName = normalizeDisplayText(next.sourceName);
   }
   return next;
+}
+
+async function cleanupLegacyDisplayArtifacts(env: Env) {
+  // Backfill cleanup for already-ingested cards so older slots render cleanly too.
+  await env.DB.prepare(`
+    UPDATE items
+    SET title = trim(
+      replace(
+        replace(
+          replace(
+            replace(
+              replace(
+                replace(COALESCE(title, ''), '<![CDATA[', ' '),
+              ']]>', ' '),
+            '&lt;![CDATA[', ' '),
+          ']]&gt;', ' '),
+        '&raquo;', ' '),
+      '»', ' ')
+    ),
+    summary = trim(
+      replace(
+        replace(
+          replace(
+            replace(
+              replace(
+                replace(COALESCE(summary, ''), '<![CDATA[', ' '),
+              ']]>', ' '),
+            '&lt;![CDATA[', ' '),
+          ']]&gt;', ' '),
+        '&raquo;', ' '),
+      '»', ' ')
+    )
+    WHERE title LIKE '%]]>%'
+       OR title LIKE '%<![CDATA[%'
+       OR title LIKE '%&lt;![CDATA[%'
+       OR title LIKE '%]]&gt;%'
+       OR title LIKE '%&raquo;%'
+       OR title LIKE '%»%'
+       OR summary LIKE '%]]>%'
+       OR summary LIKE '%<![CDATA[%'
+       OR summary LIKE '%&lt;![CDATA[%'
+       OR summary LIKE '%]]&gt;%'
+       OR summary LIKE '%&raquo;%'
+       OR summary LIKE '%»%'
+  `).run();
 }
 
 function safeHost(url: string) {
