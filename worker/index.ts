@@ -422,7 +422,13 @@ async function handleGetFeedToday(url: URL, env: Env, ctx: ExecutionContext, use
     result = await queryDistinctDateItems(targetDate, env, userId);
   }
 
-  const rows = (result.results ?? []) as Record<string, unknown>[];
+  let rows = (result.results ?? []) as Record<string, unknown>[];
+  if (rows.length === 0) {
+    await recoverEmptyFeedForUser(targetDate, env, userId);
+    result = await queryDistinctDateItems(targetDate, env, userId);
+    rows = (result.results ?? []) as Record<string, unknown>[];
+  }
+
   ctx.waitUntil((async () => {
     await Promise.allSettled([
       rehydrateWeakShownSources(rows, env),
@@ -715,13 +721,71 @@ async function ensureUserSourcesSeeded(env: Env, userId: number) {
     SELECT
       ?,
       s.id,
-      CASE WHEN s.is_active = 0 THEN 0 ELSE 1 END,
+      1,
       CASE
         WHEN s.level IN ('core', 'focus', 'light') THEN s.level
         ELSE 'focus'
       END
     FROM sources s
   `).bind(userId).run();
+}
+
+async function recoverEmptyFeedForUser(targetDate: string, env: Env, userId: number) {
+  await ensureUserSourcesSeeded(env, userId);
+
+  const activeCount = await env.DB.prepare(`
+    SELECT COUNT(*) AS count
+    FROM user_sources
+    WHERE user_id = ? AND is_active = 1
+  `).bind(userId).first<{ count?: number }>();
+  if (Number(activeCount?.count ?? 0) === 0) {
+    await env.DB.prepare(`
+      UPDATE user_sources
+      SET is_active = 1
+      WHERE user_id = ?
+    `).bind(userId).run();
+  }
+
+  const activeSources = await env.DB.prepare(`
+    SELECT s.id, s.name, s.url, s.type
+    FROM user_sources us
+    JOIN sources s ON s.id = us.source_id
+    WHERE us.user_id = ? AND us.is_active = 1
+    ORDER BY us.created_at DESC
+    LIMIT 60
+  `).bind(userId).all<{ id: number; name: string; url: string; type: SourceType }>();
+
+  for (const source of activeSources.results ?? []) {
+    await seedItemForSource(source, env);
+  }
+
+  await fillDateIfNeeded(targetDate, env, userId);
+
+  const slotCount = await env.DB.prepare(`
+    SELECT COUNT(*) AS count
+    FROM user_feed_slots
+    WHERE user_id = ? AND date = ?
+  `).bind(userId, targetDate).first<{ count?: number }>();
+  if (Number(slotCount?.count ?? 0) > 0) return;
+
+  const fallbackItems = await env.DB.prepare(`
+    SELECT i.id AS itemId, i.source_id AS sourceId
+    FROM items i
+    JOIN user_sources us ON us.user_id = ? AND us.source_id = i.source_id
+    WHERE us.is_active = 1
+      AND i.status = 'active'
+    ORDER BY RANDOM()
+    LIMIT 3
+  `).bind(userId).all<{ itemId: number; sourceId: number }>();
+
+  let slot = 0;
+  for (const row of fallbackItems.results ?? []) {
+    await env.DB.prepare(`
+      INSERT OR REPLACE INTO user_feed_slots (user_id, date, slot_index, item_id, source_id)
+      VALUES (?, ?, ?, ?, ?)
+    `).bind(userId, targetDate, slot, row.itemId, row.sourceId).run();
+    slot += 1;
+  }
 }
 
 async function handlePostSources(request: Request, env: Env, ctx: ExecutionContext, userId: number) {

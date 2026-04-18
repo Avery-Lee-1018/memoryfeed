@@ -55,6 +55,13 @@ export default function App() {
   const loadFeed = async (date: string) => {
     setLoading(true);
     return authorizedFetch(`/api/feed/today?date=${date}`)
+      .then(async (r) => {
+        if (r.status === 401) {
+          setAuthUser(null);
+          throw new Error("AUTH_REQUIRED");
+        }
+        return r;
+      })
       .then((r) => readJson<{ items: FeedItem[] }>(r))
       .then((data) => {
         const nextItems = data.items ?? [];
@@ -63,7 +70,10 @@ export default function App() {
         setReplacingIds(new Set());
         setMemoItemIds(new Set(nextItems.filter((i) => i.hasNote).map((i) => i.id)));
       })
-      .catch(console.error)
+      .catch((error) => {
+        if (error instanceof Error && error.message === "AUTH_REQUIRED") return;
+        console.error(error);
+      })
       .finally(() => setLoading(false));
   };
 
