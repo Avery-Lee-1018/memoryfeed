@@ -2,8 +2,6 @@ import { useEffect, useMemo, useState } from "react";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { authorizedFetch, readJson } from "@/lib/api";
 
-const THUMBNAIL_FALLBACK_TIMEOUT_MS = 2600;
-
 const FALLBACK_THUMBNAILS = [
   "/thumbnails/01.png",
   "/thumbnails/02.png",
@@ -59,17 +57,32 @@ export default function FeedCard({
   const [imageLoaded, setImageLoaded] = useState(false);
 
   useEffect(() => {
-    setThumbnailSrc(resolvedThumbnail);
-    setImageLoaded(false);
-  }, [resolvedThumbnail]);
+    let revokedUrl: string | null = null;
+    let cancelled = false;
 
-  useEffect(() => {
-    if (thumbnailSrc !== resolvedThumbnail || imageLoaded) return;
-    const timer = window.setTimeout(() => {
-      setThumbnailSrc((c) => (c === resolvedThumbnail ? fallbackThumbnail : c));
-    }, THUMBNAIL_FALLBACK_TIMEOUT_MS);
-    return () => window.clearTimeout(timer);
-  }, [thumbnailSrc, resolvedThumbnail, fallbackThumbnail, imageLoaded]);
+    setImageLoaded(false);
+
+    (async () => {
+      try {
+        const res = await authorizedFetch(resolvedThumbnail);
+        if (!res.ok) throw new Error(`thumbnail_fetch_failed_${res.status}`);
+        const contentType = res.headers.get("content-type") || "";
+        if (!contentType.startsWith("image/")) throw new Error("thumbnail_not_image");
+        const blob = await res.blob();
+        if (cancelled) return;
+        revokedUrl = URL.createObjectURL(blob);
+        setThumbnailSrc(revokedUrl);
+      } catch {
+        if (cancelled) return;
+        setThumbnailSrc(fallbackThumbnail);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      if (revokedUrl) URL.revokeObjectURL(revokedUrl);
+    };
+  }, [resolvedThumbnail, fallbackThumbnail]);
 
   // suppress unused-var warning for index kept for future use
   void index;
