@@ -436,7 +436,7 @@ async function handleGetFeedToday(url: URL, env: Env, ctx: ExecutionContext, use
     ]);
   })());
   const finalItems = rows.map(({ sourceId, ...rest }) => rest);
-  return json({ date: targetDate, items: finalItems });
+  return json({ date: targetDate, items: finalItems.map(sanitizeFeedItemText) });
 }
 
 async function rehydrateWeakShownSources(rows: Record<string, unknown>[], env: Env) {
@@ -639,7 +639,7 @@ async function handlePostFeedReplacement(request: Request, env: Env, userId: num
     WHERE i.id = ?
     LIMIT 1
   `).bind(userId, userId, replacementId).first();
-  return json({ item: finalReplacement ?? null });
+  return json({ item: finalReplacement ? sanitizeFeedItemText(finalReplacement as Record<string, unknown>) : null });
 }
 
 async function handlePostReaction(request: Request, env: Env, userId: number) {
@@ -1374,12 +1374,14 @@ async function ingestItemsForSource(
           WHEN lower(trim(items.title)) = lower(trim(?)) THEN excluded.title
           WHEN items.title LIKE 'http://%' OR items.title LIKE 'https://%' THEN excluded.title
           WHEN items.title LIKE '%&#%' THEN excluded.title
+          WHEN items.title LIKE '%]]>%' THEN excluded.title
           WHEN items.title LIKE '%!%%' ESCAPE '!' THEN excluded.title
           ELSE items.title
         END,
         summary = CASE
           WHEN items.summary IS NULL OR trim(items.summary) = '' THEN excluded.summary
           WHEN items.summary LIKE '%&#%' THEN excluded.summary
+          WHEN items.summary LIKE '%]]>%' THEN excluded.summary
           WHEN trim(items.summary) = '*' THEN excluded.summary
           WHEN trim(items.summary) = '-' THEN excluded.summary
           WHEN items.summary LIKE '%<%>%' THEN excluded.summary
@@ -1847,15 +1849,37 @@ function safeDecodePercent(text: string): string {
 function normalizeDisplayText(text: string) {
   return safeDecodePercent(text)
     .replace(/\u00a0/g, " ")
+    .replace(/<!\[CDATA\[/gi, " ")
+    .replace(/\]\]>/g, " ")
+    .replace(/&lt;!\[CDATA\[/gi, " ")
+    .replace(/\]\]&gt;/gi, " ")
+    .replace(/[«»]/g, " ")
     .replace(/[“”]/g, '"')
     .replace(/[‘’]/g, "'")
     .replace(/[–—]/g, "-")
+    .replace(/(^|\s)[>»]+(?=\s|$)/g, " ")
     .replace(/^\s*[\-*•·]+\s*/, "")
     .replace(/\s+\*\s+/g, " ")
+    .replace(/^[\s\-:|>]+/, "")
+    .replace(/[\s\-:|>]+$/, "")
     .replace(/\bDiscussion\s*\|\s*Link\b/gi, "")
     .replace(/https?:\/\/\S+/gi, "")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function sanitizeFeedItemText(item: Record<string, unknown>) {
+  const next = { ...item };
+  if (typeof next.title === "string") {
+    next.title = normalizeDisplayText(next.title);
+  }
+  if (typeof next.summary === "string") {
+    next.summary = normalizeDisplayText(next.summary);
+  }
+  if (typeof next.sourceName === "string") {
+    next.sourceName = normalizeDisplayText(next.sourceName);
+  }
+  return next;
 }
 
 function safeHost(url: string) {
