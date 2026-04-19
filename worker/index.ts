@@ -14,6 +14,7 @@ type SourceType = "rss" | "blog";
 type SourceLevel = "core" | "focus" | "light";
 const FEED_START_DATE = "2026-04-01";
 const ENTRY_LIMIT_PER_SOURCE = 120;
+const ENTRY_VALIDATE_LIMIT_PER_SOURCE = 36;
 const RESURFACE_COOLDOWN_DAYS = 7;
 const SOURCE_REFRESH_INTERVAL_MINUTES = 45;
 const SOURCE_REFRESH_BATCH_SIZE = 4;
@@ -331,6 +332,14 @@ async function handleGetThumbnail(request: Request, url: URL, ctx: ExecutionCont
           return ogResult;
         }
       }
+      const inlineImage = extractFirstContentImage(html, pageUrl);
+      if (inlineImage) {
+        const inlineResult = await fetchImage(inlineImage, pageUrl);
+        if (inlineResult) {
+          ctx.waitUntil(cache.put(cacheKey, inlineResult.clone()));
+          return inlineResult;
+        }
+      }
     }
   }
 
@@ -346,6 +355,9 @@ async function handleGetThumbnail(request: Request, url: URL, ctx: ExecutionCont
     // no-op
   }
 
+  // If thumbnail extraction fails repeatedly, schedule a guarded source rehydrate
+  // so future cards can recover richer metadata instead of staying on fallback.
+  ctx.waitUntil(triggerSourceRehydrateForPageUrl(pageUrl, env, userId));
   return new Response("Not Found", { status: 404 });
 }
 
@@ -389,6 +401,27 @@ function extractMetaImage(html: string, pageUrl: string): string | null {
   } catch {
     return null;
   }
+}
+
+function extractFirstContentImage(html: string, pageUrl: string): string | null {
+  const imgTags = html.match(/<img[^>]*>/gi) || [];
+  for (const tag of imgTags) {
+    const candidate = getAttr(tag, "src") || getAttr(tag, "data-src");
+    if (!candidate) continue;
+    const normalized = normalizeEntryUrl(candidate, pageUrl);
+    if (!normalized || !isPublicHttpUrl(normalized)) continue;
+    const lower = normalized.toLowerCase();
+    if (
+      lower.includes("favicon") ||
+      lower.includes("/icon") ||
+      lower.includes("sprite") ||
+      lower.includes("logo")
+    ) {
+      continue;
+    }
+    return normalized;
+  }
+  return null;
 }
 
 function buildCrawlerHeaders(accept: string, referer?: string) {
@@ -441,6 +474,7 @@ async function handleGetFeedToday(url: URL, env: Env, ctx: ExecutionContext, use
   ]));
   const targetDate = getDateParamOrToday(url.searchParams.get("date"));
   await ensureUserSourcesSeeded(env, userId);
+  await ensureDateHasThreeSlots(targetDate, env, userId);
   let result = await queryDistinctDateItems(targetDate, env, userId);
   const quickRows = (result.results ?? []) as Record<string, unknown>[];
   if (quickRows.length >= 3) {
@@ -450,6 +484,7 @@ async function handleGetFeedToday(url: URL, env: Env, ctx: ExecutionContext, use
       await Promise.allSettled([
         ensureItemsFromSources(env, ctx, userId),
         refreshStaleSourcesInBackground(env, userId),
+        ensureThumbnailsForShownItems(quickRows, env),
       ]);
       await backfillFeedsUntilDate(targetDate, env, userId);
     })());
@@ -483,10 +518,28 @@ async function handleGetFeedToday(url: URL, env: Env, ctx: ExecutionContext, use
     await Promise.allSettled([
       rehydrateWeakShownSources(rows, env),
       rehydrateRandomWeakSource(env, userId),
+      cleanupInvalidItemsForUser(env, userId),
+      ensureThumbnailsForShownItems(rows, env),
     ]);
   })());
   const finalItems = rows.map(({ sourceId, ...rest }) => rest);
   return json({ date: targetDate, items: finalItems.map(sanitizeFeedItemText) });
+}
+
+async function ensureDateHasThreeSlots(targetDate: string, env: Env, userId: number) {
+  // Defensive self-heal: if any upstream cleanup/rehydration removed cards,
+  // force date slot refill before responding.
+  for (let i = 0; i < 2; i += 1) {
+    const current = await queryDistinctDateItems(targetDate, env, userId);
+    const rows = (current.results ?? []) as Record<string, unknown>[];
+    if (rows.length >= 3) return;
+    await fillDateIfNeeded(targetDate, env, userId);
+  }
+
+  const finalCheck = await queryDistinctDateItems(targetDate, env, userId);
+  const finalRows = (finalCheck.results ?? []) as Record<string, unknown>[];
+  if (finalRows.length >= 3) return;
+  await recoverEmptyFeedForUser(targetDate, env, userId);
 }
 
 async function rehydrateWeakShownSources(rows: Record<string, unknown>[], env: Env) {
@@ -730,6 +783,7 @@ async function handleGetSources(env: Env, userId: number) {
       s.type,
       us.level,
       us.is_active,
+      MAX(us.created_at) AS createdAt,
       COUNT(DISTINCT i.id) AS totalItems,
       COUNT(DISTINCT CASE WHEN RTRIM(i.url, '/') <> RTRIM(s.url, '/') THEN i.id END) AS splitItems,
       COUNT(DISTINCT CASE WHEN RTRIM(i.url, '/') = RTRIM(s.url, '/') THEN i.id END) AS rootItems,
@@ -748,7 +802,7 @@ async function handleGetSources(env: Env, userId: number) {
       ) AS lastActivityAt,
       MAX(rs.last_refreshed_at) AS lastRefreshedAt,
       CASE
-        WHEN COUNT(DISTINCT CASE WHEN RTRIM(i.url, '/') <> RTRIM(s.url, '/') THEN i.id END) >= 2 THEN 'split'
+        WHEN COUNT(DISTINCT CASE WHEN RTRIM(i.url, '/') <> RTRIM(s.url, '/') THEN i.id END) >= 1 THEN 'split'
         ELSE 'single'
       END AS extractionMode,
       CASE
@@ -960,6 +1014,7 @@ async function handlePostSources(request: Request, env: Env, ctx: ExecutionConte
     const addedUrls: string[] = [];
     const duplicateUrls: string[] = [];
     const failedUrls: string[] = [];
+    const touchedSourceIds = new Set<number>();
     let registeredOrReactivated = 0;
     for (const sourceUrl of urls) {
       const host = extractSourceHost(sourceUrl);
@@ -967,6 +1022,7 @@ async function handlePostSources(request: Request, env: Env, ctx: ExecutionConte
       if (existingByHost) {
         duplicateUrls.push(sourceUrl);
         await upsertUserSourceActive(env, userId, existingByHost.id);
+        touchedSourceIds.add(existingByHost.id);
         await seedItemForSource(existingByHost, env);
         ctx.waitUntil(hydrateSourceItems(existingByHost, env));
         registeredOrReactivated += 1;
@@ -988,6 +1044,7 @@ async function handlePostSources(request: Request, env: Env, ctx: ExecutionConte
             .first<{ id: number; name: string; url: string; type: SourceType }>();
           if (inserted) {
             await upsertUserSourceActive(env, userId, inserted.id);
+            touchedSourceIds.add(inserted.id);
             await seedItemForSource(inserted, env);
             ctx.waitUntil(hydrateSourceItems(inserted, env));
             registeredOrReactivated += 1;
@@ -1002,6 +1059,7 @@ async function handlePostSources(request: Request, env: Env, ctx: ExecutionConte
             .first<{ id: number; name: string; url: string; type: SourceType }>();
           if (existing) {
             await upsertUserSourceActive(env, userId, existing.id);
+            touchedSourceIds.add(existing.id);
             await seedItemForSource(existing, env);
             ctx.waitUntil(hydrateSourceItems(existing, env));
             registeredOrReactivated += 1;
@@ -1014,6 +1072,7 @@ async function handlePostSources(request: Request, env: Env, ctx: ExecutionConte
 
     if (registeredOrReactivated > 0) {
       await ensureItemsFromSources(env, undefined, userId);
+      await autoClassifySingleSourcesToLight(env, userId, [...touchedSourceIds]);
       await backfillFeedsUntilDate(getTodayIso(), env, userId);
     }
 
@@ -1060,6 +1119,7 @@ async function handlePostSources(request: Request, env: Env, ctx: ExecutionConte
       await upsertUserSourceActive(env, userId, match.id);
       await seedItemForSource(match, env);
       await ensureItemsFromSources(env, undefined, userId);
+      await autoClassifySingleSourcesToLight(env, userId, [match.id]);
       await backfillFeedsUntilDate(getTodayIso(), env, userId);
       ctx.waitUntil(hydrateSourceItems(match, env));
       return json({ ok: true, duplicateByHost: true }, { status: 201 });
@@ -1076,6 +1136,7 @@ async function handlePostSources(request: Request, env: Env, ctx: ExecutionConte
     await upsertUserSourceActive(env, userId, inserted.id);
     await seedItemForSource(inserted, env);
     await ensureItemsFromSources(env, undefined, userId);
+    await autoClassifySingleSourcesToLight(env, userId, [inserted.id]);
     await backfillFeedsUntilDate(getTodayIso(), env, userId);
     ctx.waitUntil(hydrateSourceItems(inserted, env));
   }
@@ -1090,6 +1151,65 @@ async function upsertUserSourceActive(env: Env, userId: number, sourceId: number
     ON CONFLICT(user_id, source_id) DO UPDATE SET
       is_active = 1
   `).bind(userId, sourceId).run();
+}
+
+async function autoClassifySingleSourcesToLight(env: Env, userId: number, sourceIds: number[]) {
+  const validSourceIds = sourceIds.filter(Number.isFinite);
+  if (validSourceIds.length === 0) return;
+  const uniqueSourceIds = [...new Set(validSourceIds)];
+  const placeholders = uniqueSourceIds.map(() => "?").join(", ");
+  const stats = await env.DB.prepare(`
+    SELECT
+      s.id AS sourceId,
+      COUNT(DISTINCT CASE WHEN RTRIM(i.url, '/') <> RTRIM(s.url, '/') THEN i.id END) AS splitItems
+    FROM sources s
+    LEFT JOIN items i ON i.source_id = s.id
+    WHERE s.id IN (${placeholders})
+    GROUP BY s.id
+  `).bind(...uniqueSourceIds).all<{ sourceId: number; splitItems: number }>();
+
+  const singleSourceIds = (stats.results ?? [])
+    .filter((row) => Number(row.splitItems ?? 0) < 1)
+    .map((row) => Number(row.sourceId))
+    .filter(Number.isFinite);
+  if (singleSourceIds.length === 0) return;
+
+  await env.DB.batch(
+    singleSourceIds.map((sourceId) =>
+      env.DB.prepare(`
+        UPDATE user_sources
+        SET level = 'light'
+        WHERE user_id = ?
+          AND source_id = ?
+          AND COALESCE(level, 'focus') = 'focus'
+      `).bind(userId, sourceId)
+    )
+  );
+}
+
+async function triggerSourceRehydrateForPageUrl(pageUrl: string, env: Env, userId: number) {
+  await ensureSourceRefreshTable(env);
+  const source = await env.DB.prepare(`
+    SELECT s.id, s.name, s.url, s.type
+    FROM items i
+    JOIN sources s ON s.id = i.source_id
+    JOIN user_sources us ON us.user_id = ? AND us.source_id = s.id AND us.is_active = 1
+    LEFT JOIN source_refresh_state rs ON rs.source_id = s.id
+    WHERE i.url = ?
+      AND (
+        rs.last_refreshed_at IS NULL
+        OR rs.last_refreshed_at <= datetime('now', '-${SOURCE_REFRESH_INTERVAL_MINUTES} minutes')
+      )
+    LIMIT 1
+  `).bind(userId, pageUrl).first<{ id: number; name: string; url: string; type: SourceType }>();
+  if (!source) return;
+
+  await hydrateSourceItems(source, env);
+  await env.DB.prepare(`
+    INSERT INTO source_refresh_state (source_id, last_refreshed_at)
+    VALUES (?, CURRENT_TIMESTAMP)
+    ON CONFLICT(source_id) DO UPDATE SET last_refreshed_at = CURRENT_TIMESTAMP
+  `).bind(source.id).run();
 }
 
 function parseSourceUrls(rawText?: string, urlsInput?: string[]) {
@@ -1138,6 +1258,11 @@ function extractSourceHost(sourceUrl: string) {
   } catch {
     return "";
   }
+}
+
+function isProtectedContentHost(value: string) {
+  const host = value.includes("://") ? extractSourceHost(value) : value.toLowerCase().replace(/^www\./, "");
+  return host === "longblack.co";
 }
 
 function inferSourceType(sourceUrl: string): SourceType {
@@ -1357,6 +1482,9 @@ async function fillDateIfNeeded(targetDate: string, env: Env, userId: number) {
   /**
    * Apply one fill pass: batch-fetch source_ids, batch-insert slots, track state in memory.
    * Eliminates the per-item SELECT + per-item INSERT pattern (was N+1 × 3 passes).
+   *
+   * NOTE: cursor only advances when a valid, non-dedup candidate is actually assigned.
+   * Skipped candidates (missing meta, dedup collision) do NOT consume a slot index.
    */
   async function applyPass(candidates: number[]): Promise<void> {
     if (candidates.length === 0 || missingSlots.length === 0) return;
@@ -1364,12 +1492,12 @@ async function fillDateIfNeeded(targetDate: string, env: Env, userId: number) {
     const assignments: Array<[slot: number, itemId: number, sourceId: number]> = [];
     let cursor = 0;
     for (const id of candidates) {
-      const slot = missingSlots[cursor++];
-      if (slot === undefined) break;
+      if (cursor >= missingSlots.length) break;
       const meta = metaMap.get(id);
       if (!meta) continue;
       const dedupKey = buildContentDedupKey(meta.sourceId, meta.title, meta.url);
       if (seenDedupKeys.has(dedupKey)) continue;
+      const slot = missingSlots[cursor++];
       assignments.push([slot, id, meta.sourceId]);
       filledSlots.add(slot);
       seenDedupKeys.add(dedupKey);
@@ -1624,18 +1752,36 @@ async function ingestItemsForSource(
   if (entries.length === 0) return 0;
 
   let inserted = 0;
-  for (const entry of entries.slice(0, ENTRY_LIMIT_PER_SOURCE)) {
-    let resolvedTitle = normalizeDisplayText(entry.title || deriveTitleFromUrl(entry.url) || source.name);
+  const limitedEntries = entries.slice(0, ENTRY_LIMIT_PER_SOURCE);
+  for (let idx = 0; idx < limitedEntries.length; idx += 1) {
+    const entry = limitedEntries[idx];
+    const shouldStrictValidate = idx < ENTRY_VALIDATE_LIMIT_PER_SOURCE;
+    let prefetchedHtml: string | null = null;
+    let resolvedUrl = entry.url;
+    if (shouldStrictValidate) {
+      const validated = await resolveValidatedLanding(entry.url, source.url);
+      if (!validated) {
+        if (!isProtectedContentHost(source.url)) continue;
+      } else {
+        resolvedUrl = validated.url;
+        prefetchedHtml = validated.html;
+      }
+    }
+
+    let resolvedTitle = normalizeDisplayText(entry.title || deriveTitleFromUrl(resolvedUrl) || source.name);
     let resolvedSummary = entry.summary ? normalizeDisplayText(entry.summary) : null;
     let resolvedThumbnail = entry.thumbnailUrl ?? null;
 
     if (isWeakEntryTitle(resolvedTitle, source.name) || !isUsableSummary(resolvedSummary ?? "") || !resolvedThumbnail) {
-      const html = await fetchSourceText(entry.url, "text/html,application/xhtml+xml");
+      const html = prefetchedHtml ?? await fetchSourceText(resolvedUrl, "text/html,application/xhtml+xml");
       if (html) {
         if (isWeakEntryTitle(resolvedTitle, source.name)) {
           const htmlTitle = normalizeDisplayText((extractHtmlTitle(html) ?? "").replace(/\|\s*Substack.*$/i, "").trim());
+          const metaTitle = normalizeDisplayText(extractMetaTitle(html) ?? "");
           if (htmlTitle && !isWeakEntryTitle(htmlTitle, source.name)) {
             resolvedTitle = htmlTitle;
+          } else if (metaTitle && !isWeakEntryTitle(metaTitle, source.name)) {
+            resolvedTitle = metaTitle;
           }
         }
         if (!resolvedSummary || !isUsableSummary(resolvedSummary)) {
@@ -1645,13 +1791,26 @@ async function ingestItemsForSource(
           }
         }
         if (!resolvedThumbnail) {
-          const metaImage = extractMetaImage(html, entry.url);
-          if (metaImage) resolvedThumbnail = metaImage;
+          const metaImage = extractMetaImage(html, resolvedUrl);
+          if (metaImage) {
+            resolvedThumbnail = metaImage;
+          } else {
+            const inlineImage = extractFirstContentImage(html, resolvedUrl);
+            if (inlineImage) resolvedThumbnail = inlineImage;
+          }
         }
       }
     }
     if (isWeakEntryTitle(resolvedTitle, source.name)) {
       resolvedTitle = buildFallbackTitleFromSummary(resolvedSummary ?? "", source.name);
+      if (isWeakEntryTitle(resolvedTitle, source.name)) {
+        const pathFallback = derivePathTitleFromUrl(resolvedUrl);
+        if (pathFallback) resolvedTitle = pathFallback;
+      }
+    }
+
+    if ((!resolvedSummary || !isUsableSummary(resolvedSummary)) && isProtectedContentHost(source.url)) {
+      resolvedSummary = "원문 보호 정책으로 요약을 불러오지 못했어요.";
     }
 
     const result = await env.DB.prepare(`
@@ -1688,7 +1847,7 @@ async function ingestItemsForSource(
     `).bind(
       source.id,
       resolvedTitle,
-      entry.url,
+      resolvedUrl,
       resolvedSummary,
       resolvedThumbnail,
       source.name,
@@ -1713,6 +1872,193 @@ async function fetchSourceText(targetUrl: string, accept = "text/html,applicatio
     return null;
   } finally {
     clearTimeout(timeout);
+  }
+}
+
+async function fetchHtmlWithMeta(targetUrl: string) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 7000);
+  try {
+    const res = await fetch(targetUrl, {
+      headers: buildCrawlerHeaders("text/html,application/xhtml+xml"),
+      signal: controller.signal,
+      cf: { cacheEverything: true, cacheTtl: 60 * 15 },
+      redirect: "follow",
+    });
+    const contentType = (res.headers.get("content-type") || "").toLowerCase();
+    const body = contentType.includes("text/html") ? await res.text() : "";
+    return {
+      ok: res.ok,
+      status: res.status,
+      url: res.url || targetUrl,
+      contentType,
+      body,
+    };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function extractAlternateHreflangUrl(html: string, pageUrl: string, langPrefix: string) {
+  const re = /<link[^>]+rel=["']alternate["'][^>]*>/gi;
+  const tags = html.match(re) || [];
+  for (const tag of tags) {
+    const hreflang = (getAttr(tag, "hreflang") || "").toLowerCase();
+    if (!hreflang.startsWith(langPrefix)) continue;
+    const href = getAttr(tag, "href");
+    if (!href) continue;
+    const normalized = normalizeEntryUrl(href, pageUrl);
+    if (normalized) return normalized;
+  }
+  return null;
+}
+
+function isLikelyErrorPage(html: string, resolvedUrl: string) {
+  const lowerUrl = resolvedUrl.toLowerCase();
+  if (/(^|\/)(404|not-found|not_found)(\/|$)/.test(lowerUrl)) return true;
+  const head = html.slice(0, 1200).toLowerCase();
+  return (
+    head.includes("page not found") ||
+    head.includes(">404<") ||
+    head.includes("not found -") ||
+    head.includes("찾을 수 없습니다") ||
+    head.includes("존재하지 않는")
+  );
+}
+
+function looksEnglishLanding(resolvedUrl: string, html: string) {
+  const lowerUrl = resolvedUrl.toLowerCase();
+  if (lowerUrl.includes("/en/") || lowerUrl.endsWith("-en") || lowerUrl.includes("lang=en")) return true;
+  const htmlLang = html.match(/<html[^>]+lang=["']([^"']+)["']/i)?.[1]?.toLowerCase() || "";
+  return htmlLang.startsWith("en");
+}
+
+async function resolveValidatedLanding(entryUrl: string, sourceUrl: string): Promise<{ url: string; html: string } | null> {
+  const normalized = normalizeEntryUrl(entryUrl, sourceUrl);
+  if (!normalized) return null;
+
+  const candidates = new Set<string>([normalized]);
+  try {
+    const parsed = new URL(normalized);
+    if (parsed.pathname.includes("/en/")) {
+      const koPath = parsed.pathname.replace("/en/", "/ko/");
+      if (koPath !== parsed.pathname) {
+        const alt = new URL(parsed.toString());
+        alt.pathname = koPath;
+        candidates.add(alt.toString());
+      }
+    }
+    if (parsed.searchParams.get("lang") === "en") {
+      const alt = new URL(parsed.toString());
+      alt.searchParams.set("lang", "ko");
+      candidates.add(alt.toString());
+    }
+  } catch {
+    // no-op
+  }
+
+  let best: { url: string; html: string } | null = null;
+  for (const candidate of candidates) {
+    const fetched = await fetchHtmlWithMeta(candidate);
+    if (!fetched || !fetched.ok || fetched.status >= 400) continue;
+    if (!fetched.contentType.includes("text/html")) continue;
+    if (!fetched.body || isLikelyErrorPage(fetched.body, fetched.url)) continue;
+
+    const koAlt = extractAlternateHreflangUrl(fetched.body, fetched.url, "ko");
+    if (koAlt && koAlt !== fetched.url) {
+      const koFetched = await fetchHtmlWithMeta(koAlt);
+      if (
+        koFetched &&
+        koFetched.ok &&
+        koFetched.status < 400 &&
+        koFetched.contentType.includes("text/html") &&
+        koFetched.body &&
+        !isLikelyErrorPage(koFetched.body, koFetched.url)
+      ) {
+        return { url: koFetched.url, html: koFetched.body };
+      }
+    }
+
+    if (!best) best = { url: fetched.url, html: fetched.body };
+    if (!looksEnglishLanding(fetched.url, fetched.body)) {
+      return { url: fetched.url, html: fetched.body };
+    }
+  }
+  return best;
+}
+
+async function cleanupInvalidItemsForUser(env: Env, userId: number) {
+  const candidates = await env.DB.prepare(`
+    SELECT DISTINCT i.id AS itemId, i.url AS url, s.url AS sourceUrl
+    FROM user_feed_slots fs
+    JOIN items i ON i.id = fs.item_id
+    JOIN sources s ON s.id = i.source_id
+    WHERE fs.user_id = ?
+      AND i.status = 'active'
+    ORDER BY fs.date DESC, fs.slot_index ASC
+    LIMIT 12
+  `).bind(userId).all<{ itemId: number; url: string; sourceUrl: string }>();
+
+  const refillDates = new Set<string>();
+  for (const row of candidates.results ?? []) {
+    const validated = await resolveValidatedLanding(row.url, row.sourceUrl);
+    if (!validated) {
+      if (isProtectedContentHost(row.sourceUrl)) continue;
+      const affected = await env.DB.prepare(`
+        SELECT date
+        FROM user_feed_slots
+        WHERE user_id = ? AND item_id = ?
+      `).bind(userId, row.itemId).all<{ date: string }>();
+      for (const r of affected.results ?? []) {
+        if (r.date) refillDates.add(r.date);
+      }
+      await env.DB.prepare("UPDATE items SET status = 'archived' WHERE id = ?").bind(row.itemId).run();
+      await env.DB.prepare("DELETE FROM user_feed_slots WHERE user_id = ? AND item_id = ?").bind(userId, row.itemId).run();
+      continue;
+    }
+    if (validated.url !== row.url) {
+      await env.DB.prepare(`
+        UPDATE items
+        SET url = ?
+        WHERE id = ?
+      `).bind(validated.url, row.itemId).run();
+    }
+  }
+
+  for (const date of refillDates) {
+    await fillDateIfNeeded(date, env, userId);
+  }
+}
+
+async function ensureThumbnailsForShownItems(rows: Record<string, unknown>[], env: Env) {
+  const itemIds = [...new Set(
+    rows.map((row) => Number(row.id)).filter(Number.isFinite)
+  )];
+  if (itemIds.length === 0) return;
+
+  const placeholders = itemIds.map(() => "?").join(", ");
+  const targets = await env.DB.prepare(`
+    SELECT i.id AS itemId, i.url AS itemUrl, i.thumbnail_url AS thumbnailUrl
+    FROM items i
+    WHERE i.id IN (${placeholders})
+  `).bind(...itemIds).all<{ itemId: number; itemUrl: string; thumbnailUrl?: string | null }>();
+
+  for (const target of targets.results ?? []) {
+    const existing = (target.thumbnailUrl ?? "").trim();
+    if (existing && !existing.toLowerCase().includes("/favicon.ico")) continue;
+    const html = await fetchSourceText(target.itemUrl, "text/html,application/xhtml+xml");
+    if (!html) continue;
+    const metaImage = extractMetaImage(html, target.itemUrl);
+    const inlineImage = metaImage ? null : extractFirstContentImage(html, target.itemUrl);
+    const selected = metaImage || inlineImage;
+    if (!selected) continue;
+    await env.DB.prepare(`
+      UPDATE items
+      SET thumbnail_url = ?
+      WHERE id = ?
+    `).bind(selected, target.itemId).run();
   }
 }
 
@@ -2456,6 +2802,21 @@ function deriveTitleFromUrl(url: string) {
   }
 }
 
+function derivePathTitleFromUrl(url: string) {
+  try {
+    const parsed = new URL(url);
+    const parts = parsed.pathname.split("/").filter(Boolean);
+    if (parts.length >= 2) {
+      const prev = decodeUrlSlug(parts[parts.length - 2]).replace(/[-_]+/g, " ").trim();
+      const last = decodeUrlSlug(parts[parts.length - 1]).replace(/[-_]+/g, " ").trim();
+      if (prev && last) return `${prev} ${last}`.trim();
+    }
+    return "";
+  } catch {
+    return "";
+  }
+}
+
 function decodeUrlSlug(value: string) {
   let current = value;
   for (let i = 0; i < 2; i += 1) {
@@ -2507,7 +2868,20 @@ function stripTrackingQueryParams(parsed: URL) {
 function extractMetaDescription(html: string) {
   const m =
     html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["'][^>]*>/i) ||
-    html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+name=["']description["'][^>]*>/i);
+    html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+name=["']description["'][^>]*>/i) ||
+    html.match(/<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']+)["'][^>]*>/i) ||
+    html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:description["'][^>]*>/i) ||
+    html.match(/<meta[^>]+name=["']twitter:description["'][^>]+content=["']([^"']+)["'][^>]*>/i) ||
+    html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+name=["']twitter:description["'][^>]*>/i);
+  return m?.[1]?.trim() || null;
+}
+
+function extractMetaTitle(html: string) {
+  const m =
+    html.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["'][^>]*>/i) ||
+    html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:title["'][^>]*>/i) ||
+    html.match(/<meta[^>]+name=["']twitter:title["'][^>]+content=["']([^"']+)["'][^>]*>/i) ||
+    html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+name=["']twitter:title["'][^>]*>/i);
   return m?.[1]?.trim() || null;
 }
 

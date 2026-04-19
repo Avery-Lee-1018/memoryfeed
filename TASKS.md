@@ -22,6 +22,7 @@
 - [x] POST /api/sources (bulk)
 - [x] PATCH /api/sources/:id
 - [x] DELETE /api/sources/:id
+- [x] POST /api/sources/:id/refresh
 - [x] GET/POST/DELETE /api/notes/:itemId
 - [x] GET /api/thumbnail
 
@@ -39,6 +40,8 @@
 - [x] 모바일 대응
 - [x] 에러 토스트/재시도 UX
 - [x] 보안 하드닝 1차 (메모 분리 조회, 썸네일 제한, 옵션 토큰)
+- [x] 썸네일 안정화 (public 이미지 허용 + 사설망 차단 + favicon 고착 완화)
+- [x] 피드 응답 최적화 (기존 3슬롯 즉시 응답 + 백그라운드 유지보수)
 
 ## Phase 7 - Auth Bootstrap
 - [x] 계정/세션 테이블 추가(users, auth_identities, sessions)

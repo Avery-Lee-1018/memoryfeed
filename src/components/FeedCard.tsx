@@ -8,6 +8,49 @@ const FALLBACK_THUMBNAILS = [
   "/thumbnails/03.png",
 ];
 
+const thumbnailObjectUrlCache = new Map<string, string>();
+const thumbnailInflightCache = new Map<string, Promise<string | null>>();
+const MAX_THUMBNAIL_CACHE = 220;
+
+function setThumbnailCache(key: string, objectUrl: string) {
+  if (!thumbnailObjectUrlCache.has(key) && thumbnailObjectUrlCache.size >= MAX_THUMBNAIL_CACHE) {
+    const oldest = thumbnailObjectUrlCache.keys().next().value as string | undefined;
+    if (oldest) {
+      const revoked = thumbnailObjectUrlCache.get(oldest);
+      if (revoked) URL.revokeObjectURL(revoked);
+      thumbnailObjectUrlCache.delete(oldest);
+    }
+  }
+  thumbnailObjectUrlCache.set(key, objectUrl);
+}
+
+async function fetchAuthorizedThumbnailObjectUrl(url: string) {
+  const cached = thumbnailObjectUrlCache.get(url);
+  if (cached) return cached;
+
+  const inflight = thumbnailInflightCache.get(url);
+  if (inflight) return inflight;
+
+  const task = (async () => {
+    try {
+      const res = await authorizedFetch(url);
+      if (!res.ok) return null;
+      const contentType = res.headers.get("content-type") || "";
+      if (!contentType.startsWith("image/")) return null;
+      const blob = await res.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      setThumbnailCache(url, objectUrl);
+      return objectUrl;
+    } catch {
+      return null;
+    } finally {
+      thumbnailInflightCache.delete(url);
+    }
+  })();
+  thumbnailInflightCache.set(url, task);
+  return task;
+}
+
 export type FeedItem = {
   id: number;
   title: string;
@@ -47,6 +90,7 @@ export default function FeedCard({
   const [draftMemo, setDraftMemo] = useState("");
   const [memoLoaded, setMemoLoaded] = useState(!hasNote);
   const [memoSaving, setMemoSaving] = useState(false);
+  const [hasMemoState, setHasMemoState] = useState(!!hasNote);
 
   const fallbackThumbnail = FALLBACK_THUMBNAILS[id % 3];
   const resolvedThumbnail = useMemo(() => {
@@ -59,15 +103,30 @@ export default function FeedCard({
   const [imageLoaded, setImageLoaded] = useState(false);
 
   useEffect(() => {
-    setThumbnailSrc(resolvedThumbnail);
+    let cancelled = false;
     setImageLoaded(false);
-    return undefined;
-  }, [resolvedThumbnail]);
+    setThumbnailSrc(resolvedThumbnail);
+
+    void (async () => {
+      const objectUrl = await fetchAuthorizedThumbnailObjectUrl(resolvedThumbnail);
+      if (cancelled) return;
+      if (objectUrl) {
+        setThumbnailSrc(objectUrl);
+        return;
+      }
+      setThumbnailSrc(fallbackThumbnail);
+      setImageLoaded(true);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [resolvedThumbnail, fallbackThumbnail]);
 
   // suppress unused-var warning for index kept for future use
   void index;
 
-  const hasMemo = savedMemo.length > 0 || !!hasNote;
+  const hasMemo = hasMemoState;
 
   const loadNote = async () => {
     if (memoLoaded) return;
@@ -78,6 +137,7 @@ export default function FeedCard({
         const content = (data.content ?? "").trim();
         setSavedMemo(content);
         setDraftMemo(content);
+        setHasMemoState(content.length > 0);
       }
     } catch (error) {
       console.error(error);
@@ -109,6 +169,7 @@ export default function FeedCard({
         body: JSON.stringify({ content: draftMemo.trim() }),
       });
       setSavedMemo(draftMemo.trim());
+      setHasMemoState(true);
       setMemoEditing(false);
       setMemoLoaded(true);
       onMemoSaved?.();
@@ -121,6 +182,7 @@ export default function FeedCard({
     await authorizedFetch(`/api/notes/${id}`, { method: "DELETE" });
     setSavedMemo("");
     setDraftMemo("");
+    setHasMemoState(false);
     setMemoLoaded(true);
     setMemoEditing(false);
     setMemoOpen(false);

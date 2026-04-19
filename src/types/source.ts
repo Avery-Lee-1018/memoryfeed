@@ -15,6 +15,7 @@ export type SourceEntry = {
   rootItems?: number;
   exposureCount: number;
   memoCount: number;
+  createdAt?: string | null;
   lastExposedAt?: string | null;
   lastActivityAt?: string | null;
   lastRefreshedAt?: string | null;

@@ -8,10 +8,12 @@
 ## Runtime Flow
 1. 사용자가 Feed 화면 진입
 2. `GET /api/feed/today?date=...` 호출
-3. Worker가 필요한 테이블/슬롯(`feed_slots`)을 보장하고 날짜 데이터 조회
-4. 해당 날짜 슬롯이 부족하면 source/items 기준으로 보충
-5. 카드 3개 + `hasNote` 상태만 반환
-6. 메모는 별도 `GET /api/notes/:itemId`로 지연 조회
+3. Worker가 먼저 해당 날짜의 기존 슬롯을 조회
+4. 이미 3개 슬롯이 있으면 즉시 반환(빠른 응답 경로)
+5. 슬롯이 부족하면 source/items hydration + 날짜 슬롯 보충 수행
+6. 중복 정리/약한 콘텐츠 보강/주기 refresh는 `ctx.waitUntil`로 백그라운드 처리
+7. 카드 3개 + `hasNote` 상태만 반환
+8. 메모는 별도 `GET /api/notes/:itemId`로 지연 조회
 
 ## Sources Flow
 1. 사용자가 URL 여러 개를 한 번에 입력
@@ -19,6 +21,13 @@
 3. Worker에서 URL 정규화/중복 제거/host 단위 중복 처리
 4. source 생성 후 item 시드 + 비동기 hydration
 5. `GET /api/sources`에서 aggregate(`exposureCount`, `memoCount`, `lastActivityAt`) 반환
+
+## Source Refresh Flow
+1. 사용자가 My source 카드에서 `업데이트 확인` 버튼 클릭
+2. `POST /api/sources/:id/refresh` 호출
+3. Worker가 source 소유권/활성 상태 검증 후 수동 refresh 실행
+4. `source_refresh_state.last_refreshed_at` 갱신
+5. 과도한 부하 방지를 위해 source별 짧은 cooldown 적용
 
 ## Account/Auth Flow (Bootstrap)
 1. 클라이언트(웹/익스텐션)가 Google ID Token 획득
@@ -45,6 +54,7 @@ Write:
 - `POST /api/feed/replacement`
 - `POST /api/reaction`
 - `POST /api/sources`
+- `POST /api/sources/:id/refresh`
 - `PATCH /api/sources/:id`
 - `DELETE /api/sources/:id`
 - `POST /api/notes/:itemId`
@@ -55,7 +65,8 @@ Write:
 ## Security Model
 - `ADMIN_TOKEN`이 설정된 경우, 쓰기/민감 API는 토큰 필요.
 - 피드 응답에서 메모 원문 미노출(`hasNote`만 반환).
-- 썸네일 프록시는 등록 source 도메인 계열만 허용.
+- 썸네일 프록시는 사용자 소유 item URL에 한해 동작.
+- 이미지 URL은 public `http/https`만 허용하고 사설망/localhost 요청 차단.
 
 ## Principle
 백엔드는 최소 규칙과 데이터 무결성에 집중,  

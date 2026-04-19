@@ -68,6 +68,7 @@ export function normalizeSourceEntry(raw: Record<string, unknown>): SourceEntry 
     rootItems: Number(raw.rootItems ?? 0),
     exposureCount: Number(raw.exposureCount ?? 0),
     memoCount: Number(raw.memoCount ?? 0),
+    createdAt: typeof raw.createdAt === "string" ? raw.createdAt : null,
     lastExposedAt: typeof raw.lastExposedAt === "string" ? raw.lastExposedAt : null,
     lastActivityAt: typeof raw.lastActivityAt === "string" ? raw.lastActivityAt : null,
     lastRefreshedAt: typeof raw.lastRefreshedAt === "string" ? raw.lastRefreshedAt : null,

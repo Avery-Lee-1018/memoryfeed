@@ -8,6 +8,8 @@
 - 메모 저장/수정/삭제
 - Source 벌크 등록(공백/줄바꿈 분리, 중복/실패 피드백)
 - My에서 source 레벨(core/focus/light), 토글, 삭제, 검색
+- My source 카드별 수동 갱신(업데이트 확인) + 카드 단위 스켈레톤 로딩
+- 피드 조회 빠른 응답 경로(기존 3슬롯이 있으면 즉시 반환, 무거운 정리는 백그라운드 처리)
 
 ## Stack
 - Frontend: React + Vite + TypeScript
@@ -27,6 +29,7 @@ User-scoped (Bearer session token required):
 - `POST /api/reaction`
 - `GET /api/sources`
 - `POST /api/sources`
+- `POST /api/sources/:id/refresh`
 - `PATCH /api/sources/:id`
 - `DELETE /api/sources/:id`
 - `GET /api/thumbnail?pageUrl=...&imageUrl=...`
@@ -101,7 +104,8 @@ Production:
 
 ## Security Notes
 - 메모 본문은 피드 응답에 포함하지 않음(`hasNote`만 노출).
-- 썸네일 프록시는 로그인 사용자 본인 source 도메인 계열 URL만 허용.
+- 썸네일 프록시는 로그인 사용자의 실제 아이템 URL만 허용하고,
+  이미지 URL은 `http/https` + public host만 허용(`localhost`/사설망 차단).
 - API는 사용자 세션(`Bearer`) 기준으로 동작.
 - 계정 연동 필수 변수:
   - `AUTH_JWT_SECRET` (필수, Wrangler Secret)

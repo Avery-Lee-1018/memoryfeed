@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS sources (
   name TEXT NOT NULL,
   url TEXT NOT NULL UNIQUE,
   type TEXT NOT NULL CHECK (type IN ('rss', 'blog')),
+  level TEXT NOT NULL DEFAULT 'focus' CHECK (level IN ('core', 'focus', 'light')),
   is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1))
 );
 

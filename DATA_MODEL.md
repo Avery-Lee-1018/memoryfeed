@@ -74,6 +74,10 @@
 - type (keep | skip)
 - created_at
 
+## source_refresh_state
+- source_id (PK)
+- last_refreshed_at
+
 ## users
 - id
 - email (UNIQUE)
@@ -108,5 +112,6 @@
 - 메모 본문은 피드 응답에 포함하지 않음 (`hasNote`만 전달).
 - source 삭제 시 연관 items/notes/reactions/feed_slots는 FK로 정리됨.
 - source 단위 통계는 조회 시 aggregate 계산.
+- source별 수동 갱신 시각은 `source_refresh_state`로 추적.
 - 인증은 `users` + `auth_identities` + `sessions`.
 - 피드/메모/반응/소스 상태는 `user_*` 테이블로 계정별 분리.

@@ -17,6 +17,7 @@ type Props = {
 };
 
 type LevelKey = SourceLevel;
+type SortKey = "recent" | "content" | "alpha";
 
 const LEVELS: { key: LevelKey; title: string; hint: string }[] = [
   { key: "core", title: "Core", hint: "자주 떠오른 출처" },
@@ -43,6 +44,11 @@ const LEVEL_THEME: Record<LevelKey, { shell: string; badge: string; hint: string
 };
 
 const STORAGE_KEY = "memoryfeed.sourceLevelOverrides.v1";
+const SORT_LABEL: Record<SortKey, string> = {
+  recent: "최근 등록순",
+  content: "콘텐츠 많은순",
+  alpha: "가나다순",
+};
 
 function formatRecentLabel(value?: string | null) {
   if (!value) return "업데이트 없음";
@@ -53,17 +59,6 @@ function formatRecentLabel(value?: string | null) {
   const mm = String(parsed.getMonth() + 1).padStart(2, "0");
   const dd = String(parsed.getDate()).padStart(2, "0");
   return `${yy}.${mm}.${dd} 업데이트`;
-}
-
-function formatRefreshLabel(value?: string | null) {
-  if (!value) return "최근 갱신 기록 없음";
-  const parsed = new Date(value.length === 10 ? `${value}T00:00:00` : value);
-  if (Number.isNaN(parsed.getTime())) return "최근 갱신 기록 없음";
-
-  const yy = String(parsed.getFullYear()).slice(-2);
-  const mm = String(parsed.getMonth() + 1).padStart(2, "0");
-  const dd = String(parsed.getDate()).padStart(2, "0");
-  return `최신 ${yy}.${mm}.${dd}`;
 }
 
 function resolveSourceOpenUrl(source: SourceEntry) {
@@ -150,6 +145,7 @@ export default function MySourcesView({
   const [draggingId, setDraggingId] = useState<number | null>(null);
   const [dragOverLevel, setDragOverLevel] = useState<LevelKey | null>(null);
   const [diagnoseOpenId, setDiagnoseOpenId] = useState<number | null>(null);
+  const [sortKey, setSortKey] = useState<SortKey>("recent");
   const canSubmitSource = sourceInput.trim().length > 0 && !sourceSubmitting;
 
   useEffect(() => {
@@ -188,11 +184,32 @@ export default function MySourcesView({
       const level = overrides[source.id] ?? source.level ?? inferLevel(source);
       groups[level].push(source);
     }
-    groups.core.sort((a, b) => b.id - a.id);
-    groups.focus.sort((a, b) => b.id - a.id);
-    groups.light.sort((a, b) => b.id - a.id);
+    const getCreatedAtMs = (source: SourceEntry) => {
+      if (!source.createdAt) return 0;
+      const ms = new Date(source.createdAt).getTime();
+      return Number.isFinite(ms) ? ms : 0;
+    };
+    const sorter = (a: SourceEntry, b: SourceEntry) => {
+      if (sortKey === "alpha") {
+        const byName = a.name.localeCompare(b.name, "ko");
+        return byName !== 0 ? byName : b.id - a.id;
+      }
+      if (sortKey === "content") {
+        const byContent = (b.splitItems ?? 0) - (a.splitItems ?? 0);
+        if (byContent !== 0) return byContent;
+        const byTotal = (b.totalItems ?? 0) - (a.totalItems ?? 0);
+        if (byTotal !== 0) return byTotal;
+        return b.id - a.id;
+      }
+      const byCreatedAt = getCreatedAtMs(b) - getCreatedAtMs(a);
+      if (byCreatedAt !== 0) return byCreatedAt;
+      return b.id - a.id;
+    };
+    groups.core.sort(sorter);
+    groups.focus.sort(sorter);
+    groups.light.sort(sorter);
     return groups;
-  }, [filteredSources, overrides]);
+  }, [filteredSources, overrides, sortKey]);
 
   const moveSourceLevel = (sourceId: number, level: LevelKey) => {
     setOverrides((prev) => ({ ...prev, [sourceId]: level }));
@@ -241,6 +258,19 @@ export default function MySourcesView({
         <div className="flex items-center justify-between">
           <h3 className="ml-2 text-base font-semibold tracking-tight text-zinc-800">언젠가는 읽을 북마크 모음</h3>
           <div className="mr-2 flex items-center gap-2">
+            <label className="relative">
+              <span className="sr-only">정렬 기준</span>
+              <select
+                value={sortKey}
+                onChange={(e) => setSortKey(e.target.value as SortKey)}
+                className="h-7 rounded-full border border-zinc-200 bg-white px-2.5 pr-7 text-[11px] text-zinc-700 focus:outline-none focus:ring-1 focus:ring-ring"
+              >
+                <option value="recent">최근 등록순</option>
+                <option value="content">콘텐츠 많은순</option>
+                <option value="alpha">가나다순</option>
+              </select>
+              <i className="ri-arrow-down-s-line pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-xs text-zinc-500" />
+            </label>
             <p className="text-sm text-zinc-700">총 {sources.length}개 북마크</p>
             <button
               type="button"
@@ -337,7 +367,10 @@ export default function MySourcesView({
                   </p>
                   <p className="text-xs text-zinc-600">{LEVEL_THEME[level.key].hint}</p>
                 </div>
-                <p className="text-xs text-zinc-500">{groupedSources[level.key].length}개</p>
+                <div className="flex items-center gap-2">
+                  <p className="text-[11px] text-zinc-500">{SORT_LABEL[sortKey]}</p>
+                  <p className="text-xs text-zinc-500">{groupedSources[level.key].length}개</p>
+                </div>
               </div>
               <div className="grid grid-cols-1 gap-3 sm:gap-4">
                 {groupedSources[level.key].map((source) => (
@@ -431,9 +464,6 @@ export default function MySourcesView({
                         )}
                         <div className="mt-3 flex items-end justify-between gap-2">
                           <div className="flex flex-col items-start gap-1">
-                            <p className="text-[11px] text-zinc-500">
-                              {formatRefreshLabel(source.lastRefreshedAt ?? source.lastActivityAt ?? source.lastExposedAt)}
-                            </p>
                             <button
                               type="button"
                               onClick={() => void onRefreshSource(source.id)}

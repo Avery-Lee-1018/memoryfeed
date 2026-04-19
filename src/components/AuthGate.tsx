@@ -58,10 +58,10 @@ export default function AuthGate({ onSignedIn }: Props) {
   }, [canRenderGoogleButton, clientId, onSignedIn]);
 
   return (
-    <div className="mx-auto flex min-h-dvh w-full max-w-[420px] flex-col justify-center px-6 py-10">
+    <div className="mx-auto flex min-h-dvh w-full max-w-sm flex-col justify-center px-6 py-10">
       <p className="text-xs text-zinc-500">Memoryfeed Account</p>
       <h1 className="mt-2 text-2xl font-semibold tracking-tight text-zinc-900">Google 로그인이 필요해요</h1>
-      <p className="mt-2 text-sm text-zinc-600">
+      <p className="mt-2 w-full break-keep text-sm text-zinc-600">
         계정별로 같은 피드/메모/소스를 관리하려면 로그인 후 시작해 주세요.
       </p>
 
