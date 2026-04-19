@@ -497,6 +497,7 @@ export default function App() {
                       <FeedCard
                         {...item}
                         index={i}
+                        dimThumbnail={!isToday && !memoItemIds.has(item.id)}
                         onMemoSaved={() =>
                           {
                             setMemoItemIds((prev) => new Set(prev).add(item.id));

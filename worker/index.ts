@@ -14,6 +14,7 @@ type SourceType = "rss" | "blog";
 type SourceLevel = "core" | "focus" | "light";
 const FEED_START_DATE = "2026-04-01";
 const ENTRY_LIMIT_PER_SOURCE = 30;
+const RESURFACE_COOLDOWN_DAYS = 7;
 const KOREAN_ACCEPT_LANGUAGE = "ko-KR,ko;q=0.95,en-US;q=0.7,en;q=0.6";
 const CRAWLER_USER_AGENT = "Mozilla/5.0 (compatible; MemoryFeedBot/1.0)";
 const ADMIN_HEADER = "x-memoryfeed-key";
@@ -574,6 +575,7 @@ async function handlePostFeedReplacement(request: Request, env: Env, userId: num
 
   const preferred = await selectCandidateItemIds(env, {
     userId,
+    targetDate,
     limit: 1,
     excludeItemIds: excludedIds,
     excludeSourceIds: excludedSources,
@@ -585,6 +587,7 @@ async function handlePostFeedReplacement(request: Request, env: Env, userId: num
   if (!replacementId) {
     const fallbackUnassigned = await selectCandidateItemIds(env, {
       userId,
+      targetDate,
       limit: 1,
       excludeItemIds: excludedIds,
       excludeSourceIds: todaySources,
@@ -598,6 +601,7 @@ async function handlePostFeedReplacement(request: Request, env: Env, userId: num
     // Last-resort: allow memoed items, but keep cross-date uniqueness.
     const fallbackAny = await selectCandidateItemIds(env, {
       userId,
+      targetDate,
       limit: 1,
       excludeItemIds: excludedIds,
       excludeSourceIds: [],
@@ -722,32 +726,14 @@ async function handleGetSources(env: Env, userId: number) {
   return json({ sources: result.results ?? [] });
 }
 
-async function ensureUserSourcesSeeded(env: Env, userId: number) {
-  const mapped = await env.DB.prepare(`
-    SELECT COUNT(*) AS count
-    FROM user_sources
-    WHERE user_id = ?
-  `).bind(userId).first<{ count?: number }>();
-  if (Number(mapped?.count ?? 0) > 0) return;
-
-  const total = await env.DB.prepare(`
-    SELECT COUNT(*) AS count
-    FROM sources
-  `).first<{ count?: number }>();
-  if (Number(total?.count ?? 0) <= 0) return;
-
-  await env.DB.prepare(`
-    INSERT OR IGNORE INTO user_sources (user_id, source_id, is_active, level)
-    SELECT
-      ?,
-      s.id,
-      1,
-      CASE
-        WHEN s.level IN ('core', 'focus', 'light') THEN s.level
-        ELSE 'focus'
-      END
-    FROM sources s
-  `).bind(userId).run();
+async function ensureUserSourcesSeeded(_env: Env, _userId: number) {
+  // Intentionally a no-op.
+  //
+  // Previously this copied ALL rows from the global `sources` table into every
+  // new user's user_sources on first login, which meant User B automatically
+  // inherited every source that User A had ever added — a critical data-isolation
+  // bug. Each user now starts with an empty source list and adds their own
+  // sources through the My Sources view.
 }
 
 async function recoverEmptyFeedForUser(targetDate: string, env: Env, userId: number) {
@@ -1058,6 +1044,7 @@ function nextIsoDate(isoDate: string) {
 
 type CandidateQueryOptions = {
   userId: number;
+  targetDate: string;
   limit: number;
   excludeItemIds: number[];
   excludeSourceIds: number[];
@@ -1076,13 +1063,22 @@ function buildInClause(column: string, values: number[]) {
 }
 
 async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) {
-  const { userId } = options;
+  const { userId, targetDate } = options;
   const itemExclusion = buildInClause("i.id", options.excludeItemIds);
   const sourceExclusion = buildInClause("i.source_id", options.excludeSourceIds);
   const memoClause = options.requireNoMemo ? "AND (n.content IS NULL OR trim(n.content) = '')" : "";
-  // Exclude items already scheduled on ANY date unless caller explicitly allows reuse.
+  // Keep memoed items excluded and allow memo-less resurfacing after cooldown.
   const assignedClause = options.excludeAssigned !== false
-    ? "AND NOT EXISTS (SELECT 1 FROM user_feed_slots fs_chk WHERE fs_chk.item_id = i.id AND fs_chk.user_id = ?)"
+    ? `
+      AND (n.content IS NULL OR trim(n.content) = '')
+      AND NOT EXISTS (
+        SELECT 1
+        FROM user_feed_slots fs_chk
+        WHERE fs_chk.item_id = i.id
+          AND fs_chk.user_id = ?
+          AND fs_chk.date >= date(?, '-${RESURFACE_COOLDOWN_DAYS} day')
+      )
+    `
     : "";
   const limit = Math.max(0, options.limit);
   if (limit === 0) return [] as number[];
@@ -1128,7 +1124,7 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
     `).bind(
       userId,
       userId,
-      ...(options.excludeAssigned !== false ? [userId] : []),
+      ...(options.excludeAssigned !== false ? [userId, targetDate] : []),
       ...itemExclusion.params,
       ...sourceExclusion.params,
       limit,
@@ -1167,7 +1163,7 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
   `).bind(
     userId,
     userId,
-    ...(options.excludeAssigned !== false ? [userId] : []),
+    ...(options.excludeAssigned !== false ? [userId, targetDate] : []),
     ...itemExclusion.params,
     ...sourceExclusion.params,
     limit,
@@ -1277,6 +1273,7 @@ async function fillDateIfNeeded(targetDate: string, env: Env, userId: number) {
   // Pass 1: diverse sources, avoid recently seen sources
   const diverse = await selectCandidateItemIds(env, {
     userId,
+    targetDate,
     limit: missingSlots.length,
     excludeItemIds: currentIds,
     excludeSourceIds: [...new Set([...currentSourceIds, ...fatiguedSourceIds])],
@@ -1289,6 +1286,7 @@ async function fillDateIfNeeded(targetDate: string, env: Env, userId: number) {
   // Pass 2: relax source fatigue, still distinct sources
   const fallback = await selectCandidateItemIds(env, {
     userId,
+    targetDate,
     limit: missingSlots.length,
     excludeItemIds: currentIds,
     excludeSourceIds: currentSourceIds,
@@ -1301,6 +1299,7 @@ async function fillDateIfNeeded(targetDate: string, env: Env, userId: number) {
   // Pass 3: last resort — allow memoed items, any source
   const relaxed = await selectCandidateItemIds(env, {
     userId,
+    targetDate,
     limit: missingSlots.length,
     excludeItemIds: currentIds,
     excludeSourceIds: [],

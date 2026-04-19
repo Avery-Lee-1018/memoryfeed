@@ -21,6 +21,7 @@ export type FeedItem = {
 
 type Props = FeedItem & {
   index?: number;
+  dimThumbnail?: boolean;
   onMemoSaved?: () => void;
   onMemoDeleted?: () => void;
 };
@@ -35,6 +36,7 @@ export default function FeedCard({
   sourceName,
   sourceType,
   index = 0,
+  dimThumbnail = false,
   onMemoSaved,
   onMemoDeleted,
 }: Props) {
@@ -173,7 +175,7 @@ export default function FeedCard({
               alt=""
               className={`h-full w-full object-cover transition-opacity duration-300 ${
                 imageLoaded ? "opacity-100" : "opacity-0"
-              }`}
+              } ${dimThumbnail ? "brightness-75 saturate-75" : ""}`}
               loading="lazy"
               decoding="async"
               referrerPolicy="no-referrer"
@@ -183,6 +185,9 @@ export default function FeedCard({
               }}
               onLoad={() => setImageLoaded(true)}
             />
+            {dimThumbnail && (
+              <div className="pointer-events-none absolute inset-0 bg-white/20" />
+            )}
           </div>
 
           {/* Header */}
