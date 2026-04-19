@@ -7,6 +7,12 @@
     "directory": "./dist",
     "binding": "ASSETS"
   },
+  "triggers": {
+    "crons": [
+      "*/10 * * * *",
+      "17 3 * * *"
+    ]
+  },
   "d1_databases": [
     {
       "binding": "DB",

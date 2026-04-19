@@ -44,7 +44,13 @@ const json = (data: unknown, init: ResponseInit = {}) =>
 
 export default {
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(refreshAllSourcesGlobal(env));
+    const cron = _event.cron ?? "";
+    // Every 10 minutes: monitor replacement-requested sources and hydrate only due targets.
+    ctx.waitUntil(processReplacementMonitorQueue(env));
+    // Daily full sweep to keep global freshness without 10-min heavy crawl cost.
+    if (cron === "17 3 * * *") {
+      ctx.waitUntil(refreshAllSourcesGlobal(env));
+    }
   },
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     try {
@@ -722,6 +728,15 @@ async function handlePostFeedReplacement(request: Request, env: Env, userId: num
     return json({ item: null, reason: "item_not_in_today_slots" });
   }
 
+  const replacedItemMeta = Number.isInteger(body.replaceItemId)
+    ? await env.DB.prepare(`
+      SELECT id, source_id, url
+      FROM items
+      WHERE id = ?
+      LIMIT 1
+    `).bind(body.replaceItemId).first<{ id: number; source_id: number; url: string }>()
+    : null;
+
   const todayRows = await env.DB.prepare(`
     SELECT item_id, source_id
     FROM user_feed_slots
@@ -788,6 +803,23 @@ async function handlePostFeedReplacement(request: Request, env: Env, userId: num
     if (fallbackAny.length > 0) replacementId = fallbackAny[0];
   }
 
+  if (!replacementId) {
+    const emergencyNeverShown = await selectEmergencyNeverShownItemId(
+      env,
+      userId,
+      targetDate,
+      excludedIds,
+      todaySources,
+    );
+    if (emergencyNeverShown) replacementId = emergencyNeverShown;
+  }
+
+  if (!replacementId) {
+    // Absolute final guard: pick anything active for this user (even previously shown).
+    const emergencyAny = await selectEmergencyAnyItemId(env, userId, excludedIds);
+    if (emergencyAny) replacementId = emergencyAny;
+  }
+
   if (replacementId) {
     const replacementSource = await env.DB.prepare("SELECT source_id FROM items WHERE id = ? LIMIT 1")
       .bind(replacementId)
@@ -803,7 +835,14 @@ async function handlePostFeedReplacement(request: Request, env: Env, userId: num
       .run();
   }
 
-  if (!replacementId) return json({ item: null });
+  if (!replacementId) return json({ item: null, reason: "replacement_unavailable" });
+
+  // Monitor the replaced source in the background every 10 minutes for a while
+  // so future replacement requests can find richer content.
+  if (replacedItemMeta?.source_id) {
+    await enqueueReplacementMonitor(env, userId, replacedItemMeta.source_id, replacedItemMeta.url);
+  }
+
   const finalReplacement = await env.DB.prepare(`
     SELECT i.id, i.title, i.url, i.summary, i.thumbnail_url,
            s.name AS sourceName, s.type AS sourceType, us.level AS sourceLevel,
@@ -816,6 +855,71 @@ async function handlePostFeedReplacement(request: Request, env: Env, userId: num
     LIMIT 1
   `).bind(userId, userId, replacementId).first();
   return json({ item: finalReplacement ? sanitizeFeedItemText(finalReplacement as Record<string, unknown>) : null });
+}
+
+async function selectEmergencyNeverShownItemId(
+  env: Env,
+  userId: number,
+  targetDate: string,
+  excludeItemIds: number[],
+  preferredExcludeSourceIds: number[],
+) {
+  const itemExclusion = buildInClause("i.id", excludeItemIds);
+  const sourceExclusion = buildInClause("i.source_id", preferredExcludeSourceIds);
+  const query = async (withSourceExclusion: boolean) => {
+    const row = await env.DB.prepare(`
+      SELECT i.id
+      FROM items i
+      JOIN user_sources us ON us.user_id = ? AND us.source_id = i.source_id AND us.is_active = 1
+      JOIN sources s ON s.id = i.source_id
+      LEFT JOIN user_notes n ON n.user_id = ? AND n.item_id = i.id
+      WHERE i.status = 'active'
+        AND ${buildSqlAssetExclusion("i")}
+        AND RTRIM(i.url, '/') != RTRIM(s.url, '/')
+        AND (n.content IS NULL OR trim(n.content) = '')
+        AND NOT EXISTS (
+          SELECT 1
+          FROM user_feed_slots fs
+          WHERE fs.user_id = ? AND fs.item_id = i.id
+        )
+        ${itemExclusion.sql}
+        ${withSourceExclusion ? sourceExclusion.sql : ""}
+      ORDER BY i.id DESC
+      LIMIT 1
+    `).bind(
+      userId,
+      userId,
+      userId,
+      ...itemExclusion.params,
+      ...(withSourceExclusion ? sourceExclusion.params : []),
+    ).first<{ id: number }>();
+    return row?.id ?? null;
+  };
+
+  const preferred = await query(true);
+  if (preferred) return preferred;
+
+  // Try refreshing user sources once and retry.
+  await ensureItemsFromSources(env, undefined, userId);
+  await fillDateIfNeeded(targetDate, env, userId);
+  return await query(false);
+}
+
+async function selectEmergencyAnyItemId(env: Env, userId: number, excludeItemIds: number[]) {
+  const itemExclusion = buildInClause("i.id", excludeItemIds);
+  const row = await env.DB.prepare(`
+    SELECT i.id
+    FROM items i
+    JOIN user_sources us ON us.user_id = ? AND us.source_id = i.source_id AND us.is_active = 1
+    JOIN sources s ON s.id = i.source_id
+    WHERE i.status = 'active'
+      AND ${buildSqlAssetExclusion("i")}
+      AND RTRIM(i.url, '/') != RTRIM(s.url, '/')
+      ${itemExclusion.sql}
+    ORDER BY i.id DESC
+    LIMIT 1
+  `).bind(userId, ...itemExclusion.params).first<{ id: number }>();
+  return row?.id ?? null;
 }
 
 async function handleGetSourceMemos(sourceId: number, env: Env, userId: number) {
@@ -969,6 +1073,8 @@ async function handlePostItemReport(
   }>();
 
   if (!item) return json({ error: "item not found" }, { status: 404 });
+
+  await enqueueReplacementMonitor(env, userId, item.source_id, item.url);
 
   // --- Attempt to re-fetch and repair ---
   const html = await fetchSourceText(item.url, "text/html,application/xhtml+xml");
@@ -3678,6 +3784,104 @@ async function ensureUserScopedTables(env: Env) {
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     )
   `).run();
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS user_replacement_monitors (
+      user_id INTEGER NOT NULL,
+      source_id INTEGER NOT NULL,
+      seed_url TEXT,
+      next_check_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      last_checked_at TEXT,
+      failure_count INTEGER NOT NULL DEFAULT 0,
+      is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+      expires_at TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (user_id, source_id),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE
+    )
+  `).run();
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_replacement_monitors_due
+    ON user_replacement_monitors(is_active, next_check_at)
+  `).run();
+}
+
+async function enqueueReplacementMonitor(env: Env, userId: number, sourceId: number, seedUrl?: string | null) {
+  if (!Number.isFinite(userId) || !Number.isFinite(sourceId)) return;
+  await ensureUserScopedTables(env);
+  await env.DB.prepare(`
+    INSERT INTO user_replacement_monitors (
+      user_id, source_id, seed_url, next_check_at, last_checked_at, failure_count, is_active, expires_at, updated_at
+    )
+    VALUES (?, ?, ?, CURRENT_TIMESTAMP, NULL, 0, 1, datetime('now', '+24 hours'), CURRENT_TIMESTAMP)
+    ON CONFLICT(user_id, source_id) DO UPDATE SET
+      seed_url = COALESCE(excluded.seed_url, user_replacement_monitors.seed_url),
+      next_check_at = CURRENT_TIMESTAMP,
+      failure_count = 0,
+      is_active = 1,
+      expires_at = datetime('now', '+24 hours'),
+      updated_at = CURRENT_TIMESTAMP
+  `).bind(userId, sourceId, seedUrl ?? null).run();
+}
+
+async function processReplacementMonitorQueue(env: Env) {
+  await ensureUserScopedTables(env);
+  await ensureSourceRefreshTable(env);
+  const due = await env.DB.prepare(`
+    SELECT user_id, source_id
+    FROM user_replacement_monitors
+    WHERE is_active = 1
+      AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
+      AND next_check_at <= CURRENT_TIMESTAMP
+    ORDER BY next_check_at ASC
+    LIMIT 20
+  `).all<{ user_id: number; source_id: number }>();
+
+  for (const row of due.results ?? []) {
+    const userId = Number(row.user_id);
+    const sourceId = Number(row.source_id);
+    try {
+      const source = await env.DB.prepare(`
+        SELECT s.id, s.name, s.url, s.type
+        FROM user_sources us
+        JOIN sources s ON s.id = us.source_id
+        WHERE us.user_id = ? AND us.source_id = ? AND us.is_active = 1
+        LIMIT 1
+      `).bind(userId, sourceId).first<{ id: number; name: string; url: string; type: SourceType }>();
+      if (!source) {
+        await env.DB.prepare(`
+          UPDATE user_replacement_monitors
+          SET is_active = 0, updated_at = CURRENT_TIMESTAMP
+          WHERE user_id = ? AND source_id = ?
+        `).bind(userId, sourceId).run();
+        continue;
+      }
+
+      await hydrateSourceItems(source, env, true);
+      await ensureItemsFromSources(env, undefined, userId);
+      await fillDateIfNeeded(getTodayIso(), env, userId);
+
+      await env.DB.prepare(`
+        UPDATE user_replacement_monitors
+        SET last_checked_at = CURRENT_TIMESTAMP,
+            next_check_at = datetime('now', '+10 minutes'),
+            failure_count = 0,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE user_id = ? AND source_id = ?
+      `).bind(userId, sourceId).run();
+    } catch {
+      await env.DB.prepare(`
+        UPDATE user_replacement_monitors
+        SET last_checked_at = CURRENT_TIMESTAMP,
+            next_check_at = datetime('now', '+10 minutes'),
+            failure_count = failure_count + 1,
+            is_active = CASE WHEN failure_count >= 12 THEN 0 ELSE is_active END,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE user_id = ? AND source_id = ?
+      `).bind(userId, sourceId).run();
+    }
+  }
 }
 
 function parseGoogleAudiences(env: Env) {
