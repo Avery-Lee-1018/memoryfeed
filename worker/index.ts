@@ -13,7 +13,7 @@ type ReactionType = "keep" | "skip";
 type SourceType = "rss" | "blog";
 type SourceLevel = "core" | "focus" | "light";
 const FEED_START_DATE = "2026-04-01";
-const ENTRY_LIMIT_PER_SOURCE = 18;
+const ENTRY_LIMIT_PER_SOURCE = 30;
 const KOREAN_ACCEPT_LANGUAGE = "ko-KR,ko;q=0.95,en-US;q=0.7,en;q=0.6";
 const CRAWLER_USER_AGENT = "Mozilla/5.0 (compatible; MemoryFeedBot/1.0)";
 const ADMIN_HEADER = "x-memoryfeed-key";
@@ -400,6 +400,7 @@ async function handleGetFeedToday(url: URL, env: Env, ctx: ExecutionContext, use
     ensureFeedSlotsTable(env),
     cleanupDemoData(env),
     cleanupLegacyDisplayArtifacts(env),
+    cleanupWeakNumericTitles(env),
   ]));
   const targetDate = getDateParamOrToday(url.searchParams.get("date"));
   await ensureUserSourcesSeeded(env, userId);
@@ -1376,6 +1377,9 @@ async function ingestItemsForSource(
         }
       }
     }
+    if (isWeakEntryTitle(resolvedTitle, source.name)) {
+      resolvedTitle = buildFallbackTitleFromSummary(resolvedSummary ?? "", source.name);
+    }
 
     const result = await env.DB.prepare(`
       INSERT INTO items (source_id, title, url, summary, thumbnail_url, status, shown_date)
@@ -1387,6 +1391,7 @@ async function ingestItemsForSource(
           WHEN items.title LIKE 'http://%' OR items.title LIKE 'https://%' THEN excluded.title
           WHEN items.title LIKE '%&#%' THEN excluded.title
           WHEN items.title LIKE '%]]>%' THEN excluded.title
+          WHEN length(trim(items.title)) <= 8 AND trim(items.title) NOT GLOB '*[^0-9]*' THEN excluded.title
           WHEN items.title LIKE '%!%%' ESCAPE '!' THEN excluded.title
           ELSE items.title
         END,
@@ -1630,7 +1635,7 @@ function collectEntriesFromHtmlLinks(html: string, pageUrl: string) {
     if (entries.length >= ENTRY_LIMIT_PER_SOURCE) return;
     const normalized = normalizeEntryUrl(decodeXml(rawUrl.trim()), pageUrl);
     if (!normalized) return;
-    if (!isLikelyArticleUrl(normalized, host)) return;
+    if (!isLikelyArticleUrl(normalized, host) && !isFallbackContentUrl(normalized, host)) return;
     const key = canonicalEntryKey(normalized);
     if (!key || seen.has(key)) return;
     seen.add(key);
@@ -1683,7 +1688,7 @@ function buildSitemapEntries(urls: string[], seedUrl: string) {
   const entries: SourceEntry[] = [];
 
   for (const candidate of urls) {
-    if (!isLikelyArticleUrl(candidate, seedHost)) continue;
+    if (!isLikelyArticleUrl(candidate, seedHost) && !isFallbackContentUrl(candidate, seedHost)) continue;
     const key = canonicalEntryKey(candidate);
     if (!key || seenKey.has(key)) continue;
     seenKey.add(key);
@@ -1939,6 +1944,21 @@ async function cleanupLegacyDisplayArtifacts(env: Env) {
   `).run();
 }
 
+async function cleanupWeakNumericTitles(env: Env) {
+  await env.DB.prepare(`
+    UPDATE items
+    SET title = (
+      SELECT s.name
+      FROM sources s
+      WHERE s.id = items.source_id
+      LIMIT 1
+    )
+    WHERE length(trim(COALESCE(title, ''))) <= 8
+      AND trim(COALESCE(title, '')) != ''
+      AND trim(title) NOT GLOB '*[^0-9]*'
+  `).run();
+}
+
 function safeHost(url: string) {
   return extractSourceHost(url);
 }
@@ -2015,6 +2035,34 @@ function isLikelyArticleUrl(url: string, seedHost: string) {
   }
 }
 
+function isFallbackContentUrl(url: string, seedHost: string) {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+    const host = parsed.hostname.toLowerCase();
+    if (seedHost && host !== seedHost) return false;
+
+    const path = parsed.pathname.replace(/\/+$/, "");
+    if (!path || path === "/") return false;
+    if (/\.(css|js|json|xml|txt|png|jpe?g|gif|svg|webp|avif|ico|pdf|zip)$/i.test(path)) return false;
+    if (
+      path.startsWith("/tag/") ||
+      path.startsWith("/tags/") ||
+      path.startsWith("/category/") ||
+      path.startsWith("/categories/") ||
+      path.startsWith("/author/") ||
+      path.startsWith("/authors/") ||
+      path.startsWith("/topic/") ||
+      path.startsWith("/topics/")
+    ) return false;
+    const tail = path.split("/").filter(Boolean).pop()?.toLowerCase() || "";
+    if (["feed", "rss", "atom", "index", "page", "about", "contact"].includes(tail)) return false;
+    return tail.length >= 4;
+  } catch {
+    return false;
+  }
+}
+
 function isWeakEntryTitle(title: string, sourceName: string) {
   // Detect un-decoded percent-encoding before normalizing (e.g. "%ED%85%8C").
   if (/%[0-9A-Fa-f]{2}/.test(title)) return true;
@@ -2033,6 +2081,14 @@ function pickBestSummary(primary: string, fallback: string) {
   return isUsableSummary(cleanedFallback) ? cleanedFallback : "";
 }
 
+function buildFallbackTitleFromSummary(summary: string, sourceName: string) {
+  const cleaned = normalizeDisplayText(summary);
+  if (cleaned.length >= 10) {
+    return cleaned.slice(0, 56).trim();
+  }
+  return sourceName;
+}
+
 function isUsableSummary(summary: string) {
   if (!summary) return false;
   if (summary === "*" || summary === "-") return false;
@@ -2047,12 +2103,14 @@ function deriveTitleFromUrl(url: string) {
     const last = parts[parts.length - 1] || "";
     if (!last) return "";
     const decoded = decodeUrlSlug(last);
-    return decoded
+    const cleaned = decoded
       .replace(/[-_]+/g, " ")
       .replace(/[?&]source=[^\s]+/gi, "")
       .replace(/\b[a-f0-9]{8,}\b$/i, "")
       .replace(/\.[a-z0-9]+$/i, "")
       .trim();
+    if (/^\d{3,8}$/.test(cleaned)) return "";
+    return cleaned;
   } catch {
     return "";
   }
