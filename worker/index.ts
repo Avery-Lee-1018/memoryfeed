@@ -42,8 +42,9 @@ export default {
       const url = new URL(request.url);
       let sessionUserId: number | null = null;
       if (isUserScopedRoute(request.method, url.pathname)) {
-        await ensureAuthTables(env);
-        await ensureUserScopedTables(env);
+        // DDL ensure-calls are idempotent — tables already exist in production (created by migrations).
+        // Run them in the background so they don't block the response path.
+        ctx.waitUntil(Promise.allSettled([ensureAuthTables(env), ensureUserScopedTables(env)]));
         const auth = await authenticateSession(request, env);
         if (!auth.ok) {
           return withCorsIfNeeded(request, env, json({ error: auth.error }, { status: 401 }));
@@ -215,27 +216,15 @@ function isHostRelated(hostA: string, hostB: string) {
 }
 
 async function isAllowedSourcePageUrl(targetUrl: string, env: Env, userId: number) {
-  let targetHost: string;
-  try {
-    targetHost = new URL(targetUrl).hostname;
-  } catch {
-    return false;
-  }
-  const rows = await env.DB.prepare(`
-    SELECT s.url AS url
-    FROM user_sources us
-    JOIN sources s ON s.id = us.source_id
-    WHERE us.user_id = ? AND us.is_active = 1
-  `).bind(userId).all<{ url: string }>();
-  for (const row of rows.results ?? []) {
-    try {
-      const sourceHost = new URL(row.url).hostname;
-      if (isHostRelated(targetHost, sourceHost)) return true;
-    } catch {
-      // ignore malformed source URL
-    }
-  }
-  return false;
+  // Check by exact item URL — avoids false negatives when source feed URL
+  // is hosted on a different domain than article URLs (e.g. Feedburner CDNs).
+  const row = await env.DB.prepare(`
+    SELECT 1 FROM items i
+    JOIN user_sources us ON us.source_id = i.source_id
+    WHERE us.user_id = ? AND us.is_active = 1 AND i.url = ?
+    LIMIT 1
+  `).bind(userId, targetUrl).first();
+  return row !== null;
 }
 
 function isSafeImageHost(imageUrl: string, pageUrl: string) {
@@ -406,12 +395,16 @@ async function ensureFeedSlotsTable(env: Env) {
 }
 
 async function handleGetFeedToday(url: URL, env: Env, ctx: ExecutionContext, userId: number) {
-  await ensureFeedSlotsTable(env);
-  await cleanupDemoData(env);
-  await cleanupLegacyDisplayArtifacts(env);
-  await ensureUserSourcesSeeded(env, userId);
-  await ensureItemsFromSources(env, userId);
+  // DDL and one-time cleanup tasks don't block the response — run them in background.
+  ctx.waitUntil(Promise.allSettled([
+    ensureFeedSlotsTable(env),
+    cleanupDemoData(env),
+    cleanupLegacyDisplayArtifacts(env),
+  ]));
   const targetDate = getDateParamOrToday(url.searchParams.get("date"));
+  await ensureUserSourcesSeeded(env, userId);
+  await pruneDateItemsDuplicatedAcrossOtherDates(env, userId, targetDate);
+  await ensureItemsFromSources(env, userId);
   await backfillFeedsUntilDate(targetDate, env, userId);
   let result = await queryDistinctDateItems(targetDate, env, userId);
 
@@ -600,7 +593,7 @@ async function handlePostFeedReplacement(request: Request, env: Env, userId: num
   }
 
   if (!replacementId) {
-    // Last-resort: allow any item even if already used on another date.
+    // Last-resort: allow memoed items, but keep cross-date uniqueness.
     const fallbackAny = await selectCandidateItemIds(env, {
       userId,
       limit: 1,
@@ -608,7 +601,6 @@ async function handlePostFeedReplacement(request: Request, env: Env, userId: num
       excludeSourceIds: [],
       requireNoMemo: false,
       distinctBySource: false,
-      excludeAssigned: false,
     });
     if (fallbackAny.length > 0) replacementId = fallbackAny[0];
   }
@@ -775,9 +767,14 @@ async function recoverEmptyFeedForUser(targetDate: string, env: Env, userId: num
     JOIN user_sources us ON us.user_id = ? AND us.source_id = i.source_id
     WHERE us.is_active = 1
       AND i.status = 'active'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM user_feed_slots fs
+        WHERE fs.user_id = ? AND fs.item_id = i.id
+      )
     ORDER BY RANDOM()
     LIMIT 3
-  `).bind(userId).all<{ itemId: number; sourceId: number }>();
+  `).bind(userId, userId).all<{ itemId: number; sourceId: number }>();
 
   let slot = 0;
   for (const row of fallbackItems.results ?? []) {
@@ -1154,6 +1151,7 @@ async function fillDateIfNeeded(targetDate: string, env: Env, userId: number) {
           AND us.is_active = 1
       )
   `).bind(userId, targetDate).run();
+  await pruneDateItemsDuplicatedAcrossOtherDates(env, userId, targetDate);
 
   const existing = await env.DB.prepare(`
     SELECT slot_index, item_id, source_id
@@ -1236,15 +1234,14 @@ async function fillDateIfNeeded(targetDate: string, env: Env, userId: number) {
   const finalMissing = [0, 1, 2].filter((slot) => !finalSet.has(slot));
   if (finalMissing.length <= 0) return;
 
-  // Last-resort pass: allow reuse of items already on other dates if pool is exhausted.
+  // Last-resort pass: allow memoed items, but never reuse items assigned on other dates.
   const relaxed = await selectCandidateItemIds(env, {
     userId,
     limit: finalMissing.length,
     excludeItemIds: currentIds,
     excludeSourceIds: [],
-    requireNoMemo: true,
+    requireNoMemo: false,
     distinctBySource: false,
-    excludeAssigned: false,
   });
 
   let relaxedCursor = 0;
@@ -1258,6 +1255,20 @@ async function fillDateIfNeeded(targetDate: string, env: Env, userId: number) {
       VALUES (?, ?, ?, ?, ?)
     `).bind(userId, targetDate, slot, id, sourceRow.source_id).run();
   }
+}
+
+async function pruneDateItemsDuplicatedAcrossOtherDates(env: Env, userId: number, targetDate: string) {
+  await env.DB.prepare(`
+    DELETE FROM user_feed_slots
+    WHERE user_id = ? AND date = ?
+      AND EXISTS (
+        SELECT 1
+        FROM user_feed_slots fs2
+        WHERE fs2.user_id = user_feed_slots.user_id
+          AND fs2.item_id = user_feed_slots.item_id
+          AND fs2.date <> user_feed_slots.date
+      )
+  `).bind(userId, targetDate).run();
 }
 
 async function backfillFeedsUntilDate(targetDate: string, env: Env, userId: number) {
