@@ -1079,9 +1079,15 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
           ) AS source_rank
         FROM items i
         JOIN user_sources us ON us.user_id = ? AND us.source_id = i.source_id
+        JOIN sources s ON s.id = i.source_id
         LEFT JOIN user_notes n ON n.item_id = i.id AND n.user_id = ?
         WHERE i.status = 'active'
           AND us.is_active = 1
+          AND NOT (
+            RTRIM(i.url, '/') = RTRIM(s.url, '/')
+            AND (i.summary IS NULL OR trim(i.summary) = '')
+            AND lower(trim(COALESCE(i.title, ''))) = lower(trim(COALESCE(s.name, '')))
+          )
           ${memoClause}
           ${assignedClause}
           ${itemExclusion.sql}
@@ -1110,9 +1116,15 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
     SELECT i.id
     FROM items i
     JOIN user_sources us ON us.user_id = ? AND us.source_id = i.source_id
+    JOIN sources s ON s.id = i.source_id
     LEFT JOIN user_notes n ON n.item_id = i.id AND n.user_id = ?
     WHERE i.status = 'active'
       AND us.is_active = 1
+      AND NOT (
+        RTRIM(i.url, '/') = RTRIM(s.url, '/')
+        AND (i.summary IS NULL OR trim(i.summary) = '')
+        AND lower(trim(COALESCE(i.title, ''))) = lower(trim(COALESCE(s.name, '')))
+      )
       ${memoClause}
       ${assignedClause}
       ${itemExclusion.sql}
@@ -1285,7 +1297,18 @@ async function cleanupDemoData(env: Env) {
 
 async function ensureItemsFromSources(env: Env, userId: number) {
   const rows = await env.DB.prepare(`
-    SELECT s.id, s.name, s.url, s.type, COUNT(i.id) AS itemCount
+    SELECT
+      s.id,
+      s.name,
+      s.url,
+      s.type,
+      COUNT(i.id) AS itemCount,
+      SUM(CASE WHEN RTRIM(i.url, '/') = RTRIM(s.url, '/') THEN 1 ELSE 0 END) AS rootUrlCount,
+      SUM(CASE
+        WHEN i.summary IS NULL OR trim(i.summary) = ''
+          THEN CASE WHEN lower(trim(COALESCE(i.title, ''))) = lower(trim(COALESCE(s.name, ''))) THEN 1 ELSE 0 END
+        ELSE 0
+      END) AS weakTitleCount
     FROM user_sources us
     JOIN sources s ON s.id = us.source_id
     LEFT JOIN items i ON i.source_id = s.id
@@ -1301,8 +1324,18 @@ async function ensureItemsFromSources(env: Env, userId: number) {
       type: (row.type === "rss" ? "rss" : "blog") as SourceType,
     };
     const itemCount = Number(row.itemCount ?? 0);
+    const rootUrlCount = Number(row.rootUrlCount ?? 0);
+    const weakTitleCount = Number(row.weakTitleCount ?? 0);
     if (itemCount === 0) {
       await seedItemForSource(source, env);
+      continue;
+    }
+
+    // If this source is effectively only showing a homepage placeholder, try re-hydration now.
+    const onlyRootLikeItems =
+      itemCount > 0 && (rootUrlCount >= itemCount || weakTitleCount >= itemCount);
+    if (onlyRootLikeItems) {
+      await hydrateSourceItems(source, env);
     }
   }
 }
