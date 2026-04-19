@@ -692,6 +692,13 @@ async function queryDistinctDateItems(targetDate: string, env: Env, userId: numb
       AND fs.user_id = ?
       AND i.status = 'active'
       AND us.is_active = 1
+      AND NOT EXISTS (
+        SELECT 1
+        FROM user_hidden_items uhi
+        WHERE uhi.user_id = fs.user_id
+          AND uhi.date = fs.date
+          AND uhi.item_id = fs.item_id
+      )
       AND ${buildSqlAssetExclusion("i")}
     ORDER BY fs.slot_index ASC
     LIMIT 3
@@ -723,6 +730,10 @@ async function handlePostFeedReplacement(request: Request, env: Env, userId: num
     : null;
   if (!slot) {
     return json({ item: null, reason: "item_not_in_today_slots" });
+  }
+
+  if (Number.isInteger(body.replaceItemId)) {
+    await hideItemForDate(env, userId, targetDate, Number(body.replaceItemId));
   }
 
   const replacedItemMeta = Number.isInteger(body.replaceItemId)
@@ -829,6 +840,20 @@ async function handlePostFeedReplacement(request: Request, env: Env, userId: num
     // Absolute final guard: pick anything active for this user (even previously shown).
     const emergencyAny = await selectEmergencyAnyItemId(env, userId, excludedIds, blockedDedupKey);
     if (emergencyAny) replacementId = emergencyAny;
+  }
+
+  if (!replacementId) {
+    // Hidden slot recovery: refill today's slots and reuse whatever landed in the same slot index.
+    await fillDateIfNeeded(targetDate, env, userId);
+    const slotted = await env.DB.prepare(`
+      SELECT item_id
+      FROM user_feed_slots
+      WHERE user_id = ? AND date = ? AND slot_index = ?
+      LIMIT 1
+    `).bind(userId, targetDate, slot.slot_index).first<{ item_id: number }>();
+    if (slotted?.item_id && Number.isFinite(Number(slotted.item_id))) {
+      replacementId = Number(slotted.item_id);
+    }
   }
 
   if (replacementId) {
@@ -1965,6 +1990,13 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
         LEFT JOIN user_notes n ON n.item_id = i.id AND n.user_id = ?
         WHERE i.status = 'active'
           AND us.is_active = 1
+          AND NOT EXISTS (
+            SELECT 1
+            FROM user_hidden_items uhi
+            WHERE uhi.user_id = ?
+              AND uhi.date = ?
+              AND uhi.item_id = i.id
+          )
           AND ${buildSqlAssetExclusion("i")}
           AND RTRIM(i.url, '/') != RTRIM(s.url, '/')
           ${memoClause}
@@ -1984,6 +2016,8 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
     `).bind(
       userId,
       userId,
+      userId,
+      targetDate,
       ...(options.excludeAssigned !== false ? [userId, targetDate] : []),
       ...itemExclusion.params,
       ...sourceExclusion.params,
@@ -2017,6 +2051,13 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
     LEFT JOIN user_notes n ON n.item_id = i.id AND n.user_id = ?
     WHERE i.status = 'active'
       AND us.is_active = 1
+      AND NOT EXISTS (
+        SELECT 1
+        FROM user_hidden_items uhi
+        WHERE uhi.user_id = ?
+          AND uhi.date = ?
+          AND uhi.item_id = i.id
+      )
       AND ${buildSqlAssetExclusion("i")}
       AND RTRIM(i.url, '/') != RTRIM(s.url, '/')
       ${memoClause}
@@ -2028,6 +2069,8 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
   `).bind(
     userId,
     userId,
+    userId,
+    targetDate,
     ...(options.excludeAssigned !== false ? [userId, targetDate] : []),
     ...itemExclusion.params,
     ...sourceExclusion.params,
@@ -2097,6 +2140,17 @@ async function fillDateIfNeeded(targetDate: string, env: Env, userId: number) {
         WHERE us.user_id = user_feed_slots.user_id
           AND us.source_id = user_feed_slots.source_id
           AND us.is_active = 1
+      )
+  `).bind(userId, targetDate).run();
+  await env.DB.prepare(`
+    DELETE FROM user_feed_slots
+    WHERE user_id = ? AND date = ?
+      AND EXISTS (
+        SELECT 1
+        FROM user_hidden_items uhi
+        WHERE uhi.user_id = user_feed_slots.user_id
+          AND uhi.date = user_feed_slots.date
+          AND uhi.item_id = user_feed_slots.item_id
       )
   `).bind(userId, targetDate).run();
   await pruneDateItemsDuplicatedAcrossOtherDates(env, userId, targetDate);
@@ -3827,6 +3881,21 @@ async function ensureUserScopedTables(env: Env) {
     )
   `).run();
   await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS user_hidden_items (
+      user_id INTEGER NOT NULL,
+      date TEXT NOT NULL,
+      item_id INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (user_id, date, item_id),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
+    )
+  `).run();
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user_date
+    ON user_hidden_items(user_id, date)
+  `).run();
+  await env.DB.prepare(`
     CREATE TABLE IF NOT EXISTS user_replacement_monitors (
       user_id INTEGER NOT NULL,
       source_id INTEGER NOT NULL,
@@ -3847,6 +3916,19 @@ async function ensureUserScopedTables(env: Env) {
     CREATE INDEX IF NOT EXISTS idx_replacement_monitors_due
     ON user_replacement_monitors(is_active, next_check_at)
   `).run();
+}
+
+async function hideItemForDate(env: Env, userId: number, targetDate: string, itemId: number) {
+  if (!Number.isFinite(userId) || !Number.isFinite(itemId) || !targetDate) return;
+  await ensureUserScopedTables(env);
+  await env.DB.prepare(`
+    INSERT OR IGNORE INTO user_hidden_items (user_id, date, item_id)
+    VALUES (?, ?, ?)
+  `).bind(userId, targetDate, itemId).run();
+  await env.DB.prepare(`
+    DELETE FROM user_feed_slots
+    WHERE user_id = ? AND date = ? AND item_id = ?
+  `).bind(userId, targetDate, itemId).run();
 }
 
 async function enqueueReplacementMonitor(env: Env, userId: number, sourceId: number, seedUrl?: string | null) {
