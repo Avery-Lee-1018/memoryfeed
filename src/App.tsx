@@ -22,6 +22,7 @@ import type { SourceEntry } from "@/types/source";
 import { fetchMe, logout, type AuthUser } from "@/lib/auth-session";
 
 const SKELETON_MIN_MS = 500;
+const REPORT_TIMEOUT_MS = 6000;
 const AUTO_RELOAD_SYNC_MS = 3 * 60 * 1000;
 const PENDING_UNCLASSIFIED_KEY = "memoryfeed.pendingUnclassifiedSourceIds.v1";
 
@@ -247,15 +248,8 @@ export default function App() {
   useEffect(() => {
     if (sources.length === 0) return;
     const existing = new Set(sources.map((s) => s.id));
+    // Keep "미분류" visible until the user explicitly classifies by drag/drop.
     setPendingSourceIds((prev) => prev.filter((id) => existing.has(id)));
-    // Auto-resolve from unclassified after actual interaction starts.
-    setPendingSourceIds((prev) =>
-      prev.filter((id) => {
-        const s = sources.find((x) => x.id === id);
-        if (!s) return false;
-        return s.exposureCount === 0 && s.memoCount === 0;
-      })
-    );
   }, [sources]);
 
   useEffect(() => {
@@ -332,14 +326,35 @@ export default function App() {
     const currentItemIds = items.map((item) => item.id);
     const startedAt = Date.now();
     setReplacingIds((prev) => new Set(prev).add(id));
-    const res = await authorizedFetch(`/api/items/${id}/report`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ issues: payload.issues, details: payload.details }),
-    });
-    const data = (await res.json()) as { repaired: boolean; item?: FeedItem | null; reason?: string };
-    if (data.repaired && data.item) {
-      setItems((prev) => prev.map((item) => (item.id === id ? data.item! : item)));
+    let repairedItem: FeedItem | null = null;
+    let reportTimeoutOrError = false;
+    try {
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), REPORT_TIMEOUT_MS);
+      try {
+        const res = await authorizedFetch(`/api/items/${id}/report`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ issues: payload.issues, details: payload.details }),
+          signal: controller.signal,
+        });
+        if (res.ok) {
+          const data = (await res.json()) as { repaired: boolean; item?: FeedItem | null; reason?: string };
+          if (data.repaired && data.item) {
+            repairedItem = data.item;
+          }
+        } else {
+          reportTimeoutOrError = true;
+        }
+      } finally {
+        window.clearTimeout(timeout);
+      }
+    } catch {
+      reportTimeoutOrError = true;
+    }
+
+    if (repairedItem) {
+      setItems((prev) => prev.map((item) => (item.id === id ? repairedItem! : item)));
       const elapsed = Date.now() - startedAt;
       if (elapsed < SKELETON_MIN_MS) await new Promise((r) => setTimeout(r, SKELETON_MIN_MS - elapsed));
       setReplacingIds((prev) => {
@@ -353,23 +368,40 @@ export default function App() {
       });
       return;
     }
-    // Not repaired — fetch a replacement card
-    const repRes = await authorizedFetch("/api/feed/replacement", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ excludeItemIds: currentItemIds, date: selectedDate, replaceItemId: id }),
-    });
-    const repData = (await repRes.json()) as { item?: FeedItem | null };
-    if (repData.item) {
-      setItems((prev) => prev.map((item) => (item.id === id ? repData.item! : item)));
+
+    // Not repaired or report endpoint timed out/failed — fetch a replacement card.
+    let replacementItem: FeedItem | null = null;
+    try {
+      const repRes = await authorizedFetch("/api/feed/replacement", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ excludeItemIds: currentItemIds, date: selectedDate, replaceItemId: id }),
+      });
+      if (repRes.ok) {
+        const repData = (await repRes.json()) as { item?: FeedItem | null };
+        replacementItem = repData.item ?? null;
+      }
+    } catch {
+      replacementItem = null;
+    }
+
+    if (replacementItem) {
+      setItems((prev) => prev.map((item) => (item.id === id ? replacementItem! : item)));
+      if (reportTimeoutOrError) {
+        setToast({
+          tone: "warning",
+          title: "응답이 지연되어 새 콘텐츠로 교체했어요",
+        });
+      }
     } else {
-      // Guarantee deterministic outcome: if not fixable and no replacement, remove from current feed.
+      // Deterministic outcome: if not fixable and no replacement, remove from current feed.
       setItems((prev) => prev.filter((item) => item.id !== id));
       setToast({
         tone: "warning",
         title: "문제 콘텐츠를 피드에서 제외했어요",
       });
     }
+
     const elapsed = Date.now() - startedAt;
     if (elapsed < SKELETON_MIN_MS) await new Promise((r) => setTimeout(r, SKELETON_MIN_MS - elapsed));
     setReplacingIds((prev) => {
@@ -450,11 +482,11 @@ export default function App() {
       }
       setToast(buildSourceResultToast(data));
       if ((data.added ?? 0) > 0 || (data.duplicateCount ?? 0) > 0) {
-        const hosts = [...new Set((data.addedUrls ?? []).map(extractHost).filter(Boolean))];
-        if (hosts.length > 0) {
-          onboardingScheduledRef.current.clear();
-          setOnboardingHosts(hosts);
-          setOnboardingSourceIds([]);
+        const sourceIds = (data.sourceIds ?? []).filter((id): id is number => Number.isFinite(id));
+        if (sourceIds.length > 0) {
+          setOnboardingHosts([]);
+          setOnboardingSourceIds(sourceIds);
+          setPendingSourceIds((prev) => [...new Set([...prev, ...sourceIds])]);
         }
         void loadSources(false);
         void loadFeed(selectedDate);
@@ -484,12 +516,6 @@ export default function App() {
         description: "http/https 링크를 한 줄씩 붙여넣어 주세요.",
       });
       return;
-    }
-    // Start onboarding interaction immediately after CTA.
-    const hosts = [...new Set(parsed.urls.map(extractHost).filter(Boolean))];
-    if (hosts.length > 0) {
-      onboardingScheduledRef.current.clear();
-      setOnboardingHosts(hosts);
     }
     const result = await postSources({ rawText: sourceInput });
     if (!result?.ok) {

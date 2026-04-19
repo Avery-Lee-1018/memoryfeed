@@ -484,9 +484,9 @@ export default function MySourcesView({
                       target="_blank"
                       rel="noopener noreferrer"
                       draggable={false}
-                      className="inline-flex items-center gap-1 line-clamp-1 text-xs text-zinc-600 underline decoration-zinc-300 underline-offset-2 hover:text-zinc-900 hover:decoration-zinc-500"
+                      className="mt-0.5 flex w-full items-start gap-1 text-xs text-zinc-600 underline decoration-zinc-300 underline-offset-2 break-all hover:text-zinc-900 hover:decoration-zinc-500"
                     >
-                      {source.type === "rss" && <i className="ri-rss-line text-[11px] text-zinc-300" aria-hidden />}
+                      {source.type === "rss" && <i className="ri-rss-line mt-0.5 shrink-0 text-[11px] text-zinc-300" aria-hidden />}
                       {source.type === "rss" ? resolveSourceOpenUrl(source) : source.url}
                     </a>
                   </CardHeader>
@@ -698,9 +698,9 @@ export default function MySourcesView({
                           href={resolveSourceOpenUrl(source)}
                           target="_blank"
                           rel="noopener noreferrer"
-                          className="inline-flex items-center gap-1 line-clamp-1 text-xs text-zinc-600 underline decoration-zinc-300 underline-offset-2 hover:text-zinc-900 hover:decoration-zinc-500"
+                          className="mt-0.5 flex w-full items-start gap-1 text-xs text-zinc-600 underline decoration-zinc-300 underline-offset-2 break-all hover:text-zinc-900 hover:decoration-zinc-500"
                         >
-                          {source.type === "rss" && <i className="ri-rss-line text-[11px] text-zinc-300" aria-hidden />}
+                          {source.type === "rss" && <i className="ri-rss-line mt-0.5 shrink-0 text-[11px] text-zinc-300" aria-hidden />}
                           {source.type === "rss" ? resolveSourceOpenUrl(source) : source.url}
                         </a>
                       </CardHeader>

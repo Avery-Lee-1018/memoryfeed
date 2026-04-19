@@ -5,6 +5,7 @@ export type SourceBulkResult = {
   failed?: number;
   invalidCount?: number;
   duplicateCount?: number;
+  sourceIds?: number[];
   addedUrls?: string[];
   duplicateUrls?: string[];
   failedUrls?: string[];

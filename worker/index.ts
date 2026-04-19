@@ -1411,9 +1411,13 @@ async function handlePostSources(request: Request, env: Env, ctx: ExecutionConte
     }
 
     if (registeredOrReactivated > 0) {
-      await ensureItemsFromSources(env, undefined, userId);
-      await autoClassifySingleSourcesToLight(env, userId, [...touchedSourceIds]);
-      await backfillFeedsUntilDate(getTodayIso(), env, userId);
+      const touchedIds = [...touchedSourceIds];
+      ctx.waitUntil((async () => {
+        await ensureItemsFromSources(env, undefined, userId);
+        await backfillFeedsUntilDate(getTodayIso(), env, userId);
+        // Keep added sources in "미분류" until user explicitly classifies.
+        void touchedIds;
+      })());
     }
 
     const added = addedUrls.length;
@@ -1430,6 +1434,7 @@ async function handlePostSources(request: Request, env: Env, ctx: ExecutionConte
       totalCandidates,
       validUniqueCount: urls.length,
       addedUrls,
+      sourceIds: [...touchedSourceIds],
       duplicateUrls,
       failedUrls,
       invalidTokens,
@@ -1458,11 +1463,12 @@ async function handlePostSources(request: Request, env: Env, ctx: ExecutionConte
     if (match) {
       await upsertUserSourceActive(env, userId, match.id);
       await seedItemForSource(match, env);
-      await ensureItemsFromSources(env, undefined, userId);
-      await autoClassifySingleSourcesToLight(env, userId, [match.id]);
-      await backfillFeedsUntilDate(getTodayIso(), env, userId);
+      ctx.waitUntil((async () => {
+        await ensureItemsFromSources(env, undefined, userId);
+        await backfillFeedsUntilDate(getTodayIso(), env, userId);
+      })());
       ctx.waitUntil(hydrateSourceItems(match, env));
-      return json({ ok: true, duplicateByHost: true }, { status: 201 });
+      return json({ ok: true, duplicateByHost: true, sourceIds: [match.id] }, { status: 201 });
     }
   }
 
@@ -1475,13 +1481,15 @@ async function handlePostSources(request: Request, env: Env, ctx: ExecutionConte
   if (inserted) {
     await upsertUserSourceActive(env, userId, inserted.id);
     await seedItemForSource(inserted, env);
-    await ensureItemsFromSources(env, undefined, userId);
-    await autoClassifySingleSourcesToLight(env, userId, [inserted.id]);
-    await backfillFeedsUntilDate(getTodayIso(), env, userId);
+    ctx.waitUntil((async () => {
+      await ensureItemsFromSources(env, undefined, userId);
+      await backfillFeedsUntilDate(getTodayIso(), env, userId);
+    })());
     ctx.waitUntil(hydrateSourceItems(inserted, env));
+    return json({ ok: true, sourceIds: [inserted.id] }, { status: 201 });
   }
 
-  return json({ ok: true }, { status: 201 });
+  return json({ ok: true, sourceIds: [] }, { status: 201 });
 }
 
 async function upsertUserSourceActive(env: Env, userId: number, sourceId: number) {
