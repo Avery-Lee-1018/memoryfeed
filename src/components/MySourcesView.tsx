@@ -95,6 +95,12 @@ function getExtractionLabel(source: SourceEntry) {
   return source.extractionMode === "split" ? "개별 링크" : "통합 링크";
 }
 
+function getExtractionChipClass(source: SourceEntry) {
+  return source.extractionMode === "split"
+    ? "border-zinc-200 bg-zinc-100 text-zinc-700"
+    : "border-amber-200 bg-amber-50 text-amber-700";
+}
+
 function getExtractionCases(source: SourceEntry) {
   const reason = source.extractionReason ?? "UNKNOWN";
   switch (reason) {
@@ -348,7 +354,9 @@ export default function MySourcesView({
                             </span>
                           )}
                         </div>
-                        <p className="text-[11px] text-zinc-500">{getExtractionLabel(source)}</p>
+                        <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] ${getExtractionChipClass(source)}`}>
+                          {getExtractionLabel(source)}
+                        </span>
                       </div>
                       <a
                         href={resolveSourceOpenUrl(source)}
@@ -364,8 +372,9 @@ export default function MySourcesView({
                       <p className="text-xs text-zinc-700">
                         {source.exposureCount}번 떠오름 · {source.memoCount}개 메모 · {formatRecentLabel(source.lastActivityAt ?? source.lastExposedAt)}
                       </p>
-                      <p className="mt-1 text-[11px] text-zinc-500">
-                        분리 {source.splitItems ?? 0}개 · 루트 {source.rootItems ?? 0}개
+                      <p className="mt-1 inline-flex items-center gap-1 text-[11px] text-zinc-500">
+                        <i className="ri-file-list-2-line text-zinc-400" />
+                        콘텐츠 {source.splitItems ?? 0}개
                       </p>
                       {source.extractionMode !== "split" && (
                         <div className="mt-1">

@@ -175,7 +175,7 @@ export default function FeedCard({
               alt=""
               className={`h-full w-full object-cover transition-opacity duration-300 ${
                 imageLoaded ? "opacity-100" : "opacity-0"
-              } ${dimThumbnail ? "brightness-75 saturate-75" : ""}`}
+              } ${dimThumbnail ? "grayscale" : ""}`}
               loading="lazy"
               decoding="async"
               referrerPolicy="no-referrer"
@@ -185,9 +185,6 @@ export default function FeedCard({
               }}
               onLoad={() => setImageLoaded(true)}
             />
-            {dimThumbnail && (
-              <div className="pointer-events-none absolute inset-0 bg-white/20" />
-            )}
           </div>
 
           {/* Header */}
