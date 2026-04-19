@@ -14,7 +14,7 @@ type SourceType = "rss" | "blog";
 type SourceLevel = "core" | "focus" | "light";
 const FEED_START_DATE = "2026-04-01";
 const ENTRY_LIMIT_PER_SOURCE = 120;
-const ENTRY_VALIDATE_LIMIT_PER_SOURCE = 36;
+const ENTRY_VALIDATE_LIMIT_PER_SOURCE = 6;
 const RESURFACE_COOLDOWN_DAYS = 7;
 const SOURCE_REFRESH_INTERVAL_MINUTES = 45;
 const SOURCE_REFRESH_BATCH_SIZE = 4;
@@ -518,7 +518,6 @@ async function handleGetFeedToday(url: URL, env: Env, ctx: ExecutionContext, use
     await Promise.allSettled([
       rehydrateWeakShownSources(rows, env),
       rehydrateRandomWeakSource(env, userId),
-      cleanupInvalidItemsForUser(env, userId),
       ensureThumbnailsForShownItems(rows, env),
     ]);
   })());
@@ -529,7 +528,7 @@ async function handleGetFeedToday(url: URL, env: Env, ctx: ExecutionContext, use
 async function ensureDateHasThreeSlots(targetDate: string, env: Env, userId: number) {
   // Defensive self-heal: if any upstream cleanup/rehydration removed cards,
   // force date slot refill before responding.
-  for (let i = 0; i < 2; i += 1) {
+  for (let i = 0; i < 3; i += 1) {
     const current = await queryDistinctDateItems(targetDate, env, userId);
     const rows = (current.results ?? []) as Record<string, unknown>[];
     if (rows.length >= 3) return;
@@ -615,6 +614,7 @@ async function queryDistinctDateItems(targetDate: string, env: Env, userId: numb
     LEFT JOIN user_notes n ON n.item_id = i.id AND n.user_id = fs.user_id
     WHERE fs.date = ?
       AND fs.user_id = ?
+      AND i.status = 'active'
       AND us.is_active = 1
     ORDER BY fs.slot_index ASC
     LIMIT 3
@@ -1758,7 +1758,8 @@ async function ingestItemsForSource(
     const shouldStrictValidate = idx < ENTRY_VALIDATE_LIMIT_PER_SOURCE;
     let prefetchedHtml: string | null = null;
     let resolvedUrl = entry.url;
-    if (shouldStrictValidate) {
+    const shouldValidateLanding = shouldStrictValidate && shouldValidateEntryLanding(entry.url, source.url);
+    if (shouldValidateLanding) {
       const validated = await resolveValidatedLanding(entry.url, source.url);
       if (!validated) {
         if (!isProtectedContentHost(source.url)) continue;
@@ -1989,47 +1990,22 @@ async function resolveValidatedLanding(entryUrl: string, sourceUrl: string): Pro
   return best;
 }
 
+function shouldValidateEntryLanding(entryUrl: string, sourceUrl: string) {
+  const normalized = normalizeEntryUrl(entryUrl, sourceUrl);
+  if (!normalized) return true;
+  const lower = normalized.toLowerCase();
+  if (lower.includes("/en/") || lower.includes("lang=en") || /(?:-|_)en(?:$|[/?#])/.test(lower)) return true;
+  if (lower.includes("404") || lower.includes("not-found") || lower.includes("not_found")) return true;
+  if (lower.includes("toss.im")) return true;
+  return false;
+}
+
 async function cleanupInvalidItemsForUser(env: Env, userId: number) {
-  const candidates = await env.DB.prepare(`
-    SELECT DISTINCT i.id AS itemId, i.url AS url, s.url AS sourceUrl
-    FROM user_feed_slots fs
-    JOIN items i ON i.id = fs.item_id
-    JOIN sources s ON s.id = i.source_id
-    WHERE fs.user_id = ?
-      AND i.status = 'active'
-    ORDER BY fs.date DESC, fs.slot_index ASC
-    LIMIT 12
-  `).bind(userId).all<{ itemId: number; url: string; sourceUrl: string }>();
-
-  const refillDates = new Set<string>();
-  for (const row of candidates.results ?? []) {
-    const validated = await resolveValidatedLanding(row.url, row.sourceUrl);
-    if (!validated) {
-      if (isProtectedContentHost(row.sourceUrl)) continue;
-      const affected = await env.DB.prepare(`
-        SELECT date
-        FROM user_feed_slots
-        WHERE user_id = ? AND item_id = ?
-      `).bind(userId, row.itemId).all<{ date: string }>();
-      for (const r of affected.results ?? []) {
-        if (r.date) refillDates.add(r.date);
-      }
-      await env.DB.prepare("UPDATE items SET status = 'archived' WHERE id = ?").bind(row.itemId).run();
-      await env.DB.prepare("DELETE FROM user_feed_slots WHERE user_id = ? AND item_id = ?").bind(userId, row.itemId).run();
-      continue;
-    }
-    if (validated.url !== row.url) {
-      await env.DB.prepare(`
-        UPDATE items
-        SET url = ?
-        WHERE id = ?
-      `).bind(validated.url, row.itemId).run();
-    }
-  }
-
-  for (const date of refillDates) {
-    await fillDateIfNeeded(date, env, userId);
-  }
+  // NOTE:
+  // Aggressive runtime cleanup was causing feed instability (2 cards / slow responses)
+  // when validation endpoints intermittently failed. Keep as no-op for stability-first.
+  void env;
+  void userId;
 }
 
 async function ensureThumbnailsForShownItems(rows: Record<string, unknown>[], env: Env) {
@@ -2522,6 +2498,21 @@ function sanitizeFeedItemText(item: Record<string, unknown>) {
   if (typeof next.sourceName === "string") {
     next.sourceName = normalizeDisplayText(next.sourceName);
   }
+
+  const title = typeof next.title === "string" ? next.title : "";
+  const sourceName = typeof next.sourceName === "string" ? next.sourceName : "";
+  const summary = typeof next.summary === "string" ? next.summary : "";
+  const url = typeof next.url === "string" ? next.url : "";
+  if (isWeakEntryTitle(title, sourceName)) {
+    const fromSummary = buildFallbackTitleFromSummary(summary, sourceName);
+    if (!isWeakEntryTitle(fromSummary, sourceName)) {
+      next.title = fromSummary;
+    } else {
+      const fromPath = derivePathTitleFromUrl(url);
+      next.title = fromPath || sourceName || title;
+    }
+  }
+
   return next;
 }
 
