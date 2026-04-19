@@ -7,6 +7,11 @@ export type SourceEntry = {
   type: "rss" | "blog";
   level?: SourceLevel;
   is_active: number;
+  extractionMode?: "split" | "single";
+  extractionNote?: string;
+  totalItems?: number;
+  splitItems?: number;
+  rootItems?: number;
   exposureCount: number;
   memoCount: number;
   lastExposedAt?: string | null;

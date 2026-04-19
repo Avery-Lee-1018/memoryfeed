@@ -672,6 +672,9 @@ async function handleGetSources(env: Env, userId: number) {
       s.type,
       us.level,
       us.is_active,
+      COUNT(DISTINCT i.id) AS totalItems,
+      COUNT(DISTINCT CASE WHEN RTRIM(i.url, '/') <> RTRIM(s.url, '/') THEN i.id END) AS splitItems,
+      COUNT(DISTINCT CASE WHEN RTRIM(i.url, '/') = RTRIM(s.url, '/') THEN i.id END) AS rootItems,
       COALESCE(COUNT(DISTINCT CASE WHEN fs.date IS NOT NULL THEN fs.date || ':' || fs.slot_index END), 0) AS exposureCount,
       COALESCE(COUNT(DISTINCT CASE WHEN n.content IS NOT NULL AND trim(n.content) != '' THEN n.id END), 0) AS memoCount,
       MAX(fs.date) AS lastExposedAt,
@@ -684,7 +687,19 @@ async function handleGetSources(env: Env, userId: number) {
         END),
         MAX(fs.date),
         MAX(n.updated_at)
-      ) AS lastActivityAt
+      ) AS lastActivityAt,
+      CASE
+        WHEN COUNT(DISTINCT CASE WHEN RTRIM(i.url, '/') <> RTRIM(s.url, '/') THEN i.id END) >= 2 THEN 'split'
+        ELSE 'single'
+      END AS extractionMode,
+      CASE
+        WHEN COUNT(DISTINCT i.id) = 0 THEN '아직 수집된 콘텐츠가 없어요'
+        WHEN COUNT(DISTINCT CASE WHEN RTRIM(i.url, '/') <> RTRIM(s.url, '/') THEN i.id END) = 0
+          THEN '홈/피드 페이지 중심으로 감지됐어요'
+        WHEN COUNT(DISTINCT CASE WHEN RTRIM(i.url, '/') <> RTRIM(s.url, '/') THEN i.id END) = 1
+          THEN '분리 가능한 아티클이 1개만 감지됐어요'
+        ELSE '아티클 분리 노출이 가능해요'
+      END AS extractionNote
     FROM user_sources us
     JOIN sources s ON s.id = us.source_id
     LEFT JOIN items i ON i.source_id = s.id
