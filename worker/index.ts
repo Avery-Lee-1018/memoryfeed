@@ -17,6 +17,7 @@ const ENTRY_LIMIT_PER_SOURCE = 120;
 const RESURFACE_COOLDOWN_DAYS = 7;
 const SOURCE_REFRESH_INTERVAL_MINUTES = 45;
 const SOURCE_REFRESH_BATCH_SIZE = 4;
+const MANUAL_REFRESH_COOLDOWN_SECONDS = 120;
 const KOREAN_ACCEPT_LANGUAGE = "ko-KR,ko;q=0.95,en-US;q=0.7,en;q=0.6";
 const CRAWLER_USER_AGENT = "Mozilla/5.0 (compatible; MemoryFeedBot/1.0)";
 const ADMIN_HEADER = "x-memoryfeed-key";
@@ -79,6 +80,10 @@ export default {
       if (request.method === "POST" && url.pathname === "/api/sources") {
         return handlePostSources(request, env, ctx, sessionUserId ?? 0);
       }
+      if (request.method === "POST" && /^\/api\/sources\/\d+\/refresh$/.test(url.pathname)) {
+        const sourceId = parseInt(url.pathname.split("/")[3]);
+        return handlePostSourceRefresh(sourceId, env, sessionUserId ?? 0);
+      }
       if (request.method === "PATCH" && /^\/api\/sources\/\d+$/.test(url.pathname)) {
         const sourceId = parseInt(url.pathname.split("/")[3]);
         return handlePatchSource(sourceId, request, env, sessionUserId ?? 0);
@@ -132,6 +137,7 @@ function isUserScopedRoute(method: string, pathname: string) {
   if (method === "POST" && pathname === "/api/feed/replacement") return true;
   if (method === "POST" && pathname === "/api/reaction") return true;
   if ((method === "GET" || method === "POST") && pathname === "/api/sources") return true;
+  if (method === "POST" && /^\/api\/sources\/\d+\/refresh$/.test(pathname)) return true;
   if ((method === "PATCH" || method === "DELETE") && /^\/api\/sources\/\d+$/.test(pathname)) return true;
   if ((method === "GET" || method === "POST" || method === "DELETE") && /^\/api\/notes\/\d+$/.test(pathname)) return true;
   return false;
@@ -218,6 +224,43 @@ function isHostRelated(hostA: string, hostB: string) {
   return a === b || a.endsWith(`.${b}`) || b.endsWith(`.${a}`);
 }
 
+function isPrivateIPv4(hostname: string) {
+  const match = hostname.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (!match) return false;
+  const octets = match.slice(1).map((v) => Number(v));
+  if (octets.some((v) => !Number.isFinite(v) || v < 0 || v > 255)) return false;
+  const [a, b] = octets;
+  return (
+    a === 10 ||
+    a === 127 ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168)
+  );
+}
+
+function isDisallowedHost(hostname: string) {
+  const host = hostname.toLowerCase();
+  return (
+    host === "localhost" ||
+    host === "0.0.0.0" ||
+    host === "::1" ||
+    host.endsWith(".local") ||
+    isPrivateIPv4(host)
+  );
+}
+
+function isPublicHttpUrl(candidateUrl: string) {
+  try {
+    const parsed = new URL(candidateUrl);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+    if (isDisallowedHost(parsed.hostname)) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function isAllowedSourcePageUrl(targetUrl: string, env: Env, userId: number) {
   // Check by exact item URL — avoids false negatives when source feed URL
   // is hosted on a different domain than article URLs (e.g. Feedburner CDNs).
@@ -228,16 +271,6 @@ async function isAllowedSourcePageUrl(targetUrl: string, env: Env, userId: numbe
     LIMIT 1
   `).bind(userId, targetUrl).first();
   return row !== null;
-}
-
-function isSafeImageHost(imageUrl: string, pageUrl: string) {
-  try {
-    const pageHost = new URL(pageUrl).hostname;
-    const imageHost = new URL(imageUrl).hostname;
-    return isHostRelated(imageHost, pageHost);
-  } catch {
-    return false;
-  }
 }
 
 async function handleGetThumbnail(request: Request, url: URL, ctx: ExecutionContext, env: Env, userId: number) {
@@ -259,7 +292,7 @@ async function handleGetThumbnail(request: Request, url: URL, ctx: ExecutionCont
   }
 
   // 1) Prefer explicit imageUrl if provided and reachable.
-  if (imageUrl && /^https?:\/\//i.test(imageUrl) && isSafeImageHost(imageUrl, pageUrl)) {
+  if (imageUrl && isPublicHttpUrl(imageUrl)) {
     const direct = await fetchImage(imageUrl, pageUrl);
     if (direct) {
       ctx.waitUntil(cache.put(cacheKey, direct.clone()));
@@ -317,6 +350,7 @@ async function handleGetThumbnail(request: Request, url: URL, ctx: ExecutionCont
 }
 
 async function fetchImage(targetUrl: string, referer?: string) {
+  if (!isPublicHttpUrl(targetUrl)) return null;
   const upstream = await fetch(targetUrl, {
     headers: buildCrawlerHeaders("image/avif,image/webp,image/apng,image/*,*/*;q=0.8", referer),
     cf: {
@@ -407,12 +441,28 @@ async function handleGetFeedToday(url: URL, env: Env, ctx: ExecutionContext, use
   ]));
   const targetDate = getDateParamOrToday(url.searchParams.get("date"));
   await ensureUserSourcesSeeded(env, userId);
+  let result = await queryDistinctDateItems(targetDate, env, userId);
+  const quickRows = (result.results ?? []) as Record<string, unknown>[];
+  if (quickRows.length >= 3) {
+    ctx.waitUntil((async () => {
+      await pruneDateItemsDuplicatedAcrossOtherDates(env, userId, targetDate);
+      await pruneDateContentDuplicatesByKey(env, userId, targetDate);
+      await Promise.allSettled([
+        ensureItemsFromSources(env, ctx, userId),
+        refreshStaleSourcesInBackground(env, userId),
+      ]);
+      await backfillFeedsUntilDate(targetDate, env, userId);
+    })());
+    const finalQuickItems = quickRows.map(({ sourceId, ...rest }) => rest);
+    return json({ date: targetDate, items: finalQuickItems.map(sanitizeFeedItemText) });
+  }
+
   await pruneDateItemsDuplicatedAcrossOtherDates(env, userId, targetDate);
   await pruneDateContentDuplicatesByKey(env, userId, targetDate);
   await ensureItemsFromSources(env, ctx, userId);
   ctx.waitUntil(refreshStaleSourcesInBackground(env, userId));
   await backfillFeedsUntilDate(targetDate, env, userId);
-  let result = await queryDistinctDateItems(targetDate, env, userId);
+  result = await queryDistinctDateItems(targetDate, env, userId);
 
   const items = (result.results ?? []) as Record<string, unknown>[];
 
@@ -671,6 +721,7 @@ async function handlePostReaction(request: Request, env: Env, userId: number) {
 
 async function handleGetSources(env: Env, userId: number) {
   await ensureUserSourcesSeeded(env, userId);
+  await ensureSourceRefreshTable(env);
   const result = await env.DB.prepare(`
     SELECT
       s.id,
@@ -695,6 +746,7 @@ async function handleGetSources(env: Env, userId: number) {
         MAX(fs.date),
         MAX(n.updated_at)
       ) AS lastActivityAt,
+      MAX(rs.last_refreshed_at) AS lastRefreshedAt,
       CASE
         WHEN COUNT(DISTINCT CASE WHEN RTRIM(i.url, '/') <> RTRIM(s.url, '/') THEN i.id END) >= 2 THEN 'split'
         ELSE 'single'
@@ -722,11 +774,73 @@ async function handleGetSources(env: Env, userId: number) {
     LEFT JOIN items i ON i.source_id = s.id
     LEFT JOIN user_feed_slots fs ON fs.item_id = i.id AND fs.user_id = us.user_id
     LEFT JOIN user_notes n ON n.item_id = i.id AND n.user_id = us.user_id
+    LEFT JOIN source_refresh_state rs ON rs.source_id = s.id
     WHERE us.user_id = ?
     GROUP BY s.id, us.level, us.is_active
     ORDER BY s.id DESC
   `).bind(userId).all();
   return json({ sources: result.results ?? [] });
+}
+
+async function handlePostSourceRefresh(sourceId: number, env: Env, userId: number) {
+  await ensureUserSourcesSeeded(env, userId);
+  await ensureSourceRefreshTable(env);
+
+  const source = await env.DB.prepare(`
+    SELECT s.id, s.name, s.url, s.type
+    FROM user_sources us
+    JOIN sources s ON s.id = us.source_id
+    WHERE us.user_id = ? AND us.source_id = ? AND us.is_active = 1
+    LIMIT 1
+  `).bind(userId, sourceId).first<{ id: number; name: string; url: string; type: SourceType }>();
+  if (!source) return json({ error: "source not found" }, { status: 404 });
+
+  const state = await env.DB.prepare(`
+    SELECT last_refreshed_at AS lastRefreshedAt
+    FROM source_refresh_state
+    WHERE source_id = ?
+    LIMIT 1
+  `).bind(sourceId).first<{ lastRefreshedAt?: string }>();
+
+  const now = Date.now();
+  const lastMs = state?.lastRefreshedAt ? new Date(state.lastRefreshedAt).getTime() : 0;
+  if (lastMs && Number.isFinite(lastMs) && now - lastMs < MANUAL_REFRESH_COOLDOWN_SECONDS * 1000) {
+    return json({
+      ok: true,
+      refreshed: false,
+      reason: "cooldown",
+      cooldownSeconds: MANUAL_REFRESH_COOLDOWN_SECONDS,
+      lastRefreshedAt: state.lastRefreshedAt,
+    });
+  }
+
+  await hydrateSourceItems(source, env);
+  await env.DB.prepare(`
+    INSERT INTO source_refresh_state (source_id, last_refreshed_at)
+    VALUES (?, CURRENT_TIMESTAMP)
+    ON CONFLICT(source_id) DO UPDATE SET last_refreshed_at = CURRENT_TIMESTAMP
+  `).bind(sourceId).run();
+
+  const stats = await env.DB.prepare(`
+    SELECT
+      COUNT(DISTINCT i.id) AS totalItems,
+      COUNT(DISTINCT CASE WHEN RTRIM(i.url, '/') <> RTRIM(s.url, '/') THEN i.id END) AS splitItems,
+      COUNT(DISTINCT CASE WHEN RTRIM(i.url, '/') = RTRIM(s.url, '/') THEN i.id END) AS rootItems
+    FROM sources s
+    LEFT JOIN items i ON i.source_id = s.id
+    WHERE s.id = ?
+    GROUP BY s.id
+    LIMIT 1
+  `).bind(sourceId).first<{ totalItems?: number; splitItems?: number; rootItems?: number }>();
+
+  return json({
+    ok: true,
+    refreshed: true,
+    lastRefreshedAt: new Date().toISOString(),
+    totalItems: Number(stats?.totalItems ?? 0),
+    splitItems: Number(stats?.splitItems ?? 0),
+    rootItems: Number(stats?.rootItems ?? 0),
+  });
 }
 
 async function ensureUserSourcesSeeded(_env: Env, _userId: number) {
@@ -1565,7 +1679,12 @@ async function ingestItemsForSource(
           WHEN items.summary LIKE '%utm_campaign=%' THEN excluded.summary
           ELSE items.summary
         END,
-        thumbnail_url = COALESCE(items.thumbnail_url, excluded.thumbnail_url)
+        thumbnail_url = CASE
+          WHEN excluded.thumbnail_url IS NULL OR trim(excluded.thumbnail_url) = '' THEN items.thumbnail_url
+          WHEN items.thumbnail_url IS NULL OR trim(items.thumbnail_url) = '' THEN excluded.thumbnail_url
+          WHEN lower(items.thumbnail_url) LIKE '%/favicon.ico%' AND lower(excluded.thumbnail_url) NOT LIKE '%/favicon.ico%' THEN excluded.thumbnail_url
+          ELSE items.thumbnail_url
+        END
     `).bind(
       source.id,
       resolvedTitle,

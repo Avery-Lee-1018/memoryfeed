@@ -59,32 +59,10 @@ export default function FeedCard({
   const [imageLoaded, setImageLoaded] = useState(false);
 
   useEffect(() => {
-    let revokedUrl: string | null = null;
-    let cancelled = false;
-
+    setThumbnailSrc(resolvedThumbnail);
     setImageLoaded(false);
-
-    (async () => {
-      try {
-        const res = await authorizedFetch(resolvedThumbnail);
-        if (!res.ok) throw new Error(`thumbnail_fetch_failed_${res.status}`);
-        const contentType = res.headers.get("content-type") || "";
-        if (!contentType.startsWith("image/")) throw new Error("thumbnail_not_image");
-        const blob = await res.blob();
-        if (cancelled) return;
-        revokedUrl = URL.createObjectURL(blob);
-        setThumbnailSrc(revokedUrl);
-      } catch {
-        if (cancelled) return;
-        setThumbnailSrc(fallbackThumbnail);
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-      if (revokedUrl) URL.revokeObjectURL(revokedUrl);
-    };
-  }, [resolvedThumbnail, fallbackThumbnail]);
+    return undefined;
+  }, [resolvedThumbnail]);
 
   // suppress unused-var warning for index kept for future use
   void index;

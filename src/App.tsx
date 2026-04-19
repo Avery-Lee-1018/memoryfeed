@@ -45,6 +45,7 @@ export default function App() {
   const [sourceSubmitting, setSourceSubmitting] = useState(false);
   const [sources, setSources] = useState<SourceEntry[]>([]);
   const [sourcesLoading, setSourcesLoading] = useState(false);
+  const [refreshingSourceIds, setRefreshingSourceIds] = useState<Set<number>>(new Set());
   const [toast, setToast] = useState<AppToastState>(null);
 
   useEffect(() => {
@@ -351,6 +352,68 @@ export default function App() {
     }
   };
 
+  const refreshSource = async (sourceId: number) => {
+    if (refreshingSourceIds.has(sourceId)) return;
+    setRefreshingSourceIds((prev) => new Set(prev).add(sourceId));
+    try {
+      const res = await authorizedFetch(`/api/sources/${sourceId}/refresh`, { method: "POST" });
+      const data = await readJson<{
+        ok?: boolean;
+        refreshed?: boolean;
+        reason?: string;
+        cooldownSeconds?: number;
+        lastRefreshedAt?: string;
+      }>(res);
+
+      if (!res.ok) {
+        setToast({
+          tone: "error",
+          title: "새로고침 실패",
+          description: "잠시 후 다시 시도해 주세요.",
+        });
+        return;
+      }
+
+      const lastRefreshedAt =
+        typeof data.lastRefreshedAt === "string" && data.lastRefreshedAt
+          ? data.lastRefreshedAt
+          : new Date().toISOString();
+      setSources((prev) =>
+        prev.map((source) =>
+          source.id === sourceId ? { ...source, lastRefreshedAt } : source
+        )
+      );
+
+      if (data.refreshed === false && data.reason === "cooldown") {
+        const waitSeconds = Math.max(0, Number(data.cooldownSeconds ?? 0));
+        setToast({
+          tone: "warning",
+          title: "잠시 후 다시 새로고침해 주세요",
+          description: waitSeconds > 0 ? `최대 ${waitSeconds}초 간격으로 갱신돼요.` : undefined,
+        });
+      } else {
+        setToast({
+          tone: "success",
+          title: "콘텐츠를 최신 상태로 확인했어요",
+        });
+      }
+
+      void loadSources(false);
+    } catch {
+      setToast({
+        tone: "error",
+        title: "새로고침 실패",
+        description: "네트워크 상태를 확인한 뒤 다시 시도해 주세요.",
+      });
+    } finally {
+      setRefreshingSourceIds((prev) => {
+        const next = new Set(prev);
+        next.delete(sourceId);
+        return next;
+      });
+    }
+  };
+
   return (
     !authReady ? (
       <SplashScreen />
@@ -454,6 +517,8 @@ export default function App() {
               onToggleActive={toggleSourceActive}
               onMoveLevel={moveSourceLevel}
               onDeleteSource={deleteSource}
+              refreshingSourceIds={refreshingSourceIds}
+              onRefreshSource={refreshSource}
             />
           ) : (
           <AnimatePresence mode="wait" initial={false}>

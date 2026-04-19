@@ -70,6 +70,7 @@ export function normalizeSourceEntry(raw: Record<string, unknown>): SourceEntry 
     memoCount: Number(raw.memoCount ?? 0),
     lastExposedAt: typeof raw.lastExposedAt === "string" ? raw.lastExposedAt : null,
     lastActivityAt: typeof raw.lastActivityAt === "string" ? raw.lastActivityAt : null,
+    lastRefreshedAt: typeof raw.lastRefreshedAt === "string" ? raw.lastRefreshedAt : null,
   };
 }
 

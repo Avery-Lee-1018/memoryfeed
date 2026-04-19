@@ -12,6 +12,8 @@ type Props = {
   onToggleActive: (source: SourceEntry) => void;
   onMoveLevel: (sourceId: number, level: LevelKey) => void | Promise<void>;
   onDeleteSource: (sourceId: number) => void;
+  refreshingSourceIds: Set<number>;
+  onRefreshSource: (sourceId: number) => void | Promise<void>;
 };
 
 type LevelKey = SourceLevel;
@@ -51,6 +53,17 @@ function formatRecentLabel(value?: string | null) {
   const mm = String(parsed.getMonth() + 1).padStart(2, "0");
   const dd = String(parsed.getDate()).padStart(2, "0");
   return `${yy}.${mm}.${dd} 업데이트`;
+}
+
+function formatRefreshLabel(value?: string | null) {
+  if (!value) return "최근 갱신 기록 없음";
+  const parsed = new Date(value.length === 10 ? `${value}T00:00:00` : value);
+  if (Number.isNaN(parsed.getTime())) return "최근 갱신 기록 없음";
+
+  const yy = String(parsed.getFullYear()).slice(-2);
+  const mm = String(parsed.getMonth() + 1).padStart(2, "0");
+  const dd = String(parsed.getDate()).padStart(2, "0");
+  return `최신 ${yy}.${mm}.${dd}`;
 }
 
 function resolveSourceOpenUrl(source: SourceEntry) {
@@ -127,6 +140,8 @@ export default function MySourcesView({
   onToggleActive,
   onMoveLevel,
   onDeleteSource,
+  refreshingSourceIds,
+  onRefreshSource,
 }: Props) {
   const [query, setQuery] = useState("");
   const [draftQuery, setDraftQuery] = useState("");
@@ -326,103 +341,135 @@ export default function MySourcesView({
               </div>
               <div className="grid grid-cols-1 gap-3 sm:gap-4">
                 {groupedSources[level.key].map((source) => (
-                  <Card
-                    key={source.id}
-                    draggable
-                    onDragStart={() => setDraggingId(source.id)}
-                    onDragEnd={() => {
-                      setDraggingId(null);
-                      setDragOverLevel(null);
-                    }}
-                    className={`cursor-grab rounded-2xl border border-zinc-200/80 shadow-sm transition-colors active:cursor-grabbing ${
-                      source.is_active !== 1 && source.memoCount > 0
-                        ? "bg-zinc-100/80 opacity-80"
-                        : "bg-white/95"
-                    }`}
-                  >
-                    <CardHeader className="pb-2 pt-4">
-                      <div className="flex items-center justify-between gap-2">
-                        <div className="flex min-w-0 items-center gap-1.5">
-                          <h3 className="truncate text-sm font-semibold tracking-tight text-zinc-900">{source.name}</h3>
-                          {source.extractionMode !== "split" && (
-                            <span
-                              className="inline-flex h-4 w-4 items-center justify-center text-amber-600"
-                              title="개별 콘텐츠가 노출되지 않는 항목"
-                              aria-label="개별 콘텐츠가 노출되지 않는 항목"
-                            >
-                              <i className="ri-error-warning-line text-[13px]" />
-                            </span>
-                          )}
+                  refreshingSourceIds.has(source.id) ? (
+                    <Card key={source.id} className="rounded-2xl border border-zinc-200/80 bg-white/95 shadow-sm">
+                      <CardHeader className="pb-2 pt-4">
+                        <div className="h-4 w-2/3 animate-pulse rounded bg-zinc-200" />
+                        <div className="mt-2 h-3 w-5/6 animate-pulse rounded bg-zinc-200" />
+                      </CardHeader>
+                      <CardContent className="pb-4 pt-0">
+                        <div className="h-3 w-11/12 animate-pulse rounded bg-zinc-200" />
+                        <div className="mt-2 h-3 w-1/2 animate-pulse rounded bg-zinc-200" />
+                        <div className="mt-4 flex items-center justify-between">
+                          <div className="h-6 w-28 animate-pulse rounded-full bg-zinc-200" />
+                          <div className="h-6 w-20 animate-pulse rounded-full bg-zinc-200" />
                         </div>
-                        <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] ${getExtractionChipClass(source)}`}>
-                          {getExtractionLabel(source)}
-                        </span>
-                      </div>
-                      <a
-                        href={resolveSourceOpenUrl(source)}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="inline-flex items-center gap-1 line-clamp-1 text-xs text-zinc-600 underline decoration-zinc-300 underline-offset-2 hover:text-zinc-900 hover:decoration-zinc-500"
-                      >
-                        {source.type === "rss" && <i className="ri-rss-line text-[11px] text-zinc-300" aria-hidden />}
-                        {source.type === "rss" ? resolveSourceOpenUrl(source) : source.url}
-                      </a>
-                    </CardHeader>
-                    <CardContent className="pb-4 pt-0">
-                      <p className="text-xs text-zinc-700">
-                        {source.exposureCount}번 떠오름 · {source.memoCount}개 메모 · {formatRecentLabel(source.lastActivityAt ?? source.lastExposedAt)}
-                      </p>
-                      <p className="mt-1 inline-flex items-center gap-1 text-[11px] text-zinc-500">
-                        <i className="ri-file-list-2-line text-zinc-400" />
-                        콘텐츠 {source.splitItems ?? 0}개
-                      </p>
-                      {source.extractionMode !== "split" && (
-                        <div className="mt-1">
-                          <button
-                            type="button"
-                            onClick={() => setDiagnoseOpenId((prev) => (prev === source.id ? null : source.id))}
-                            className="text-[11px] text-zinc-600 underline decoration-zinc-300 underline-offset-2 hover:text-zinc-900"
-                          >
-                            진단하기
-                          </button>
-                          {diagnoseOpenId === source.id && (
-                            <p className="mt-1 text-[11px] leading-relaxed text-zinc-600">
-                              {getExtractionCases(source)}
-                            </p>
-                          )}
+                      </CardContent>
+                    </Card>
+                  ) : (
+                    <Card
+                      key={source.id}
+                      draggable
+                      onDragStart={() => setDraggingId(source.id)}
+                      onDragEnd={() => {
+                        setDraggingId(null);
+                        setDragOverLevel(null);
+                      }}
+                      className={`cursor-grab rounded-2xl border border-zinc-200/80 shadow-sm transition-colors active:cursor-grabbing ${
+                        source.is_active !== 1 && source.memoCount > 0
+                          ? "bg-zinc-100/80 opacity-80"
+                          : "bg-white/95"
+                      }`}
+                    >
+                      <CardHeader className="pb-2 pt-4">
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="flex min-w-0 items-center gap-1.5">
+                            <h3 className="truncate text-sm font-semibold tracking-tight text-zinc-900">{source.name}</h3>
+                            {source.extractionMode !== "split" && (
+                              <span
+                                className="inline-flex h-4 w-4 items-center justify-center text-amber-600"
+                                title="개별 콘텐츠가 노출되지 않는 항목"
+                                aria-label="개별 콘텐츠가 노출되지 않는 항목"
+                              >
+                                <i className="ri-error-warning-line text-[13px]" />
+                              </span>
+                            )}
+                          </div>
+                          <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] ${getExtractionChipClass(source)}`}>
+                            {getExtractionLabel(source)}
+                          </span>
                         </div>
-                      )}
-                      {source.is_active !== 1 && source.memoCount > 0 && (
-                        <p className="mt-2 inline-flex items-center gap-1 text-[11px] text-zinc-600">
-                          <i className="ri-lock-line" />
-                          메모가 남아 있어 잠시 잠겨 있어요
+                        <a
+                          href={resolveSourceOpenUrl(source)}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1 line-clamp-1 text-xs text-zinc-600 underline decoration-zinc-300 underline-offset-2 hover:text-zinc-900 hover:decoration-zinc-500"
+                        >
+                          {source.type === "rss" && <i className="ri-rss-line text-[11px] text-zinc-300" aria-hidden />}
+                          {source.type === "rss" ? resolveSourceOpenUrl(source) : source.url}
+                        </a>
+                      </CardHeader>
+                      <CardContent className="pb-4 pt-0">
+                        <p className="text-xs text-zinc-700">
+                          {source.exposureCount}번 떠오름 · {source.memoCount}개 메모 · {formatRecentLabel(source.lastActivityAt ?? source.lastExposedAt)}
                         </p>
-                      )}
-                      <div className="mt-3 flex items-center gap-2">
-                        <button
-                          type="button"
-                          onClick={() => onToggleActive(source)}
-                          className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                            source.is_active === 1 ? "bg-zinc-800" : "bg-zinc-300"
-                          }`}
-                          aria-label={source.is_active === 1 ? "비활성화" : "활성화"}
-                        >
-                          <span
-                            className={`inline-block h-5 w-5 transform rounded-full bg-white transition-transform ${
-                              source.is_active === 1 ? "translate-x-5" : "translate-x-0.5"
-                            }`}
-                          />
-                        </button>
-                        <button
-                          onClick={() => onDeleteSource(source.id)}
-                          className="inline-flex items-center justify-center rounded-full p-1 text-zinc-500 transition-colors hover:bg-zinc-100 hover:text-zinc-700"
-                          aria-label="삭제"
-                        >
-                          <i className="ri-delete-bin-line text-base" />
-                        </button>
-                      </div>
-                    </CardContent>
-                  </Card>
+                        <p className="mt-1 inline-flex items-center gap-1 text-[11px] text-zinc-500">
+                          <i className="ri-file-list-2-line text-zinc-400" />
+                          콘텐츠 {source.splitItems ?? 0}개
+                        </p>
+                        {source.extractionMode !== "split" && (
+                          <div className="mt-1">
+                            <button
+                              type="button"
+                              onClick={() => setDiagnoseOpenId((prev) => (prev === source.id ? null : source.id))}
+                              className="text-[11px] text-zinc-600 underline decoration-zinc-300 underline-offset-2 hover:text-zinc-900"
+                            >
+                              진단하기
+                            </button>
+                            {diagnoseOpenId === source.id && (
+                              <p className="mt-1 text-[11px] leading-relaxed text-zinc-600">
+                                {getExtractionCases(source)}
+                              </p>
+                            )}
+                          </div>
+                        )}
+                        {source.is_active !== 1 && source.memoCount > 0 && (
+                          <p className="mt-2 inline-flex items-center gap-1 text-[11px] text-zinc-600">
+                            <i className="ri-lock-line" />
+                            메모가 남아 있어 잠시 잠겨 있어요
+                          </p>
+                        )}
+                        <div className="mt-3 flex items-end justify-between gap-2">
+                          <div className="flex flex-col items-start gap-1">
+                            <p className="text-[11px] text-zinc-500">
+                              {formatRefreshLabel(source.lastRefreshedAt ?? source.lastActivityAt ?? source.lastExposedAt)}
+                            </p>
+                            <button
+                              type="button"
+                              onClick={() => void onRefreshSource(source.id)}
+                              className="inline-flex items-center gap-1 rounded-full border border-zinc-200 bg-white px-2.5 py-1 text-[11px] text-zinc-700 transition-colors hover:bg-zinc-50"
+                            >
+                              <i className="ri-refresh-line text-[12px]" />
+                              업데이트 확인
+                            </button>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => onToggleActive(source)}
+                              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                                source.is_active === 1 ? "bg-zinc-800" : "bg-zinc-300"
+                              }`}
+                              aria-label={source.is_active === 1 ? "비활성화" : "활성화"}
+                            >
+                              <span
+                                className={`inline-block h-5 w-5 transform rounded-full bg-white transition-transform ${
+                                  source.is_active === 1 ? "translate-x-5" : "translate-x-0.5"
+                                }`}
+                              />
+                            </button>
+                            <button
+                              onClick={() => onDeleteSource(source.id)}
+                              className="inline-flex items-center justify-center rounded-full p-1 text-zinc-500 transition-colors hover:bg-zinc-100 hover:text-zinc-700"
+                              aria-label="삭제"
+                            >
+                              <i className="ri-delete-bin-line text-base" />
+                            </button>
+                          </div>
+                        </div>
+                      </CardContent>
+                    </Card>
+                  )
                 ))}
               </div>
             </div>

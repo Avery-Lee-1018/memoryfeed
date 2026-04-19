@@ -17,4 +17,5 @@ export type SourceEntry = {
   memoCount: number;
   lastExposedAt?: string | null;
   lastActivityAt?: string | null;
+  lastRefreshedAt?: string | null;
 };
