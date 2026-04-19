@@ -1,5 +1,14 @@
 # Architecture
 
+## WHAT
+- 런타임 흐름, 데이터 경계, API 표면을 설명하는 기술 구조 문서.
+
+## WHY
+- 문제 발생 시 어디서 원인을 봐야 하는지 빠르게 찾고, 변경 영향 범위를 줄이기 위함.
+
+## HOW
+- 기능 추가 시 먼저 `Runtime Flow`와 `API Surface`를 갱신하고 구현한다.
+
 ## Structure
 `React (Vite)`  
 → `Cloudflare Worker (API + assets)`  

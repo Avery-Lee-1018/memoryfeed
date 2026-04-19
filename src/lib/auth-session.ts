@@ -5,6 +5,7 @@ export type AuthUser = {
   email: string;
   displayName: string | null;
   avatarUrl: string | null;
+  createdAt: string;
 };
 
 export function getAuthToken() {
@@ -69,4 +70,13 @@ export async function logout() {
     },
   });
   setAuthToken("");
+}
+
+export async function deleteAccount() {
+  const res = await fetch("/api/auth/account", {
+    method: "DELETE",
+    headers: { ...authHeaders() },
+  });
+  setAuthToken("");
+  return res.ok;
 }

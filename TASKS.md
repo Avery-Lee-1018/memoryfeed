@@ -1,5 +1,14 @@
 # Tasks
 
+## WHAT
+- 현재 구현 상태와 남은 작업을 단계별로 관리하는 실행 보드.
+
+## WHY
+- “한 번에 하나” 원칙을 지키고, 우선순위 분산을 막기 위해.
+
+## HOW
+- 새 작업은 해당 Phase에 체크박스로 추가하고, 완료 즉시 상태를 갱신한다.
+
 ## Phase 1 - Setup
 - [x] Cloudflare project 생성
 - [x] React + Vite 설정

@@ -19,6 +19,7 @@ const RESURFACE_COOLDOWN_DAYS = 7;
 const SOURCE_REFRESH_INTERVAL_MINUTES = 45;
 const SOURCE_REFRESH_BATCH_SIZE = 4;
 const MANUAL_REFRESH_COOLDOWN_SECONDS = 120;
+const PREFERENCE_APPLY_SOURCE_MIN = 50;
 const KOREAN_ACCEPT_LANGUAGE = "ko-KR,ko;q=0.95,en-US;q=0.7,en;q=0.6";
 const CRAWLER_USER_AGENT = "Mozilla/5.0 (compatible; MemoryFeedBot/1.0)";
 const ADMIN_HEADER = "x-memoryfeed-key";
@@ -42,6 +43,9 @@ const json = (data: unknown, init: ResponseInit = {}) =>
   });
 
 export default {
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(refreshAllSourcesGlobal(env));
+  },
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     try {
       const url = new URL(request.url);
@@ -83,7 +87,11 @@ export default {
       }
       if (request.method === "POST" && /^\/api\/sources\/\d+\/refresh$/.test(url.pathname)) {
         const sourceId = parseInt(url.pathname.split("/")[3]);
-        return handlePostSourceRefresh(sourceId, env, sessionUserId ?? 0);
+        return handlePostSourceRefresh(sourceId, env, ctx, sessionUserId ?? 0);
+      }
+      if (request.method === "GET" && /^\/api\/sources\/\d+\/memos$/.test(url.pathname)) {
+        const sourceId = parseInt(url.pathname.split("/")[3]);
+        return handleGetSourceMemos(sourceId, env, sessionUserId ?? 0);
       }
       if (request.method === "PATCH" && /^\/api\/sources\/\d+$/.test(url.pathname)) {
         const sourceId = parseInt(url.pathname.split("/")[3]);
@@ -100,6 +108,14 @@ export default {
       if (request.method === "GET" && /^\/api\/notes\/\d+$/.test(url.pathname)) {
         const itemId = parseInt(url.pathname.split("/")[3]);
         return handleGetNote(itemId, env, sessionUserId ?? 0);
+      }
+      if (request.method === "GET" && /^\/api\/items\/\d+\/related$/.test(url.pathname)) {
+        const itemId = parseInt(url.pathname.split("/")[3]);
+        return handleGetRelatedItemsByTag(itemId, env, sessionUserId ?? 0);
+      }
+      if (request.method === "POST" && /^\/api\/items\/\d+\/report$/.test(url.pathname)) {
+        const itemId = parseInt(url.pathname.split("/")[3]);
+        return handlePostItemReport(itemId, request, env, ctx, sessionUserId ?? 0);
       }
       if (request.method === "DELETE" && /^\/api\/notes\/\d+$/.test(url.pathname)) {
         const itemId = parseInt(url.pathname.split("/")[3]);
@@ -146,8 +162,11 @@ function isUserScopedRoute(method: string, pathname: string) {
   if (method === "POST" && pathname === "/api/reaction") return true;
   if ((method === "GET" || method === "POST") && pathname === "/api/sources") return true;
   if (method === "POST" && /^\/api\/sources\/\d+\/refresh$/.test(pathname)) return true;
+  if (method === "GET" && /^\/api\/sources\/\d+\/memos$/.test(pathname)) return true;
   if ((method === "PATCH" || method === "DELETE") && /^\/api\/sources\/\d+$/.test(pathname)) return true;
   if ((method === "GET" || method === "POST" || method === "DELETE") && /^\/api\/notes\/\d+$/.test(pathname)) return true;
+  if (method === "GET" && /^\/api\/items\/\d+\/related$/.test(pathname)) return true;
+  if (method === "POST" && /^\/api\/items\/\d+\/report$/.test(pathname)) return true;
   if (method === "GET" && pathname === "/api/stats/calendar") return true;
   if (method === "DELETE" && pathname === "/api/auth/account") return true;
   return false;
@@ -310,6 +329,21 @@ async function handleGetThumbnail(request: Request, url: URL, ctx: ExecutionCont
     }
   }
 
+  // 1b) YouTube — derive thumbnail directly from the video ID.
+  //     Avoids fetching the full page HTML just to find the og:image.
+  const ytVideoId = extractYouTubeVideoId(pageUrl);
+  if (ytVideoId) {
+    // Try maxresdefault first, fall back to hqdefault (always exists).
+    for (const quality of ["maxresdefault", "hqdefault"]) {
+      const ytThumb = `https://img.youtube.com/vi/${ytVideoId}/${quality}.jpg`;
+      const ytResult = await fetchImage(ytThumb, pageUrl);
+      if (ytResult) {
+        ctx.waitUntil(cache.put(cacheKey, ytResult.clone()));
+        return ytResult;
+      }
+    }
+  }
+
   // 2) Resolve OG/Twitter image from page HTML.
   const pageRes = await fetch(pageUrl, {
     headers: buildCrawlerHeaders("text/html,application/xhtml+xml"),
@@ -352,16 +386,21 @@ async function handleGetThumbnail(request: Request, url: URL, ctx: ExecutionCont
     }
   }
 
-  // Last fallback: site favicon (still domain-specific) to avoid repeated generic placeholder.
-  try {
-    const faviconUrl = new URL("/favicon.ico", pageUrl).toString();
-    const favicon = await fetchImage(faviconUrl, pageUrl);
-    if (favicon) {
-      ctx.waitUntil(cache.put(cacheKey, favicon.clone()));
-      return favicon;
+  // Last fallback: site favicon — but only when the page itself was reachable.
+  // If the page returned a non-2xx status (dead link, 404) we skip favicon so
+  // the caller receives a 404 and FeedCard falls back to a placeholder instead
+  // of showing a tiny site icon that looks like a broken card.
+  if (pageRes.ok) {
+    try {
+      const faviconUrl = new URL("/favicon.ico", pageUrl).toString();
+      const favicon = await fetchImage(faviconUrl, pageUrl);
+      if (favicon) {
+        ctx.waitUntil(cache.put(cacheKey, favicon.clone()));
+        return favicon;
+      }
+    } catch {
+      // no-op
     }
-  } catch {
-    // no-op
   }
 
   // If thumbnail extraction fails repeatedly, schedule a guarded source rehydrate
@@ -392,6 +431,27 @@ async function fetchImage(targetUrl: string, referer?: string) {
       "cache-control": "public, max-age=43200"
     }
   });
+}
+
+function extractYouTubeVideoId(url: string): string | null {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.replace(/^www\./, "");
+    if (host === "youtube.com" || host === "m.youtube.com") {
+      const v = parsed.searchParams.get("v");
+      if (v && /^[\w-]{11}$/.test(v)) return v;
+      // /shorts/{id}
+      const shorts = parsed.pathname.match(/^\/shorts\/([\w-]{11})$/);
+      if (shorts) return shorts[1];
+    }
+    if (host === "youtu.be") {
+      const id = parsed.pathname.slice(1).split("/")[0];
+      if (id && /^[\w-]{11}$/.test(id)) return id;
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 function extractMetaImage(html: string, pageUrl: string): string | null {
@@ -758,10 +818,55 @@ async function handlePostFeedReplacement(request: Request, env: Env, userId: num
   return json({ item: finalReplacement ? sanitizeFeedItemText(finalReplacement as Record<string, unknown>) : null });
 }
 
+async function handleGetSourceMemos(sourceId: number, env: Env, userId: number) {
+  if (!Number.isInteger(sourceId) || sourceId <= 0) {
+    return json({ error: "INVALID_SOURCE_ID" }, { status: 400 });
+  }
+
+  const source = await env.DB.prepare(`
+    SELECT s.id, s.name
+    FROM user_sources us
+    JOIN sources s ON s.id = us.source_id
+    WHERE us.user_id = ? AND us.source_id = ?
+    LIMIT 1
+  `).bind(userId, sourceId).first<{ id: number; name: string }>();
+
+  if (!source) {
+    return json({ error: "SOURCE_NOT_FOUND" }, { status: 404 });
+  }
+
+  const result = await env.DB.prepare(`
+    WITH shown AS (
+      SELECT fs.item_id, MAX(fs.date) AS lastShownDate
+      FROM user_feed_slots fs
+      WHERE fs.user_id = ? AND fs.source_id = ?
+      GROUP BY fs.item_id
+    )
+    SELECT i.id, i.title, i.url, i.summary, i.thumbnail_url,
+           s.name AS sourceName, s.type AS sourceType, us.level AS sourceLevel,
+           CASE WHEN n.id IS NULL OR trim(COALESCE(n.content, '')) = '' THEN 0 ELSE 1 END AS hasNote
+    FROM shown sh
+    JOIN items i ON i.id = sh.item_id
+    JOIN sources s ON s.id = i.source_id
+    JOIN user_sources us ON us.user_id = ? AND us.source_id = s.id
+    LEFT JOIN user_notes n ON n.user_id = ? AND n.item_id = i.id
+    WHERE i.source_id = ?
+      AND i.status = 'active'
+    ORDER BY sh.lastShownDate DESC, i.id DESC
+    LIMIT 180
+  `).bind(userId, sourceId, userId, userId, sourceId).all();
+
+  const items = ((result.results ?? []) as Record<string, unknown>[]).map(sanitizeFeedItemText);
+  return json({
+    source: { id: source.id, name: source.name },
+    items,
+  });
+}
+
 async function handlePostReaction(request: Request, env: Env, userId: number) {
-  let body: { itemId?: number; type?: ReactionType };
+  let body: { itemId?: number; type?: ReactionType; reason?: string };
   try {
-    body = (await request.json()) as { itemId?: number; type?: ReactionType };
+    body = (await request.json()) as { itemId?: number; type?: ReactionType; reason?: string };
   } catch {
     return json({ error: "Invalid JSON body" }, { status: 400 });
   }
@@ -772,15 +877,221 @@ async function handlePostReaction(request: Request, env: Env, userId: number) {
   if (!["keep", "skip"].includes(body.type)) {
     return json({ error: "type must be keep | skip" }, { status: 400 });
   }
+  if (body.type === "skip" && body.reason && !["resurface_later", "not_my_interest"].includes(body.reason)) {
+    return json({ error: "reason must be resurface_later | not_my_interest" }, { status: 400 });
+  }
 
-  const itemExists = await env.DB.prepare("SELECT id FROM items WHERE id = ? LIMIT 1")
-    .bind(body.itemId).first();
+  const itemExists = await env.DB.prepare("SELECT id, source_id, title, url FROM items WHERE id = ? LIMIT 1")
+    .bind(body.itemId).first<{ id: number; source_id: number; title: string; url: string }>();
   if (!itemExists) return json({ error: "item not found" }, { status: 404 });
 
   await env.DB.prepare("INSERT INTO user_reactions (user_id, item_id, type) VALUES (?, ?, ?)")
     .bind(userId, body.itemId, body.type).run();
 
+  if (body.type === "skip" && body.reason === "not_my_interest") {
+    const sourceCountRow = await env.DB.prepare(`
+      SELECT COUNT(*) AS count FROM user_sources WHERE user_id = ? AND is_active = 1
+    `).bind(userId).first<{ count?: number }>();
+    const activeSourceCount = Number(sourceCountRow?.count ?? 0);
+    if (activeSourceCount >= PREFERENCE_APPLY_SOURCE_MIN) {
+      await env.DB.prepare(`
+        INSERT INTO user_source_penalties (user_id, source_id, score, updated_at)
+        VALUES (?, ?, 1, CURRENT_TIMESTAMP)
+        ON CONFLICT(user_id, source_id) DO UPDATE SET
+          score = MIN(8, user_source_penalties.score + 1),
+          updated_at = CURRENT_TIMESTAMP
+      `).bind(userId, Number(itemExists.source_id)).run();
+
+      const signals = extractSignalFromItem(String(itemExists.title ?? ""), "", String(itemExists.url ?? ""));
+      for (const tag of signals.tags) {
+        await env.DB.prepare(`
+          INSERT INTO user_tag_penalties (user_id, tag, score, updated_at)
+          VALUES (?, ?, 0.5, CURRENT_TIMESTAMP)
+          ON CONFLICT(user_id, tag) DO UPDATE SET
+            score = MIN(6, user_tag_penalties.score + 0.5),
+            updated_at = CURRENT_TIMESTAMP
+        `).bind(userId, tag).run();
+      }
+      await env.DB.prepare(`
+        INSERT INTO user_topic_penalties (user_id, topic, score, updated_at)
+        VALUES (?, ?, 0.7, CURRENT_TIMESTAMP)
+        ON CONFLICT(user_id, topic) DO UPDATE SET
+          score = MIN(6, user_topic_penalties.score + 0.7),
+          updated_at = CURRENT_TIMESTAMP
+      `).bind(userId, signals.topic).run();
+    }
+  }
+
   return json({ ok: true });
+}
+
+type ReportIssue = "thumbnail" | "title" | "summary" | "url";
+
+async function handlePostItemReport(
+  itemId: number,
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+  userId: number,
+) {
+  if (!Number.isInteger(itemId) || itemId <= 0) {
+    return json({ error: "INVALID_ITEM_ID" }, { status: 400 });
+  }
+
+  let body: { issues?: ReportIssue[]; details?: string };
+  try {
+    body = (await request.json()) as { issues?: ReportIssue[]; details?: string };
+  } catch {
+    return json({ error: "Invalid JSON body" }, { status: 400 });
+  }
+
+  const allowedIssues = new Set<ReportIssue>(["thumbnail", "title", "summary", "url"]);
+  const issues = new Set<ReportIssue>(
+    (body.issues ?? []).filter((v): v is ReportIssue => allowedIssues.has(v as ReportIssue))
+  );
+  const details = String(body.details ?? "").trim().slice(0, 800);
+  const hintedIssues = deriveIssueHintsFromDetails(details);
+  hintedIssues.forEach((issue) => issues.add(issue));
+  if (issues.size === 0 && details.length === 0) {
+    return json({ error: "At least one issue or details is required" }, { status: 400 });
+  }
+
+  // Verify the item belongs to one of this user's active sources
+  const item = await env.DB.prepare(`
+    SELECT i.id, i.title, i.url, i.summary, i.thumbnail_url, i.source_id
+    FROM items i
+    JOIN user_sources us ON us.source_id = i.source_id AND us.user_id = ?
+    WHERE i.id = ? AND i.status = 'active'
+    LIMIT 1
+  `).bind(userId, itemId).first<{
+    id: number; title: string; url: string;
+    summary: string | null; thumbnail_url: string | null; source_id: number;
+  }>();
+
+  if (!item) return json({ error: "item not found" }, { status: 404 });
+
+  // --- Attempt to re-fetch and repair ---
+  const html = await fetchSourceText(item.url, "text/html,application/xhtml+xml");
+
+  // If the page is dead (404 / unreachable) deactivate it immediately.
+  if (!html) {
+    await env.DB.prepare("UPDATE items SET status = 'inactive' WHERE id = ?")
+      .bind(itemId).run();
+    return json({ repaired: false, reason: "page_unreachable" });
+  }
+
+  // Check for soft-404 (page returns 200 but content is an error page)
+  if (isLikelyErrorPage(html, item.url)) {
+    await env.DB.prepare("UPDATE items SET status = 'inactive' WHERE id = ?")
+      .bind(itemId).run();
+    return json({ repaired: false, reason: "error_page_detected" });
+  }
+
+  // If url issue was the only complaint but the page loaded fine, the link is OK.
+  // Re-extract metadata for whichever fields were reported as broken.
+  let newTitle = item.title;
+  let newSummary = item.summary;
+  let newThumbnail = item.thumbnail_url;
+  let anyFixed = false;
+
+  if (issues.has("title") || issues.has("summary") || issues.has("thumbnail")) {
+    if (issues.has("title")) {
+      const htmlTitle = normalizeDisplayText(
+        (extractHtmlTitle(html) ?? "").replace(/\|\s*Substack.*$/i, "").trim()
+      );
+      const metaTitle = normalizeDisplayText(extractMetaTitle(html) ?? "");
+      const candidate = (htmlTitle && !isWeakEntryTitle(htmlTitle, "")) ? htmlTitle
+        : (metaTitle && !isWeakEntryTitle(metaTitle, "")) ? metaTitle
+        : null;
+      if (candidate && candidate !== item.title) {
+        newTitle = candidate;
+        anyFixed = true;
+      }
+    }
+
+    if (issues.has("summary")) {
+      const metaDesc = normalizeDisplayText(extractMetaDescription(html) ?? "");
+      if (isUsableSummary(metaDesc) && metaDesc !== item.summary) {
+        newSummary = metaDesc;
+        anyFixed = true;
+      }
+    }
+
+    if (issues.has("thumbnail")) {
+      const metaImage = extractMetaImage(html, item.url);
+      const inlineImage = metaImage ? null : extractFirstContentImage(html, item.url);
+      const candidate = metaImage || inlineImage;
+      if (candidate && candidate !== item.thumbnail_url) {
+        newThumbnail = candidate;
+        anyFixed = true;
+      }
+    }
+  }
+
+  // Persist any improvements found
+  if (anyFixed) {
+    await env.DB.prepare(`
+      UPDATE items
+      SET title = ?, summary = ?, thumbnail_url = ?
+      WHERE id = ?
+    `).bind(newTitle, newSummary, newThumbnail, itemId).run();
+  }
+
+  // Strict pass criteria: must differ from previous data to be considered repaired.
+  // If nothing changed compared to the previous snapshot, it fails and is removed.
+  const repaired = anyFixed;
+
+  // Trigger a background source rehydrate so fresh content is available soon
+  ctx.waitUntil(triggerSourceRehydrateForPageUrl(item.url, env, userId));
+
+  if (!repaired) {
+    // Nothing could be improved — deactivate so it won't resurface
+    await env.DB.prepare("UPDATE items SET status = 'inactive' WHERE id = ?")
+      .bind(itemId).run();
+    return json({ repaired: false, reason: "no_improvement_found", detailsAccepted: details.length > 0 });
+  }
+
+  return json({
+    repaired: true,
+    detailsAccepted: details.length > 0,
+    item: {
+      id: item.id,
+      title: newTitle,
+      url: item.url,
+      summary: newSummary,
+      thumbnail_url: newThumbnail,
+    },
+  });
+}
+
+function deriveIssueHintsFromDetails(details: string): ReportIssue[] {
+  if (!details) return [];
+  const lower = details.toLowerCase();
+  const hints = new Set<ReportIssue>();
+  if (
+    lower.includes("썸네일") ||
+    lower.includes("이미지") ||
+    lower.includes("사진") ||
+    lower.includes("thumbnail")
+  ) hints.add("thumbnail");
+  if (
+    lower.includes("제목") ||
+    lower.includes("타이틀") ||
+    lower.includes("title")
+  ) hints.add("title");
+  if (
+    lower.includes("설명") ||
+    lower.includes("본문") ||
+    lower.includes("요약") ||
+    lower.includes("summary")
+  ) hints.add("summary");
+  if (
+    lower.includes("링크") ||
+    lower.includes("랜딩") ||
+    lower.includes("404") ||
+    lower.includes("url")
+  ) hints.add("url");
+  return [...hints];
 }
 
 async function handleGetSources(env: Env, userId: number) {
@@ -847,7 +1158,8 @@ async function handleGetSources(env: Env, userId: number) {
   return json({ sources: result.results ?? [] });
 }
 
-async function handlePostSourceRefresh(sourceId: number, env: Env, userId: number) {
+async function handlePostSourceRefresh(sourceId: number, env: Env, ctx: ExecutionContext, userId: number) {
+  void ctx;
   await ensureUserSourcesSeeded(env, userId);
   await ensureSourceRefreshTable(env);
 
@@ -879,33 +1191,49 @@ async function handlePostSourceRefresh(sourceId: number, env: Env, userId: numbe
     });
   }
 
-  await hydrateSourceItems(source, env);
+  const nowIso = new Date().toISOString();
   await env.DB.prepare(`
     INSERT INTO source_refresh_state (source_id, last_refreshed_at)
     VALUES (?, CURRENT_TIMESTAMP)
     ON CONFLICT(source_id) DO UPDATE SET last_refreshed_at = CURRENT_TIMESTAMP
   `).bind(sourceId).run();
 
-  const stats = await env.DB.prepare(`
-    SELECT
-      COUNT(DISTINCT i.id) AS totalItems,
-      COUNT(DISTINCT CASE WHEN RTRIM(i.url, '/') <> RTRIM(s.url, '/') THEN i.id END) AS splitItems,
-      COUNT(DISTINCT CASE WHEN RTRIM(i.url, '/') = RTRIM(s.url, '/') THEN i.id END) AS rootItems
-    FROM sources s
-    LEFT JOIN items i ON i.source_id = s.id
-    WHERE s.id = ?
-    GROUP BY s.id
-    LIMIT 1
-  `).bind(sourceId).first<{ totalItems?: number; splitItems?: number; rootItems?: number }>();
+  const before = await getCallableContentStatsForSource(sourceId, env);
+  await hydrateSourceItems(source, env, true /* fresh — bypass CF cache */);
+  const after = await getCallableContentStatsForSource(sourceId, env);
+  const contentDelta = Math.max(0, after.callableCount - before.callableCount);
+  const changed = contentDelta > 0;
+
+  if (changed) {
+    const todayIso = getTodayIso();
+    await env.DB.prepare(`
+      DELETE FROM user_feed_slots
+      WHERE user_id = ? AND date = ? AND source_id = ?
+    `).bind(userId, todayIso, sourceId).run();
+  }
 
   return json({
     ok: true,
     refreshed: true,
-    lastRefreshedAt: new Date().toISOString(),
-    totalItems: Number(stats?.totalItems ?? 0),
-    splitItems: Number(stats?.splitItems ?? 0),
-    rootItems: Number(stats?.rootItems ?? 0),
+    changed,
+    contentDelta,
+    beforeCallableCount: before.callableCount,
+    afterCallableCount: after.callableCount,
+    lastRefreshedAt: nowIso,
   });
+}
+
+async function getCallableContentStatsForSource(sourceId: number, env: Env) {
+  const row = await env.DB.prepare(`
+    SELECT COUNT(DISTINCT i.id) AS callableCount
+    FROM items i
+    JOIN sources s ON s.id = i.source_id
+    WHERE i.source_id = ?
+      AND i.status = 'active'
+      AND RTRIM(i.url, '/') <> RTRIM(s.url, '/')
+      AND ${buildSqlAssetExclusion("i")}
+  `).bind(sourceId).first<{ callableCount?: number }>();
+  return { callableCount: Number(row?.callableCount ?? 0) };
 }
 
 async function ensureUserSourcesSeeded(_env: Env, _userId: number) {
@@ -1264,6 +1592,58 @@ function extractDomain(sourceUrl: string) {
   return host || "unknown";
 }
 
+function sanitizeTagValue(input: string) {
+  return input
+    .trim()
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s\-_/]/gu, "")
+    .replace(/\s+/g, " ")
+    .slice(0, 32);
+}
+
+function parseTagsInput(tagsRaw: unknown): string[] {
+  if (!Array.isArray(tagsRaw)) return [];
+  const set = new Set<string>();
+  for (const raw of tagsRaw) {
+    if (typeof raw !== "string") continue;
+    const normalized = sanitizeTagValue(raw);
+    if (!normalized) continue;
+    set.add(normalized);
+    if (set.size >= 12) break;
+  }
+  return [...set];
+}
+
+function extractSignalFromItem(title: string, sourceName: string, itemUrl: string) {
+  const text = `${title} ${sourceName}`.toLowerCase();
+  const tokens = text
+    .split(/[^0-9a-zA-Z가-힣]+/)
+    .map((t) => t.trim())
+    .filter((t) => t.length >= 2 && t.length <= 24);
+  const stop = new Set([
+    "https", "http", "www", "com", "co", "kr", "net", "blog", "feed",
+    "그리고", "에서", "으로", "하는", "있는", "this", "that", "with", "from",
+  ]);
+  const clean = tokens.filter((t) => !stop.has(t));
+  const uniqueTags: string[] = [];
+  const seen = new Set<string>();
+  for (const t of clean) {
+    if (seen.has(t)) continue;
+    seen.add(t);
+    uniqueTags.push(t);
+    if (uniqueTags.length >= 6) break;
+  }
+
+  let topic = extractSourceHost(itemUrl);
+  if (!topic) topic = sanitizeTagValue(sourceName);
+  topic = topic.replace(/^www\./, "");
+
+  return {
+    tags: uniqueTags,
+    topic: topic || "general",
+  };
+}
+
 function extractSourceHost(sourceUrl: string) {
   try {
     return new URL(sourceUrl).hostname.toLowerCase().replace(/^www\./, "");
@@ -1343,6 +1723,7 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
   const sourceExclusion = buildInClause("i.source_id", options.excludeSourceIds);
   const memoClause = options.requireNoMemo ? "AND (n.content IS NULL OR trim(n.content) = '')" : "";
   // Keep memoed items excluded and allow memo-less resurfacing after cooldown.
+  // Blog-type (HTML-scraped) sources use a 30-day cooldown; RSS sources use 7 days.
   const assignedClause = options.excludeAssigned !== false
     ? `
       AND (n.content IS NULL OR trim(n.content) = '')
@@ -1351,12 +1732,60 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
         FROM user_feed_slots fs_chk
         WHERE fs_chk.item_id = i.id
           AND fs_chk.user_id = ?
-          AND fs_chk.date >= date(?, '-${RESURFACE_COOLDOWN_DAYS} day')
+          AND fs_chk.date >= date(?, CASE WHEN s.type = 'blog' THEN '-30 day' ELSE '-${RESURFACE_COOLDOWN_DAYS} day' END)
       )
     `
     : "";
   const limit = Math.max(0, options.limit);
   if (limit === 0) return [] as number[];
+
+  const activeSourceCountRow = await env.DB.prepare(`
+    SELECT COUNT(*) AS count FROM user_sources WHERE user_id = ? AND is_active = 1
+  `).bind(userId).first<{ count?: number }>();
+  const shouldApplyPreference = Number(activeSourceCountRow?.count ?? 0) >= PREFERENCE_APPLY_SOURCE_MIN;
+
+  const sourcePenalty = new Map<number, number>();
+  const tagPenalty = new Map<string, number>();
+  const topicPenalty = new Map<string, number>();
+  if (shouldApplyPreference) {
+    const sourceRows = await env.DB.prepare(`
+      SELECT source_id, score FROM user_source_penalties WHERE user_id = ?
+    `).bind(userId).all<{ source_id: number; score: number }>();
+    for (const row of sourceRows.results ?? []) sourcePenalty.set(Number(row.source_id), Number(row.score ?? 0));
+
+    const tagRows = await env.DB.prepare(`
+      SELECT tag, score FROM user_tag_penalties WHERE user_id = ?
+    `).bind(userId).all<{ tag: string; score: number }>();
+    for (const row of tagRows.results ?? []) tagPenalty.set(String(row.tag), Number(row.score ?? 0));
+
+    const topicRows = await env.DB.prepare(`
+      SELECT topic, score FROM user_topic_penalties WHERE user_id = ?
+    `).bind(userId).all<{ topic: string; score: number }>();
+    for (const row of topicRows.results ?? []) topicPenalty.set(String(row.topic), Number(row.score ?? 0));
+  }
+
+  const effectiveQueryLimit = Math.min(240, Math.max(limit * 8, 24));
+  const levelWeight = (level?: string) => {
+    if (level === "core") return 3;
+    if (level === "light") return 1;
+    return 2;
+  };
+  // Scoring: lower score = higher priority.
+  // recencyRank 0 = newest item, recencyRank n-1 = oldest item (within candidate set).
+  // Recency contributes up to 500_000 penalty for the oldest item, giving a strong
+  // but not absolute recency preference (randomness still mixes things up).
+  const scoreCandidate = (row: { id: number; source_id: number; title: string; url: string; level: string }, recencyRank: number, totalCandidates: number) => {
+    const recencyPenalty = totalCandidates > 1 ? (recencyRank / (totalCandidates - 1)) * 500_000 : 0;
+    const randomPart = (Math.random() * 500_000) / levelWeight(row.level);
+    const base = recencyPenalty + randomPart;
+    if (!shouldApplyPreference) return base;
+    const signals = extractSignalFromItem(row.title ?? "", "", row.url ?? "");
+    const sourceP = sourcePenalty.get(Number(row.source_id)) ?? 0;
+    const tagP = signals.tags.reduce((sum, t) => sum + (tagPenalty.get(t) ?? 0), 0);
+    const topicP = topicPenalty.get(signals.topic) ?? 0;
+    // Slight downrank only
+    return base + sourceP * 45 + tagP * 22 + topicP * 28;
+  };
 
   if (options.distinctBySource) {
     const rows = await env.DB.prepare(`
@@ -1364,13 +1793,9 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
         SELECT
           i.id,
           i.source_id,
-          (ABS(RANDOM()) % 1000000) * 1.0 /
-            CASE COALESCE(us.level, 'focus')
-              WHEN 'core' THEN 3.0
-              WHEN 'focus' THEN 2.0
-              WHEN 'light' THEN 1.0
-              ELSE 2.0
-            END AS score,
+          i.title,
+          i.url,
+          COALESCE(us.level, 'focus') AS level,
           ROW_NUMBER() OVER (
             PARTITION BY i.source_id
             ORDER BY i.id DESC
@@ -1389,9 +1814,13 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
           ${sourceExclusion.sql}
       )
       SELECT id
+           , source_id AS source_id
+           , title
+           , url
+           , level
       FROM candidate
       WHERE source_rank = 1
-      ORDER BY id DESC, score
+      ORDER BY id DESC
       LIMIT ?
     `).bind(
       userId,
@@ -1399,16 +1828,30 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
       ...(options.excludeAssigned !== false ? [userId, targetDate] : []),
       ...itemExclusion.params,
       ...sourceExclusion.params,
-      limit,
+      effectiveQueryLimit,
     ).all();
 
-    return ((rows.results ?? []) as Record<string, unknown>[])
-      .map((row) => Number(row.id))
-      .filter(Number.isFinite);
+    const candidates = ((rows.results ?? []) as Record<string, unknown>[])
+      .map((row) => ({
+        id: Number(row.id),
+        source_id: Number(row.source_id),
+        title: String(row.title ?? ""),
+        url: String(row.url ?? ""),
+        level: String(row.level ?? "focus"),
+      }))
+      .filter((row) => Number.isFinite(row.id))
+      // Sort newest-first so recencyRank index maps correctly to item age.
+      .sort((a, b) => b.id - a.id);
+    const ranked = candidates
+      .map((row, idx) => ({ ...row, score: scoreCandidate(row, idx, candidates.length) }))
+      .sort((a, b) => a.score - b.score)
+      .slice(0, limit)
+      .map((row) => row.id);
+    return ranked;
   }
 
   const rows = await env.DB.prepare(`
-    SELECT i.id
+    SELECT i.id, i.source_id, i.title, i.url, COALESCE(us.level, 'focus') AS level
     FROM items i
     JOIN user_sources us ON us.user_id = ? AND us.source_id = i.source_id
     JOIN sources s ON s.id = i.source_id
@@ -1421,14 +1864,7 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
       ${assignedClause}
       ${itemExclusion.sql}
       ${sourceExclusion.sql}
-    ORDER BY i.id DESC,
-      (ABS(RANDOM()) % 1000000) * 1.0 /
-      CASE COALESCE(us.level, 'focus')
-        WHEN 'core' THEN 3.0
-        WHEN 'focus' THEN 2.0
-        WHEN 'light' THEN 1.0
-        ELSE 2.0
-      END
+    ORDER BY i.id DESC
     LIMIT ?
   `).bind(
     userId,
@@ -1436,12 +1872,25 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
     ...(options.excludeAssigned !== false ? [userId, targetDate] : []),
     ...itemExclusion.params,
     ...sourceExclusion.params,
-    limit,
+    effectiveQueryLimit,
   ).all();
 
-  return ((rows.results ?? []) as Record<string, unknown>[])
-    .map((row) => Number(row.id))
-    .filter(Number.isFinite);
+  const candidates2 = ((rows.results ?? []) as Record<string, unknown>[])
+    .map((row) => ({
+      id: Number(row.id),
+      source_id: Number(row.source_id),
+      title: String(row.title ?? ""),
+      url: String(row.url ?? ""),
+      level: String(row.level ?? "focus"),
+    }))
+    .filter((row) => Number.isFinite(row.id))
+    .sort((a, b) => b.id - a.id);
+  const ranked = candidates2
+    .map((row, idx) => ({ ...row, score: scoreCandidate(row, idx, candidates2.length) }))
+    .sort((a, b) => a.score - b.score)
+    .slice(0, limit)
+    .map((row) => row.id);
+  return ranked;
 }
 
 async function pruneDateAssetLikeSlots(targetDate: string, env: Env, userId: number) {
@@ -1682,6 +2131,30 @@ async function ensureSourceRefreshTable(env: Env) {
   `).run();
 }
 
+/** Weekly cron: re-crawl every active source with cache bypass to pick up new content. */
+async function refreshAllSourcesGlobal(env: Env) {
+  await ensureSourceRefreshTable(env);
+  const sources = await env.DB.prepare(`
+    SELECT DISTINCT s.id, s.name, s.url, s.type
+    FROM sources s
+    JOIN user_sources us ON us.source_id = s.id
+    WHERE us.is_active = 1
+    ORDER BY s.id ASC
+  `).all<{ id: number; name: string; url: string; type: SourceType }>();
+
+  for (const source of sources.results ?? []) {
+    try {
+      await hydrateSourceItems(source, env, true /* fresh — bypass cache */);
+    } catch { /* best-effort: skip erroring sources */ } finally {
+      await env.DB.prepare(`
+        INSERT INTO source_refresh_state (source_id, last_refreshed_at)
+        VALUES (?, CURRENT_TIMESTAMP)
+        ON CONFLICT(source_id) DO UPDATE SET last_refreshed_at = CURRENT_TIMESTAMP
+      `).bind(source.id).run();
+    }
+  }
+}
+
 async function refreshStaleSourcesInBackground(env: Env, userId: number) {
   await ensureSourceRefreshTable(env);
   const staleSources = await env.DB.prepare(`
@@ -1783,8 +2256,9 @@ async function seedItemForSource(
 async function hydrateSourceItems(
   source: { id: number; name: string; url: string; type: SourceType },
   env: Env,
+  fresh = false,
 ) {
-  const inserted = await ingestItemsForSource(source, env);
+  const inserted = await ingestItemsForSource(source, env, fresh);
   if (inserted <= 0) return;
 
   await env.DB.prepare(`
@@ -1803,8 +2277,9 @@ async function hydrateSourceItems(
 async function ingestItemsForSource(
   source: { id: number; name: string; url: string; type: SourceType },
   env: Env,
+  fresh = false,
 ) {
-  const entries = await collectSourceEntries(source);
+  const entries = await collectSourceEntries(source, fresh);
   if (entries.length === 0) return 0;
 
   let inserted = 0;
@@ -1812,9 +2287,14 @@ async function ingestItemsForSource(
   for (let idx = 0; idx < limitedEntries.length; idx += 1) {
     const entry = limitedEntries[idx];
     const shouldStrictValidate = idx < ENTRY_VALIDATE_LIMIT_PER_SOURCE;
+    // True when the feed provided no title — we only have a URL-slug guess.
+    // These entries need HTML enrichment even if summary/thumbnail exist.
+    const titleIsUrlDerived = !normalizeDisplayText(entry.title || "");
     let prefetchedHtml: string | null = null;
     let resolvedUrl = entry.url;
-    const shouldValidateLanding = shouldStrictValidate && shouldValidateEntryLanding(entry.url, source.url);
+    // Validate landing for: known risky URL patterns, AND for any entry whose
+    // title we will have to guess from the URL slug (likely misses real title).
+    const shouldValidateLanding = shouldStrictValidate && (shouldValidateEntryLanding(entry.url, source.url) || titleIsUrlDerived);
     if (shouldValidateLanding) {
       const validated = await resolveValidatedLanding(entry.url, source.url);
       if (!validated) {
@@ -1829,17 +2309,25 @@ async function ingestItemsForSource(
     let resolvedSummary = entry.summary ? normalizeDisplayText(entry.summary) : null;
     let resolvedThumbnail = entry.thumbnailUrl ?? null;
 
-    if (isWeakEntryTitle(resolvedTitle, source.name) || !isUsableSummary(resolvedSummary ?? "") || !resolvedThumbnail) {
+    if (isWeakEntryTitle(resolvedTitle, source.name) || titleIsUrlDerived || !isUsableSummary(resolvedSummary ?? "") || !resolvedThumbnail) {
       const html = prefetchedHtml ?? await fetchSourceText(resolvedUrl, "text/html,application/xhtml+xml");
+      // If the page is completely unreachable (404, blocked, etc.) and we have no
+      // metadata at all from the feed, there is nothing useful to show. Skip it
+      // unless the source is a protected-content host where fetching always fails.
+      if (!html && !isUsableSummary(resolvedSummary ?? "") && !resolvedThumbnail) {
+        if (!isProtectedContentHost(source.url)) continue;
+      }
       if (html) {
-        if (isWeakEntryTitle(resolvedTitle, source.name)) {
-          const htmlTitle = normalizeDisplayText((extractHtmlTitle(html) ?? "").replace(/\|\s*Substack.*$/i, "").trim());
-          const metaTitle = normalizeDisplayText(extractMetaTitle(html) ?? "");
-          if (htmlTitle && !isWeakEntryTitle(htmlTitle, source.name)) {
-            resolvedTitle = htmlTitle;
-          } else if (metaTitle && !isWeakEntryTitle(metaTitle, source.name)) {
-            resolvedTitle = metaTitle;
-          }
+        // Always try to get a better title from HTML when we have it —
+        // not just when the current title is "weak". This fixes cases where
+        // deriveTitleFromUrl produced a URL slug (e.g. "newoffice") that passes
+        // isWeakEntryTitle but is still worse than the real page title.
+        const htmlTitle = normalizeDisplayText((extractHtmlTitle(html) ?? "").replace(/\|\s*Substack.*$/i, "").trim());
+        const metaTitle = normalizeDisplayText(extractMetaTitle(html) ?? "");
+        if (htmlTitle && !isWeakEntryTitle(htmlTitle, source.name)) {
+          resolvedTitle = htmlTitle;
+        } else if (metaTitle && !isWeakEntryTitle(metaTitle, source.name)) {
+          resolvedTitle = metaTitle;
         }
         if (!resolvedSummary || !isUsableSummary(resolvedSummary)) {
           const metaSummary = normalizeDisplayText(extractMetaDescription(html) ?? "");
@@ -1882,6 +2370,14 @@ async function ingestItemsForSource(
           WHEN items.title LIKE '%]]>%' THEN excluded.title
           WHEN length(trim(items.title)) <= 8 AND trim(items.title) NOT GLOB '*[^0-9]*' THEN excluded.title
           WHEN items.title LIKE '%!%%' ESCAPE '!' THEN excluded.title
+          -- Single-word all-lowercase title with no spaces (≤20 chars) is almost
+          -- certainly a URL slug stored from a previous deriveTitleFromUrl pass.
+          -- Allow the new enriched title to overwrite it.
+          WHEN items.title NOT GLOB '* *'
+            AND items.title GLOB '*[a-z]*'
+            AND items.title NOT GLOB '*[A-Z]*'
+            AND items.title NOT GLOB '*[0-9]*'
+            AND length(trim(items.title)) BETWEEN 3 AND 20 THEN excluded.title
           ELSE items.title
         END,
         summary = CASE
@@ -1914,14 +2410,14 @@ async function ingestItemsForSource(
   return inserted;
 }
 
-async function fetchSourceText(targetUrl: string, accept = "text/html,application/xhtml+xml,application/xml,text/xml") {
+async function fetchSourceText(targetUrl: string, accept = "text/html,application/xhtml+xml,application/xml,text/xml", fresh = false) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 7000);
   try {
     const res = await fetch(targetUrl, {
       headers: buildCrawlerHeaders(accept),
       signal: controller.signal,
-      cf: { cacheEverything: true, cacheTtl: 60 * 30 },
+      cf: fresh ? { cacheEverything: false } : { cacheEverything: true, cacheTtl: 60 * 30 },
     });
     if (!res.ok) return null;
     return await res.text();
@@ -1974,14 +2470,26 @@ function extractAlternateHreflangUrl(html: string, pageUrl: string, langPrefix: 
 
 function isLikelyErrorPage(html: string, resolvedUrl: string) {
   const lowerUrl = resolvedUrl.toLowerCase();
-  if (/(^|\/)(404|not-found|not_found)(\/|$)/.test(lowerUrl)) return true;
-  const head = html.slice(0, 1200).toLowerCase();
+  if (/(^|\/)(404|not-found|not_found|error)(\/|$)/.test(lowerUrl)) return true;
+  const head = html.slice(0, 1500).toLowerCase();
+  // Title-tag 404 patterns (catches "<title>404 Not Found</title>" etc.)
+  const titleMatch = head.match(/<title[^>]*>([^<]{0,120})<\/title>/);
+  if (titleMatch) {
+    const t = titleMatch[1];
+    if (/\b404\b/.test(t) || /not.?found/i.test(t) || /page.?not.?found/i.test(t)) return true;
+  }
   return (
     head.includes("page not found") ||
     head.includes(">404<") ||
+    head.includes("404 not found") ||
     head.includes("not found -") ||
+    head.includes("- not found") ||
+    head.includes("이 페이지는 존재하지") ||
     head.includes("찾을 수 없습니다") ||
-    head.includes("존재하지 않는")
+    head.includes("존재하지 않는") ||
+    head.includes("페이지를 찾을 수") ||
+    head.includes("삭제된 게시물") ||
+    head.includes("삭제된 페이지")
   );
 }
 
@@ -2096,22 +2604,22 @@ async function ensureThumbnailsForShownItems(rows: Record<string, unknown>[], en
 
 type SourceEntry = { title: string; url: string; summary?: string; thumbnailUrl?: string };
 
-async function collectSourceEntries(source: { url: string; type: SourceType }): Promise<SourceEntry[]> {
+async function collectSourceEntries(source: { url: string; type: SourceType }, fresh = false): Promise<SourceEntry[]> {
   if (source.type === "rss") {
-    const text = await fetchSourceText(source.url, "application/rss+xml,application/atom+xml,application/xml,text/xml,text/html");
+    const text = await fetchSourceText(source.url, "application/rss+xml,application/atom+xml,application/xml,text/xml,text/html", fresh);
     const fromFeed = text ? parseRssEntries(text, source.url) : [];
     const fromSitemap = text ? await collectEntriesFromSitemap(source.url, text) : [];
     const fromHtml = text ? collectEntriesFromHtmlLinks(text, source.url) : [];
     return dedupeEntries([...fromFeed, ...fromSitemap, ...fromHtml]).slice(0, ENTRY_LIMIT_PER_SOURCE);
   }
 
-  const html = await fetchSourceText(source.url, "text/html,application/xhtml+xml,application/xml,text/xml");
+  const html = await fetchSourceText(source.url, "text/html,application/xhtml+xml,application/xml,text/xml", fresh);
   if (!html) return [];
 
   const aggregated: SourceEntry[] = [];
   const feedUrls = discoverFeedUrlsFromHtml(html, source.url);
   for (const feedUrl of feedUrls) {
-    const feedText = await fetchSourceText(feedUrl, "application/rss+xml,application/atom+xml,application/xml,text/xml,text/html");
+    const feedText = await fetchSourceText(feedUrl, "application/rss+xml,application/atom+xml,application/xml,text/xml,text/html", fresh);
     if (!feedText) continue;
     aggregated.push(...parseRssEntries(feedText, feedUrl));
     if (aggregated.length >= ENTRY_LIMIT_PER_SOURCE * 2) break;
@@ -2225,6 +2733,8 @@ function parseRssEntries(xml: string, baseUrl: string) {
     if (!link) continue;
     // Skip asset/font/binary URLs that sometimes appear in RSS <link> fields
     if (isAssetLikeContentUrl(link)) continue;
+    // Skip obvious index/pagination URLs (e.g. /archive/3, /page/2)
+    if (isRssPaginationUrl(link)) continue;
     entries.push({
       title,
       url: link,
@@ -2247,6 +2757,7 @@ function parseRssEntries(xml: string, baseUrl: string) {
     const link = normalizeEntryUrl(linkRaw, baseUrl);
     if (!link) continue;
     if (isAssetLikeContentUrl(link)) continue;
+    if (isRssPaginationUrl(link)) continue;
     entries.push({
       title,
       url: link,
@@ -2736,9 +3247,15 @@ function isLikelyArticleUrl(url: string, seedHost: string) {
       path.startsWith("/author/") ||
       path.startsWith("/authors/") ||
       path.startsWith("/topic/") ||
-      path.startsWith("/topics/")
+      path.startsWith("/topics/") ||
+      path.startsWith("/archive/") ||
+      path.startsWith("/archives/") ||
+      path.startsWith("/site-map/") ||
+      path.startsWith("/sitemap/") ||
+      path.startsWith("/ir/") ||
+      path.startsWith("/investor-relations/")
     ) return false;
-    if (["page", "index", "feed", "rss", "atom", "everything"].includes(tail)) return false;
+    if (["page", "index", "feed", "rss", "atom", "everything", "default.aspx", "default", "sitemap", "site-map"].includes(tail)) return false;
 
     if (host.includes("bucketplace.com")) {
       return /\/(ko|en|ja)\/post\//.test(path) || /\/post\//.test(path);
@@ -2796,16 +3313,55 @@ function isFallbackContentUrl(url: string, seedHost: string) {
       path.startsWith("/authors/") ||
       path.startsWith("/topic/") ||
       path.startsWith("/topics/") ||
+      path.startsWith("/archive/") ||
+      path.startsWith("/archives/") ||
+      path.startsWith("/site-map/") ||
+      path.startsWith("/sitemap/") ||
+      path.startsWith("/ir/") ||
+      path.startsWith("/investor-relations/") ||
       path.startsWith("/search/") ||
       path.startsWith("/page/")
     ) return false;
     const segments = path.split("/").filter(Boolean);
     const tail = segments[segments.length - 1]?.toLowerCase() || "";
-    if (["feed", "rss", "atom", "index", "page", "about", "contact", "receive", "subscribe", "unsubscribe", "login", "logout", "signup"].includes(tail)) return false;
+    if (["feed", "rss", "atom", "index", "page", "about", "contact", "receive", "subscribe", "unsubscribe", "login", "logout", "signup", "archive", "archives", "default.aspx", "default", "sitemap", "site-map"].includes(tail)) return false;
     // Require at least 2 meaningful segments (e.g. /year/slug or /section/slug).
     // Single-segment paths (/receive, /life) are almost never articles.
     if (segments.length < 2) return false;
     return tail.length >= 4;
+  } catch {
+    return false;
+  }
+}
+
+function isRssPaginationUrl(url: string) {
+  // Rejects obvious index/pagination URLs that sometimes appear in RSS feeds.
+  // e.g. /archive/3  /page/5  /archives/2024  /category/news
+  try {
+    const parsed = new URL(url);
+    const path = parsed.pathname.replace(/\/+$/, "");
+    // Block well-known index/pagination path prefixes
+    if (
+      path.startsWith("/archive/") ||
+      path.startsWith("/archives/") ||
+      path.startsWith("/page/") ||
+      path.startsWith("/category/") ||
+      path.startsWith("/categories/") ||
+      path.startsWith("/tag/") ||
+      path.startsWith("/tags/") ||
+      path.startsWith("/site-map/") ||
+      path.startsWith("/sitemap/") ||
+      path.startsWith("/ir/") ||
+      path.startsWith("/investor-relations/")
+    ) return true;
+    const parts = path.split("/").filter(Boolean);
+    if (parts.length === 0) return true;
+    const tail = parts[parts.length - 1].toLowerCase();
+    // 1-3 digit tail = pagination number
+    if (/^\d{1,3}$/.test(tail)) return true;
+    // Known index-only slugs as the final segment
+    if (["archive", "archives", "feed", "rss", "atom", "index", "home"].includes(tail)) return true;
+    return false;
   } catch {
     return false;
   }
@@ -2818,6 +3374,8 @@ function isAssetLikeContentUrl(url: string) {
     const q = parsed.search.toLowerCase();
     if (
       path.includes("/wp-content/") ||
+      path.includes("/wp-admin/") ||
+      path.includes("admin-ajax") ||
       path.includes("/assets/") ||
       path.includes("/fonts/") ||
       path.includes("/_static/") ||
@@ -3061,9 +3619,52 @@ async function ensureUserScopedTables(env: Env) {
       user_id INTEGER NOT NULL,
       item_id INTEGER NOT NULL,
       type TEXT NOT NULL CHECK (type IN ('keep', 'skip')),
+      reason TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
       FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
+    )
+  `).run();
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS user_item_tags (
+      user_id INTEGER NOT NULL,
+      item_id INTEGER NOT NULL,
+      tag TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (user_id, item_id, tag),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
+    )
+  `).run();
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS user_source_penalties (
+      user_id INTEGER NOT NULL,
+      source_id INTEGER NOT NULL,
+      score REAL NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (user_id, source_id),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE
+    )
+  `).run();
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS user_tag_penalties (
+      user_id INTEGER NOT NULL,
+      tag TEXT NOT NULL,
+      score REAL NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (user_id, tag),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    )
+  `).run();
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS user_topic_penalties (
+      user_id INTEGER NOT NULL,
+      topic TEXT NOT NULL,
+      score REAL NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (user_id, topic),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     )
   `).run();
 }
@@ -3118,17 +3719,17 @@ async function handlePostAuthGoogle(request: Request, env: Env) {
     return json({ error: "INVALID_GOOGLE_CLAIMS" }, { status: 401 });
   }
 
-  let user = await env.DB.prepare("SELECT id FROM users WHERE email = ? LIMIT 1")
+  let user = await env.DB.prepare("SELECT id, created_at FROM users WHERE email = ? LIMIT 1")
     .bind(email)
-    .first<{ id: number }>();
+    .first<{ id: number; created_at: string }>();
   if (!user) {
     await env.DB.prepare(`
       INSERT INTO users (email, display_name, avatar_url, last_login_at)
       VALUES (?, ?, ?, CURRENT_TIMESTAMP)
     `).bind(email, displayName || null, avatarUrl || null).run();
-    user = await env.DB.prepare("SELECT id FROM users WHERE email = ? LIMIT 1")
+    user = await env.DB.prepare("SELECT id, created_at FROM users WHERE email = ? LIMIT 1")
       .bind(email)
-      .first<{ id: number }>();
+      .first<{ id: number; created_at: string }>();
   } else {
     await env.DB.prepare(`
       UPDATE users
@@ -3182,6 +3783,7 @@ async function handlePostAuthGoogle(request: Request, env: Env) {
       email,
       displayName: displayName || null,
       avatarUrl: avatarUrl || null,
+      createdAt: user.created_at,
     },
   });
 }
@@ -3363,9 +3965,9 @@ async function authenticateSession(request: Request, env: Env): Promise<
 }
 
 async function handlePostNote(itemId: number, request: Request, env: Env, userId: number) {
-  let body: { content?: string };
+  let body: { content?: string; tags?: string[] };
   try {
-    body = (await request.json()) as { content?: string };
+    body = (await request.json()) as { content?: string; tags?: string[] };
   } catch {
     return json({ error: "Invalid JSON body" }, { status: 400 });
   }
@@ -3380,6 +3982,20 @@ async function handlePostNote(itemId: number, request: Request, env: Env, userId
     ON CONFLICT(user_id, item_id) DO UPDATE SET content = excluded.content, updated_at = CURRENT_TIMESTAMP
   `).bind(userId, itemId, body.content).run();
 
+  const tags = parseTagsInput(body.tags);
+  await env.DB.prepare("DELETE FROM user_item_tags WHERE user_id = ? AND item_id = ?")
+    .bind(userId, itemId).run();
+  if (tags.length > 0) {
+    await env.DB.batch(
+      tags.map((tag) =>
+        env.DB.prepare(`
+          INSERT OR IGNORE INTO user_item_tags (user_id, item_id, tag)
+          VALUES (?, ?, ?)
+        `).bind(userId, itemId, tag)
+      )
+    );
+  }
+
   return json({ ok: true });
 }
 
@@ -3388,12 +4004,70 @@ async function handleGetNote(itemId: number, env: Env, userId: number) {
     .prepare("SELECT content FROM user_notes WHERE user_id = ? AND item_id = ? LIMIT 1")
     .bind(userId, itemId)
     .first<{ content?: string }>();
-  return json({ content: row?.content ?? "" });
+  const tagRows = await env.DB.prepare(`
+    SELECT tag FROM user_item_tags
+    WHERE user_id = ? AND item_id = ?
+    ORDER BY created_at DESC, tag ASC
+    LIMIT 12
+  `).bind(userId, itemId).all<{ tag: string }>();
+
+  const itemRow = await env.DB.prepare(`
+    SELECT i.title, i.url, s.name AS sourceName
+    FROM items i
+    JOIN sources s ON s.id = i.source_id
+    WHERE i.id = ?
+    LIMIT 1
+  `).bind(itemId).first<{ title?: string; url?: string; sourceName?: string }>();
+  const recommended = extractSignalFromItem(
+    String(itemRow?.title ?? ""),
+    String(itemRow?.sourceName ?? ""),
+    String(itemRow?.url ?? ""),
+  ).tags.slice(0, 6);
+
+  return json({
+    content: row?.content ?? "",
+    tags: (tagRows.results ?? []).map((r) => String(r.tag)),
+    recommendedTags: recommended,
+  });
 }
 
 async function handleDeleteNote(itemId: number, env: Env, userId: number) {
   await env.DB.prepare("DELETE FROM user_notes WHERE user_id = ? AND item_id = ?").bind(userId, itemId).run();
+  await env.DB.prepare("DELETE FROM user_item_tags WHERE user_id = ? AND item_id = ?").bind(userId, itemId).run();
   return json({ ok: true });
+}
+
+async function handleGetRelatedItemsByTag(itemId: number, env: Env, userId: number) {
+  const tagsResult = await env.DB.prepare(`
+    SELECT tag
+    FROM user_item_tags
+    WHERE user_id = ? AND item_id = ?
+    LIMIT 12
+  `).bind(userId, itemId).all<{ tag: string }>();
+  const tags = (tagsResult.results ?? []).map((row) => String(row.tag));
+  if (tags.length === 0) return json({ items: [] });
+
+  const placeholders = tags.map(() => "?").join(", ");
+  const rows = await env.DB.prepare(`
+    SELECT i.id, i.title, i.url, s.name AS sourceName, COUNT(*) AS sharedTagCount
+    FROM user_item_tags ut
+    JOIN items i ON i.id = ut.item_id
+    JOIN sources s ON s.id = i.source_id
+    WHERE ut.user_id = ?
+      AND ut.tag IN (${placeholders})
+      AND ut.item_id != ?
+      AND EXISTS (
+        SELECT 1 FROM user_notes un
+        WHERE un.user_id = ut.user_id
+          AND un.item_id = ut.item_id
+          AND trim(COALESCE(un.content, '')) <> ''
+      )
+    GROUP BY i.id, i.title, i.url, s.name
+    ORDER BY sharedTagCount DESC, i.id DESC
+    LIMIT 8
+  `).bind(userId, ...tags, itemId).all<{ id: number; title: string; url: string; sourceName: string; sharedTagCount: number }>();
+
+  return json({ items: rows.results ?? [] });
 }
 
 async function handlePatchSource(sourceId: number, request: Request, env: Env, userId: number) {

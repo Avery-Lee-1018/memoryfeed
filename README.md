@@ -1,6 +1,30 @@
 # memoryfeed
 기억해둔 링크를 날짜별 피드(3장)로 다시 꺼내보는 개인 MVP.
 
+## Documentation Map
+- 빠른 시작(요약): [CLAUDE.md](./CLAUDE.md)
+- 제품 원칙(왜): [PRODUCT_PRINCIPLES.md](./PRODUCT_PRINCIPLES.md)
+- 범위(무엇까지): [MVP_SCOPE.md](./MVP_SCOPE.md)
+- UX 가드레일(어떻게): [DESIGN_UX_PRINCIPLES.md](./DESIGN_UX_PRINCIPLES.md)
+- 기술 구조: [ARCHITECTURE.md](./ARCHITECTURE.md)
+- 데이터 구조: [DATA_MODEL.md](./DATA_MODEL.md)
+- 실행 항목: [TASKS.md](./TASKS.md)
+- 인증 연구: [AUTH_RESEARCH.md](./AUTH_RESEARCH.md)
+
+## Design/UX Guardrail (필독)
+- 신규 기능/수정 작업 전, 아래 문서를 먼저 확인:
+  - [DESIGN_UX_PRINCIPLES.md](./DESIGN_UX_PRINCIPLES.md)
+- 본 프로젝트는 기능 추가보다 “기억 회고 경험” 일관성을 우선합니다.
+- PR/커밋 전 최소 점검:
+  - 액션 후 결과 명확성(개선 또는 피드아웃 등)
+  - 모바일/웹 레이아웃 안정성
+  - 닫기 가능한 레이어의 명시적 닫기 버튼
+  - 성능/비용 영향(불필요한 재수집/중복 요청 방지)
+
+## Documentation Rules
+- 상위 문서에는 핵심 의사결정만 남기고, 상세 절차는 분리 문서로 연결합니다.
+- 같은 내용은 한 문서만 정본으로 유지하고 다른 문서는 링크로 참조합니다.
+
 ## 현재 상태 (main 기준)
 - Feed / My 2개 뷰
 - 날짜 이동(`←`, `→`, `TODAY`) + 날짜별 고정 헤드라인

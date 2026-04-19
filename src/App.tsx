@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import FeedCard, { FeedItem } from "@/components/FeedCard";
 import CardSkeleton from "@/components/CardSkeleton";
@@ -7,6 +7,9 @@ import MySourcesView from "@/components/MySourcesView";
 import AppToast, { type AppToastState } from "@/components/AppToast";
 import AuthGate from "@/components/AuthGate";
 import SplashScreen from "@/components/SplashScreen";
+import SideNav, { type CalendarDate } from "@/components/SideNav";
+import AccountPanel from "@/components/AccountPanel";
+import { SpiralDemo } from "@/components/ui/spiral-demo";
 import { authorizedFetch, readJson } from "@/lib/api";
 import { FEED_START_DATE, getTitleForDate, shiftDate, toIsoDate } from "@/lib/feed";
 import {
@@ -20,11 +23,23 @@ import { fetchMe, logout, type AuthUser } from "@/lib/auth-session";
 
 const SKELETON_MIN_MS = 500;
 const AUTO_RELOAD_SYNC_MS = 3 * 60 * 1000;
+const PENDING_UNCLASSIFIED_KEY = "memoryfeed.pendingUnclassifiedSourceIds.v1";
+
+function extractHost(url: string) {
+  try {
+    return new URL(url).hostname.toLowerCase().replace(/^www\./, "");
+  } catch {
+    return "";
+  }
+}
 
 export default function App() {
   const [authReady, setAuthReady] = useState(false);
   const [authUser, setAuthUser] = useState<AuthUser | null>(null);
-  const [view, setView] = useState<"feed" | "sources">("feed");
+  const [view, setView] = useState<"feed" | "sources">(() => {
+    const stored = sessionStorage.getItem("activeView");
+    return stored === "sources" ? "sources" : "feed";
+  });
   const [items, setItems] = useState<FeedItem[]>([]);
   const [initialItemCount, setInitialItemCount] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -47,12 +62,44 @@ export default function App() {
   const [sourcesLoading, setSourcesLoading] = useState(false);
   const [refreshingSourceIds, setRefreshingSourceIds] = useState<Set<number>>(new Set());
   const [toast, setToast] = useState<AppToastState>(null);
+  const [snbOpen, setSnbOpen] = useState(false);
+  const [accountOpen, setAccountOpen] = useState(false);
+  const [calendarDates, setCalendarDates] = useState<CalendarDate[]>([]);
+  const [isDesktopSnb, setIsDesktopSnb] = useState(false);
+  const [sourceMemoFocus, setSourceMemoFocus] = useState<{ id: number; name: string } | null>(null);
+  const lastMyScrollYRef = useRef(0);
+  const restoreMyScrollRef = useRef(false);
+  const [skipReasonItemId, setSkipReasonItemId] = useState<number | null>(null);
+  const [onboardingHosts, setOnboardingHosts] = useState<string[]>([]);
+  const [onboardingSourceIds, setOnboardingSourceIds] = useState<number[]>([]);
+  const [pendingSourceIds, setPendingSourceIds] = useState<number[]>(() => {
+    try {
+      const raw = localStorage.getItem(PENDING_UNCLASSIFIED_KEY);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw) as number[];
+      return Array.isArray(parsed) ? parsed.filter((v) => Number.isFinite(v)).map(Number) : [];
+    } catch {
+      return [];
+    }
+  });
+  const [showIntro, setShowIntro] = useState(false);
+  const onboardingScheduledRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     fetchMe()
       .then((user) => setAuthUser(user))
       .finally(() => setAuthReady(true));
   }, []);
+
+  // Clamp selectedDate to feedStartDate after authUser loads
+  useEffect(() => {
+    if (!authUser) return;
+    const start = authUser.createdAt?.slice(0, 10) ?? FEED_START_DATE;
+    if (selectedDate < start) {
+      setSelectedDate(start);
+      sessionStorage.setItem("selectedDate", start);
+    }
+  }, [authUser]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -62,6 +109,28 @@ export default function App() {
       }
     }, AUTO_RELOAD_SYNC_MS);
     return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    sessionStorage.setItem("activeView", view);
+  }, [view]);
+
+  const handleIntroComplete = () => setShowIntro(false);
+
+  const handleSignedIn = (user: AuthUser) => {
+    setAuthUser(user);
+    setAuthReady(true);
+    // Show intro only for explicit sign-in events.
+    // Session restore on page refresh should not trigger intro.
+    setShowIntro(true);
+  };
+
+  useEffect(() => {
+    const mq = window.matchMedia("(min-width: 1024px)");
+    const sync = () => setIsDesktopSnb(mq.matches);
+    sync();
+    mq.addEventListener("change", sync);
+    return () => mq.removeEventListener("change", sync);
   }, []);
 
   const loadFeed = async (date: string) => {
@@ -82,6 +151,7 @@ export default function App() {
         setInitialItemCount(nextItems.length);
         setReplacingIds(new Set());
         setMemoItemIds(new Set(nextItems.filter((i) => i.hasNote).map((i) => i.id)));
+        void loadCalendar();
       })
       .catch((error) => {
         if (error instanceof Error && error.message === "AUTH_REQUIRED") return;
@@ -92,8 +162,42 @@ export default function App() {
 
   useEffect(() => {
     if (!authUser) return;
+    if (sourceMemoFocus) return;
     void loadFeed(selectedDate);
-  }, [selectedDate, authUser]);
+  }, [selectedDate, authUser, sourceMemoFocus]);
+
+  const loadSourceMemoFeed = async (sourceId: number, sourceName: string) => {
+    lastMyScrollYRef.current = window.scrollY;
+    setLoading(true);
+    setSourceMemoFocus({ id: sourceId, name: sourceName });
+    try {
+      const res = await authorizedFetch(`/api/sources/${sourceId}/memos`);
+      const data = await readJson<{ items?: FeedItem[] }>(res);
+      const nextItems = data.items ?? [];
+      setItems(nextItems);
+      setInitialItemCount(nextItems.length);
+      setReplacingIds(new Set());
+      setMemoItemIds(new Set(nextItems.filter((i) => i.hasNote).map((i) => i.id)));
+      setView("feed");
+      setSnbOpen(false);
+    } catch (error) {
+      console.error(error);
+      setToast({
+        tone: "error",
+        title: "소스 피드를 불러오지 못했어요",
+        description: "잠시 후 다시 시도해 주세요.",
+      });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const backToMyFromSourceFeed = () => {
+    setSourceMemoFocus(null);
+    setView("sources");
+    setSnbOpen(false);
+    restoreMyScrollRef.current = true;
+  };
 
   const loadSources = async (showLoading = true) => {
     if (showLoading) setSourcesLoading(true);
@@ -117,13 +221,75 @@ export default function App() {
   }, [view, authUser]);
 
   useEffect(() => {
+    localStorage.setItem(PENDING_UNCLASSIFIED_KEY, JSON.stringify(pendingSourceIds));
+  }, [pendingSourceIds]);
+
+  useEffect(() => {
+    if (onboardingHosts.length === 0 || sources.length === 0) return;
+    const matched = onboardingHosts
+      .map((host) => ({
+        host,
+        source: sources.find((s) => extractHost(s.url) === host),
+      }))
+      .filter((x): x is { host: string; source: SourceEntry } => !!x.source)
+      .filter((x) => !onboardingScheduledRef.current.has(x.host));
+
+    matched.forEach((item, idx) => {
+      onboardingScheduledRef.current.add(item.host);
+      window.setTimeout(() => {
+        setOnboardingHosts((prev) => prev.filter((h) => h !== item.host));
+        setOnboardingSourceIds((prev) => (prev.includes(item.source.id) ? prev : [...prev, item.source.id]));
+        setPendingSourceIds((prev) => (prev.includes(item.source.id) ? prev : [...prev, item.source.id]));
+      }, (idx + 1) * 280);
+    });
+  }, [onboardingHosts, sources]);
+
+  useEffect(() => {
+    if (sources.length === 0) return;
+    const existing = new Set(sources.map((s) => s.id));
+    setPendingSourceIds((prev) => prev.filter((id) => existing.has(id)));
+    // Auto-resolve from unclassified after actual interaction starts.
+    setPendingSourceIds((prev) =>
+      prev.filter((id) => {
+        const s = sources.find((x) => x.id === id);
+        if (!s) return false;
+        return s.exposureCount === 0 && s.memoCount === 0;
+      })
+    );
+  }, [sources]);
+
+  useEffect(() => {
+    if (view !== "sources" || !restoreMyScrollRef.current) return;
+    const y = lastMyScrollYRef.current;
+    requestAnimationFrame(() => {
+      window.scrollTo({ top: y, behavior: "auto" });
+      restoreMyScrollRef.current = false;
+    });
+  }, [view, sourcesLoading]);
+
+  const loadCalendar = async () => {
+    try {
+      const res = await authorizedFetch("/api/stats/calendar");
+      const data = await readJson<{ startDate?: string; dates?: CalendarDate[] }>(res);
+      if (data.dates) setCalendarDates(data.dates);
+    } catch (error) {
+      console.error(error);
+    }
+  };
+
+  useEffect(() => {
+    if (!authUser) return;
+    void loadCalendar();
+  }, [authUser]);
+
+  useEffect(() => {
     if (!toast) return;
     const duration = toast.undoFn ? 1500 : toast.retryUrls?.length ? 8000 : 4500;
     const timeout = window.setTimeout(() => setToast(null), duration);
     return () => window.clearTimeout(timeout);
   }, [toast]);
 
-  const skip = async (id: number) => {
+  const skip = async (id: number, reason: "resurface_later" | "not_my_interest") => {
     if (selectedDate !== toIsoDate(new Date())) return;
     const currentItemIds = items.map((item) => item.id);
     const startedAt = Date.now();
@@ -132,7 +298,7 @@ export default function App() {
     await authorizedFetch("/api/reaction", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ itemId: id, type: "skip" }),
+      body: JSON.stringify({ itemId: id, type: "skip", reason }),
     });
 
     const res = await authorizedFetch("/api/feed/replacement", {
@@ -155,16 +321,68 @@ export default function App() {
     setItems((prev) => {
       const targetIndex = prev.findIndex((item) => item.id === id);
       if (targetIndex === -1) return prev;
-      if (!data.item) return prev; // no replacement available — keep current items
+      if (!data.item) return prev.filter((item) => item.id !== id); // no replacement -> feed out
       const next = [...prev];
       next[targetIndex] = data.item;
       return next;
     });
   };
 
+  const reportContent = async (id: number, payload: { issues: string[]; details?: string }) => {
+    const currentItemIds = items.map((item) => item.id);
+    const startedAt = Date.now();
+    setReplacingIds((prev) => new Set(prev).add(id));
+    const res = await authorizedFetch(`/api/items/${id}/report`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ issues: payload.issues, details: payload.details }),
+    });
+    const data = (await res.json()) as { repaired: boolean; item?: FeedItem | null; reason?: string };
+    if (data.repaired && data.item) {
+      setItems((prev) => prev.map((item) => (item.id === id ? data.item! : item)));
+      const elapsed = Date.now() - startedAt;
+      if (elapsed < SKELETON_MIN_MS) await new Promise((r) => setTimeout(r, SKELETON_MIN_MS - elapsed));
+      setReplacingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+      setToast({
+        tone: "success",
+        title: "콘텐츠를 개선했어요",
+      });
+      return;
+    }
+    // Not repaired — fetch a replacement card
+    const repRes = await authorizedFetch("/api/feed/replacement", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ excludeItemIds: currentItemIds, date: selectedDate, replaceItemId: id }),
+    });
+    const repData = (await repRes.json()) as { item?: FeedItem | null };
+    if (repData.item) {
+      setItems((prev) => prev.map((item) => (item.id === id ? repData.item! : item)));
+    } else {
+      // Guarantee deterministic outcome: if not fixable and no replacement, remove from current feed.
+      setItems((prev) => prev.filter((item) => item.id !== id));
+      setToast({
+        tone: "warning",
+        title: "문제 콘텐츠를 피드에서 제외했어요",
+      });
+    }
+    const elapsed = Date.now() - startedAt;
+    if (elapsed < SKELETON_MIN_MS) await new Promise((r) => setTimeout(r, SKELETON_MIN_MS - elapsed));
+    setReplacingIds((prev) => {
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
+  };
+
   const todayIso = toIsoDate(new Date());
   const isToday = selectedDate === todayIso;
-  const isAtStartDate = selectedDate <= FEED_START_DATE;
+  const feedStartDate = authUser?.createdAt?.slice(0, 10) ?? FEED_START_DATE;
+  const isAtStartDate = selectedDate <= feedStartDate;
   const displayedDate = new Date(`${selectedDate}T00:00:00`).toLocaleDateString("ko-KR", {
     year: "numeric",
     month: "long",
@@ -200,6 +418,7 @@ export default function App() {
   };
 
   const hasMemoToday = memoItemIds.size > 0;
+  const snbContextVisible = view === "feed" && !sourceMemoFocus && (snbOpen || isDesktopSnb);
   const canSubmitSource = sourceInput.trim().length > 0 && !sourceSubmitting;
 
   const postSources = async (payload: { rawText?: string; urls?: string[] }) => {
@@ -227,13 +446,20 @@ export default function App() {
           title: `링크 추가 실패 (${res.status})`,
           description: serverMessage ? `${statusHint} ${serverMessage}` : statusHint,
         });
-        return;
+        return { ok: false as const, data };
       }
       setToast(buildSourceResultToast(data));
       if ((data.added ?? 0) > 0 || (data.duplicateCount ?? 0) > 0) {
+        const hosts = [...new Set((data.addedUrls ?? []).map(extractHost).filter(Boolean))];
+        if (hosts.length > 0) {
+          onboardingScheduledRef.current.clear();
+          setOnboardingHosts(hosts);
+          setOnboardingSourceIds([]);
+        }
         void loadSources(false);
         void loadFeed(selectedDate);
       }
+      return { ok: true as const, data };
     } catch {
       const isOffline = typeof navigator !== "undefined" && navigator.onLine === false;
       setToast({
@@ -243,6 +469,7 @@ export default function App() {
           ? "인터넷 연결을 확인한 뒤 다시 시도해 주세요."
           : "로컬 개발 중이라면 `npm run dev`가 실행 중인지 확인해 주세요.",
       });
+      return { ok: false as const };
     } finally {
       setSourceSubmitting(false);
     }
@@ -258,7 +485,17 @@ export default function App() {
       });
       return;
     }
-    await postSources({ rawText: sourceInput });
+    // Start onboarding interaction immediately after CTA.
+    const hosts = [...new Set(parsed.urls.map(extractHost).filter(Boolean))];
+    if (hosts.length > 0) {
+      onboardingScheduledRef.current.clear();
+      setOnboardingHosts(hosts);
+    }
+    const result = await postSources({ rawText: sourceInput });
+    if (!result?.ok) {
+      setOnboardingHosts([]);
+      onboardingScheduledRef.current.clear();
+    }
     setSourceInput("");
   };
 
@@ -295,6 +532,7 @@ export default function App() {
 
     // Optimistic remove
     setSources((prev) => prev.filter((s) => s.id !== sourceId));
+    setPendingSourceIds((prev) => prev.filter((id) => id !== sourceId));
 
     let undone = false;
     let deleteTimer: ReturnType<typeof setTimeout>;
@@ -337,6 +575,7 @@ export default function App() {
     setSources((prev) =>
       prev.map((source) => (source.id === sourceId ? { ...source, level } : source))
     );
+    setPendingSourceIds((prev) => prev.filter((id) => id !== sourceId));
     const res = await authorizedFetch(`/api/sources/${sourceId}`, {
       method: "PATCH",
       headers: { "content-type": "application/json" },
@@ -360,29 +599,17 @@ export default function App() {
       const data = await readJson<{
         ok?: boolean;
         refreshed?: boolean;
+        changed?: boolean;
+        contentDelta?: number;
         reason?: string;
         cooldownSeconds?: number;
         lastRefreshedAt?: string;
       }>(res);
 
       if (!res.ok) {
-        setToast({
-          tone: "error",
-          title: "새로고침 실패",
-          description: "잠시 후 다시 시도해 주세요.",
-        });
+        setToast({ tone: "error", title: "새로고침 실패", description: "잠시 후 다시 시도해 주세요." });
         return;
       }
-
-      const lastRefreshedAt =
-        typeof data.lastRefreshedAt === "string" && data.lastRefreshedAt
-          ? data.lastRefreshedAt
-          : new Date().toISOString();
-      setSources((prev) =>
-        prev.map((source) =>
-          source.id === sourceId ? { ...source, lastRefreshedAt } : source
-        )
-      );
 
       if (data.refreshed === false && data.reason === "cooldown") {
         const waitSeconds = Math.max(0, Number(data.cooldownSeconds ?? 0));
@@ -391,20 +618,33 @@ export default function App() {
           title: "잠시 후 다시 새로고침해 주세요",
           description: waitSeconds > 0 ? `최대 ${waitSeconds}초 간격으로 갱신돼요.` : undefined,
         });
-      } else {
-        setToast({
-          tone: "success",
-          title: "콘텐츠를 최신 상태로 확인했어요",
-        });
+        return;
       }
 
-      void loadSources(false);
+      // Crawl is running in the background — update lastRefreshedAt optimistically.
+      const lastRefreshedAt =
+        typeof data.lastRefreshedAt === "string" && data.lastRefreshedAt
+          ? data.lastRefreshedAt
+          : new Date().toISOString();
+      setSources((prev) =>
+        prev.map((s) => (s.id === sourceId ? { ...s, lastRefreshedAt } : s))
+      );
+      if (data.changed || Number(data.contentDelta ?? 0) > 0) {
+        setToast({
+          tone: "success",
+          title: "콘텐츠 업데이트 성공!",
+          description: "앞으로 더 많은 글을 볼 수 있어요.",
+        });
+      } else {
+        setToast({
+          tone: "warning",
+          title: "새로 발행된 콘텐츠가 없어요.",
+          description: "다음 번에 다시 시도해 주세요.",
+        });
+      }
+      await loadSources(false);
     } catch {
-      setToast({
-        tone: "error",
-        title: "새로고침 실패",
-        description: "네트워크 상태를 확인한 뒤 다시 시도해 주세요.",
-      });
+      setToast({ tone: "error", title: "새로고침 실패", description: "네트워크 상태를 확인한 뒤 다시 시도해 주세요." });
     } finally {
       setRefreshingSourceIds((prev) => {
         const next = new Set(prev);
@@ -418,16 +658,38 @@ export default function App() {
     !authReady ? (
       <SplashScreen />
     ) : !authUser ? (
-      <AuthGate onSignedIn={(user) => { setAuthUser(user); setAuthReady(true); }} />
+      <AuthGate onSignedIn={handleSignedIn} />
     ) : (
     <div className="relative isolate min-h-dvh overflow-x-clip bg-background">
-      <MemoShapes show={view === "feed" && hasMemoToday} dateKey={selectedDate} />
-      <div className="relative z-20 mx-auto flex min-h-dvh w-full max-w-[1160px] flex-col px-3 py-4 md:px-4 md:py-6">
+      <MemoShapes show={view === "feed" && !sourceMemoFocus && !snbOpen && hasMemoToday} dateKey={selectedDate} />
+      <div className="relative z-20 flex min-h-dvh w-full">
+        {view === "feed" && !sourceMemoFocus && (
+          <SideNav
+            startDate={feedStartDate}
+            today={todayIso}
+            calendarDates={calendarDates}
+            selectedDate={selectedDate}
+            onSelectDate={(date) => {
+              setView("feed");
+              setSelectedDate(date);
+              sessionStorage.setItem("selectedDate", date);
+              setSnbOpen(false);
+            }}
+            open={snbOpen}
+            onClose={() => setSnbOpen(false)}
+          />
+        )}
+        <div className="flex min-h-dvh flex-1 flex-col min-w-0">
+        <div className="mx-auto flex w-full max-w-[1100px] flex-1 flex-col px-5 py-6 md:px-10 md:py-8">
+        {!sourceMemoFocus && (
         <div className="mb-12 pt-2 sm:mb-14 sm:pt-4">
           <div className="flex items-end justify-between gap-5 sm:gap-5">
             <div className="flex items-end gap-5 sm:gap-5">
               <button
-                onClick={() => setView("feed")}
+                onClick={() => {
+                  setView("feed");
+                  setSourceMemoFocus(null);
+                }}
                 className={`p-0 text-3xl font-semibold leading-none tracking-tight transition-colors sm:text-4xl ${
                   view === "feed"
                     ? "text-black"
@@ -437,7 +699,10 @@ export default function App() {
                 Feed
               </button>
               <button
-                onClick={() => setView("sources")}
+                onClick={() => {
+                  setView("sources");
+                  setSnbOpen(false);
+                }}
                 className={`p-0 text-3xl font-semibold leading-none tracking-tight transition-colors sm:text-4xl ${
                   view === "sources"
                     ? "text-black"
@@ -447,61 +712,102 @@ export default function App() {
                 My
               </button>
             </div>
-            <button
-              onClick={async () => {
-                await logout();
-                setAuthUser(null);
-                setItems([]);
-                setSources([]);
-              }}
-              className="rounded-full border border-zinc-200 bg-white px-3 py-1.5 text-xs text-zinc-700 hover:bg-zinc-50"
-            >
-              로그아웃
-            </button>
+            <div className="flex items-center gap-2">
+              {/* Mobile SNB toggle */}
+              {view === "feed" && (
+                <button
+                  type="button"
+                  onClick={() => setSnbOpen(true)}
+                  className="lg:hidden flex h-8 w-8 items-center justify-center rounded-full border border-zinc-200 bg-white text-zinc-700 hover:bg-zinc-50"
+                  aria-label="날짜 보기"
+                >
+                  <i className="ri-calendar-line text-sm" />
+                </button>
+              )}
+              {/* Account button */}
+              <button
+                type="button"
+                onClick={() => setAccountOpen(true)}
+                className="flex items-center gap-1.5 rounded-full border border-zinc-200 bg-white px-3 py-1.5 text-xs text-zinc-700 hover:bg-zinc-50"
+              >
+                {authUser.avatarUrl ? (
+                  <img src={authUser.avatarUrl} alt="" className="h-4 w-4 rounded-full object-cover" />
+                ) : (
+                  <i className="ri-user-line text-xs" />
+                )}
+                <span className="max-w-[100px] truncate hidden sm:block">{authUser.displayName ?? authUser.email}</span>
+              </button>
+            </div>
           </div>
         </div>
+        )}
+        {sourceMemoFocus && (
+          <div className="mb-6 pt-2 sm:mb-8 sm:pt-3">
+            <button
+              type="button"
+              onClick={backToMyFromSourceFeed}
+              className="inline-flex items-center gap-1 rounded-full border border-zinc-200 bg-white px-3 py-1.5 text-xs text-zinc-700 hover:bg-zinc-50"
+            >
+              <i className="ri-arrow-left-line text-sm" />
+              MY로 돌아가기
+            </button>
+          </div>
+        )}
         {view === "feed" && (
           <header className="mb-8 flex flex-col gap-3 sm:mb-10 sm:flex-row sm:items-end sm:justify-between">
             <div className="space-y-2">
               <AnimatePresence mode="wait" initial={false}>
                 <motion.div
-                  key={`title-${selectedDate}`}
+                  key={`title-${sourceMemoFocus ? `source-${sourceMemoFocus.id}` : selectedDate}`}
                   initial={{ opacity: 0, x: -16 }}
                   animate={{ opacity: 1, x: 0 }}
                   exit={{ opacity: 0, x: 16 }}
                   transition={{ duration: 0.22, ease: "easeOut" }}
                 >
-                  <p className="text-xs text-muted-foreground">{displayedDate}</p>
-                  <h1 className="mt-1 text-lg font-semibold leading-snug tracking-tight sm:text-xl">{heroTitle}</h1>
+                  {sourceMemoFocus ? (
+                    <>
+                      <p className="text-xs text-muted-foreground">소스별 탐색</p>
+                      <h1 className="mt-1 text-lg font-semibold leading-snug tracking-tight sm:text-xl">
+                        {sourceMemoFocus.name}에서 노출된 피드
+                      </h1>
+                    </>
+                  ) : (
+                    <>
+                      <p className="text-xs text-muted-foreground">{displayedDate}</p>
+                      <h1 className="mt-1 text-lg font-semibold leading-snug tracking-tight sm:text-xl">{heroTitle}</h1>
+                    </>
+                  )}
                 </motion.div>
               </AnimatePresence>
             </div>
-            <div className="flex items-center gap-1 self-start pb-0.5 sm:self-auto">
-              <button
-                onClick={() => moveDate(-1)}
-                disabled={isAtStartDate}
-                className="flex h-9 w-9 items-center justify-center rounded-full text-xl text-muted-foreground hover:bg-accent hover:text-foreground transition-colors disabled:cursor-not-allowed disabled:opacity-30 sm:h-7 sm:w-7 sm:text-lg"
-                aria-label="이전 날짜"
-              >
-                <i className="ri-arrow-left-s-line" />
-              </button>
-              <button
-                onClick={() => moveDate(1)}
-                disabled={isToday}
-                className="flex h-9 w-9 items-center justify-center rounded-full text-xl text-muted-foreground hover:bg-accent hover:text-foreground transition-colors disabled:cursor-not-allowed disabled:opacity-30 sm:h-7 sm:w-7 sm:text-lg"
-                aria-label="다음 날짜"
-              >
-                <i className="ri-arrow-right-s-line" />
-              </button>
-              <button
-                onClick={moveToToday}
-                disabled={isToday}
-                className="ml-1 rounded-full border border-border bg-white px-2.5 py-1 text-[11px] font-medium text-foreground hover:bg-accent disabled:cursor-not-allowed disabled:opacity-40"
-                aria-label="오늘로 이동"
-              >
-                TODAY
-              </button>
-            </div>
+            {sourceMemoFocus ? null : (
+              <div className="flex items-center gap-1 self-start pb-0.5 sm:self-auto">
+                <button
+                  onClick={() => moveDate(-1)}
+                  disabled={isAtStartDate}
+                  className="flex h-9 w-9 items-center justify-center rounded-full text-xl text-muted-foreground hover:bg-accent hover:text-foreground transition-colors disabled:cursor-not-allowed disabled:opacity-30 sm:h-7 sm:w-7 sm:text-lg"
+                  aria-label="이전 날짜"
+                >
+                  <i className="ri-arrow-left-s-line" />
+                </button>
+                <button
+                  onClick={() => moveDate(1)}
+                  disabled={isToday}
+                  className="flex h-9 w-9 items-center justify-center rounded-full text-xl text-muted-foreground hover:bg-accent hover:text-foreground transition-colors disabled:cursor-not-allowed disabled:opacity-30 sm:h-7 sm:w-7 sm:text-lg"
+                  aria-label="다음 날짜"
+                >
+                  <i className="ri-arrow-right-s-line" />
+                </button>
+                <button
+                  onClick={moveToToday}
+                  disabled={isToday}
+                  className="ml-1 rounded-full border border-border bg-white px-2.5 py-1 text-[11px] font-medium text-foreground hover:bg-accent disabled:cursor-not-allowed disabled:opacity-40"
+                  aria-label="오늘로 이동"
+                >
+                  TODAY
+                </button>
+              </div>
+            )}
           </header>
         )}
 
@@ -519,6 +825,10 @@ export default function App() {
               onDeleteSource={deleteSource}
               refreshingSourceIds={refreshingSourceIds}
               onRefreshSource={refreshSource}
+              onOpenSourceMemos={(source) => void loadSourceMemoFeed(source.id, source.name)}
+              onboardingHosts={onboardingHosts}
+              onboardingSourceIds={onboardingSourceIds}
+              pendingSourceIds={pendingSourceIds}
             />
           ) : (
           <AnimatePresence mode="wait" initial={false}>
@@ -556,31 +866,81 @@ export default function App() {
               >
                 {items.map((item, i) => (
                   <div key={item.id} className="flex flex-col gap-3">
-                    {replacingIds.has(item.id) ? (
-                      <CardSkeleton />
-                    ) : (
-                      <FeedCard
-                        {...item}
-                        index={i}
-                        dimThumbnail={!isToday && !memoItemIds.has(item.id)}
-                        onMemoSaved={() =>
-                          {
-                            setMemoItemIds((prev) => new Set(prev).add(item.id));
-                            moveItemToLeft(item.id);
+                    <div className="relative">
+                      {replacingIds.has(item.id) ? (
+                        <CardSkeleton />
+                      ) : (
+                        <FeedCard
+                          {...item}
+                          index={i}
+                          dimThumbnail={!isToday && !memoItemIds.has(item.id)}
+                          onMemoSaved={() =>
+                            {
+                              setMemoItemIds((prev) => new Set(prev).add(item.id));
+                              moveItemToLeft(item.id);
+                            }
                           }
-                        }
-                        onMemoDeleted={() =>
-                          setMemoItemIds((prev) => {
-                            const next = new Set(prev);
-                            next.delete(item.id);
-                            return next;
-                          })
-                        }
-                      />
-                    )}
-                    {isToday && !memoItemIds.has(item.id) && (
+                          onMemoDeleted={() =>
+                            setMemoItemIds((prev) => {
+                              const next = new Set(prev);
+                              next.delete(item.id);
+                              return next;
+                            })
+                          }
+                          onReport={(payload) => reportContent(item.id, payload)}
+                        />
+                      )}
+                      {skipReasonItemId === item.id && (
+                        <div
+                          className="absolute inset-0 z-30 flex items-center justify-center rounded-2xl bg-white/88 px-3 py-4 backdrop-blur-[4px]"
+                          onClick={() => setSkipReasonItemId(null)}
+                        >
+                          <div
+                            className="w-full max-w-[250px] rounded-xl border border-zinc-200 bg-white p-3 shadow-lg"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <div className="flex items-start justify-between gap-2">
+                              <p className="text-sm font-semibold text-zinc-900">보고 싶지 않은 이유를 알려 주세요</p>
+                              <button
+                                type="button"
+                                onClick={() => setSkipReasonItemId(null)}
+                                className="inline-flex h-6 w-6 items-center justify-center rounded-md text-zinc-400 transition-colors hover:bg-zinc-100 hover:text-zinc-600"
+                                aria-label="닫기"
+                              >
+                                <i className="ri-close-line text-sm" />
+                              </button>
+                            </div>
+                            <div className="mt-2 space-y-1.5">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const id = skipReasonItemId;
+                                  setSkipReasonItemId(null);
+                                  if (id != null) void skip(id, "resurface_later");
+                                }}
+                                className="w-full rounded-lg border border-zinc-200 px-2.5 py-2 text-left text-xs text-zinc-700 hover:bg-zinc-50"
+                              >
+                                다른 날 다시 추천
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const id = skipReasonItemId;
+                                  setSkipReasonItemId(null);
+                                  if (id != null) void skip(id, "not_my_interest");
+                                }}
+                                className="w-full rounded-lg border border-zinc-200 px-2.5 py-2 text-left text-xs text-zinc-700 hover:bg-zinc-50"
+                              >
+                                관심 분야 아님
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                    {isToday && !sourceMemoFocus && !memoItemIds.has(item.id) && skipReasonItemId !== item.id && (
                       <button
-                        onClick={() => skip(item.id)}
+                        onClick={() => setSkipReasonItemId(item.id)}
                         disabled={replacingIds.has(item.id)}
                         className="text-xs text-zinc-600 hover:text-zinc-700 transition-colors text-center py-1 disabled:opacity-0"
                       >
@@ -594,6 +954,8 @@ export default function App() {
           </AnimatePresence>
           )}
         </div>
+        </div>
+        </div>
       </div>
       <AppToast
         toast={toast}
@@ -602,6 +964,25 @@ export default function App() {
         onUndo={() => toast?.undoFn?.()}
         onRetry={retryFailedSources}
       />
+      {accountOpen && authUser && (
+        <AccountPanel
+          user={authUser}
+          onClose={() => setAccountOpen(false)}
+          onLogout={() => {
+            setAuthUser(null);
+            setItems([]);
+            setSources([]);
+            setAccountOpen(false);
+          }}
+          onDeleted={() => {
+            setAuthUser(null);
+            setItems([]);
+            setSources([]);
+            setAccountOpen(false);
+          }}
+        />
+      )}
+      {showIntro && <SpiralDemo onComplete={handleIntroComplete} />}
     </div>
     )
   );
