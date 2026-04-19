@@ -105,6 +105,13 @@ export default {
         const itemId = parseInt(url.pathname.split("/")[3]);
         return handleDeleteNote(itemId, env, sessionUserId ?? 0);
       }
+      if (request.method === "GET" && url.pathname === "/api/stats/calendar") {
+        return handleGetCalendar(env, sessionUserId ?? 0);
+      }
+      if (request.method === "DELETE" && url.pathname === "/api/auth/account") {
+        const response = await handleDeleteAccount(request, env);
+        return withCorsIfNeeded(request, env, response);
+      }
       if (request.method === "POST" && url.pathname === "/api/auth/google") {
         const response = await handlePostAuthGoogle(request, env);
         return withCorsIfNeeded(request, env, response);
@@ -141,11 +148,13 @@ function isUserScopedRoute(method: string, pathname: string) {
   if (method === "POST" && /^\/api\/sources\/\d+\/refresh$/.test(pathname)) return true;
   if ((method === "PATCH" || method === "DELETE") && /^\/api\/sources\/\d+$/.test(pathname)) return true;
   if ((method === "GET" || method === "POST" || method === "DELETE") && /^\/api\/notes\/\d+$/.test(pathname)) return true;
+  if (method === "GET" && pathname === "/api/stats/calendar") return true;
+  if (method === "DELETE" && pathname === "/api/auth/account") return true;
   return false;
 }
 
 function isAuthPath(pathname: string) {
-  return pathname === "/api/auth/google" || pathname === "/api/auth/me" || pathname === "/api/auth/logout";
+  return pathname === "/api/auth/google" || pathname === "/api/auth/me" || pathname === "/api/auth/logout" || pathname === "/api/auth/account";
 }
 
 function parseAllowedOrigins(env: Env) {
@@ -474,6 +483,7 @@ async function handleGetFeedToday(url: URL, env: Env, ctx: ExecutionContext, use
   ]));
   const targetDate = getDateParamOrToday(url.searchParams.get("date"));
   await ensureUserSourcesSeeded(env, userId);
+  await pruneDateAssetLikeSlots(targetDate, env, userId);
   await ensureDateHasThreeSlots(targetDate, env, userId);
   let result = await queryDistinctDateItems(targetDate, env, userId);
   const quickRows = (result.results ?? []) as Record<string, unknown>[];
@@ -616,6 +626,7 @@ async function queryDistinctDateItems(targetDate: string, env: Env, userId: numb
       AND fs.user_id = ?
       AND i.status = 'active'
       AND us.is_active = 1
+      AND ${buildSqlAssetExclusion("i")}
     ORDER BY fs.slot_index ASC
     LIMIT 3
   `).bind(targetDate, userId).all();
@@ -951,6 +962,7 @@ async function recoverEmptyFeedForUser(targetDate: string, env: Env, userId: num
     JOIN user_sources us ON us.user_id = ? AND us.source_id = i.source_id
     WHERE us.is_active = 1
       AND i.status = 'active'
+      AND ${buildSqlAssetExclusion("i")}
       AND NOT EXISTS (
         SELECT 1
         FROM user_feed_slots fs
@@ -1304,6 +1316,27 @@ function buildInClause(column: string, values: number[]) {
   };
 }
 
+function buildSqlAssetExclusion(alias: string) {
+  return `
+    ${alias}.url NOT LIKE '%/wp-content/%'
+    AND ${alias}.url NOT LIKE '%/assets/%'
+    AND ${alias}.url NOT LIKE '%/fonts/%'
+    AND ${alias}.url NOT LIKE '%/_static/%'
+    AND ${alias}.url NOT LIKE '%/static/%'
+    AND ${alias}.url NOT LIKE '%.woff'
+    AND ${alias}.url NOT LIKE '%.woff2'
+    AND ${alias}.url NOT LIKE '%.ttf'
+    AND ${alias}.url NOT LIKE '%.otf'
+    AND ${alias}.url NOT LIKE '%.eot'
+    AND ${alias}.url NOT LIKE '%.css'
+    AND ${alias}.url NOT LIKE '%.js'
+    AND ${alias}.url NOT LIKE '%.mjs'
+    AND ${alias}.url NOT LIKE '%.map'
+    AND ${alias}.url NOT LIKE '%.json'
+    AND ${alias}.url NOT LIKE '%?%webfont%'
+  `.replace(/\s+/g, " ").trim();
+}
+
 async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) {
   const { userId, targetDate } = options;
   const itemExclusion = buildInClause("i.id", options.excludeItemIds);
@@ -1348,11 +1381,8 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
         LEFT JOIN user_notes n ON n.item_id = i.id AND n.user_id = ?
         WHERE i.status = 'active'
           AND us.is_active = 1
-          AND NOT (
-            RTRIM(i.url, '/') = RTRIM(s.url, '/')
-            AND (i.summary IS NULL OR trim(i.summary) = '')
-            AND lower(trim(COALESCE(i.title, ''))) = lower(trim(COALESCE(s.name, '')))
-          )
+          AND ${buildSqlAssetExclusion("i")}
+          AND RTRIM(i.url, '/') != RTRIM(s.url, '/')
           ${memoClause}
           ${assignedClause}
           ${itemExclusion.sql}
@@ -1385,11 +1415,8 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
     LEFT JOIN user_notes n ON n.item_id = i.id AND n.user_id = ?
     WHERE i.status = 'active'
       AND us.is_active = 1
-      AND NOT (
-        RTRIM(i.url, '/') = RTRIM(s.url, '/')
-        AND (i.summary IS NULL OR trim(i.summary) = '')
-        AND lower(trim(COALESCE(i.title, ''))) = lower(trim(COALESCE(s.name, '')))
-      )
+      AND ${buildSqlAssetExclusion("i")}
+      AND RTRIM(i.url, '/') != RTRIM(s.url, '/')
       ${memoClause}
       ${assignedClause}
       ${itemExclusion.sql}
@@ -1415,6 +1442,20 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
   return ((rows.results ?? []) as Record<string, unknown>[])
     .map((row) => Number(row.id))
     .filter(Number.isFinite);
+}
+
+async function pruneDateAssetLikeSlots(targetDate: string, env: Env, userId: number) {
+  await env.DB.prepare(`
+    DELETE FROM user_feed_slots
+    WHERE user_id = ?
+      AND date = ?
+      AND EXISTS (
+        SELECT 1
+        FROM items i
+        WHERE i.id = user_feed_slots.item_id
+          AND NOT (${buildSqlAssetExclusion("i")})
+      )
+  `).bind(userId, targetDate).run();
 }
 
 /** Batch-fetch item metadata for a list of item IDs. */
@@ -1542,7 +1583,7 @@ async function fillDateIfNeeded(targetDate: string, env: Env, userId: number) {
   await applyPass(fallback);
   if (missingSlots.length <= 0) return;
 
-  // Pass 3: last resort — allow memoed items, any source
+  // Pass 3: relax memo requirement, any source, still respect assignment cooldown
   const relaxed = await selectCandidateItemIds(env, {
     userId,
     targetDate,
@@ -1553,6 +1594,21 @@ async function fillDateIfNeeded(targetDate: string, env: Env, userId: number) {
     distinctBySource: false,
   });
   await applyPass(relaxed);
+  if (missingSlots.length <= 0) return;
+
+  // Pass 4: absolute last resort — ignore cooldown entirely.
+  // Guarantees 3 items even for accounts with very few sources or items.
+  const absolute = await selectCandidateItemIds(env, {
+    userId,
+    targetDate,
+    limit: missingSlots.length,
+    excludeItemIds: currentIds,
+    excludeSourceIds: [],
+    requireNoMemo: false,
+    distinctBySource: false,
+    excludeAssigned: false,
+  });
+  await applyPass(absolute);
 }
 
 async function pruneDateItemsDuplicatedAcrossOtherDates(env: Env, userId: number, targetDate: string) {
@@ -2167,6 +2223,8 @@ function parseRssEntries(xml: string, baseUrl: string) {
     const thumbnailUrl = thumbnailRaw ? normalizeEntryUrl(decodeXml(thumbnailRaw), baseUrl) : null;
     const link = normalizeEntryUrl(linkRaw, baseUrl);
     if (!link) continue;
+    // Skip asset/font/binary URLs that sometimes appear in RSS <link> fields
+    if (isAssetLikeContentUrl(link)) continue;
     entries.push({
       title,
       url: link,
@@ -2188,6 +2246,7 @@ function parseRssEntries(xml: string, baseUrl: string) {
     const thumbnailUrl = thumbnailRaw ? normalizeEntryUrl(decodeXml(thumbnailRaw), baseUrl) : null;
     const link = normalizeEntryUrl(linkRaw, baseUrl);
     if (!link) continue;
+    if (isAssetLikeContentUrl(link)) continue;
     entries.push({
       title,
       url: link,
@@ -2236,6 +2295,7 @@ function collectEntriesFromHtmlLinks(html: string, pageUrl: string) {
     if (entries.length >= ENTRY_LIMIT_PER_SOURCE) return;
     const normalized = normalizeEntryUrl(decodeXml(rawUrl.trim()), pageUrl);
     if (!normalized) return;
+    if (isAssetLikeContentUrl(normalized)) return;
     if (!isLikelyArticleUrl(normalized, host) && !isFallbackContentUrl(normalized, host)) return;
     const key = canonicalEntryKey(normalized);
     if (!key || seen.has(key)) return;
@@ -2289,6 +2349,7 @@ function buildSitemapEntries(urls: string[], seedUrl: string) {
   const entries: SourceEntry[] = [];
 
   for (const candidate of urls) {
+    if (isAssetLikeContentUrl(candidate)) continue;
     if (!isLikelyArticleUrl(candidate, seedHost) && !isFallbackContentUrl(candidate, seedHost)) continue;
     const key = canonicalEntryKey(candidate);
     if (!key || seenKey.has(key)) continue;
@@ -2591,6 +2652,7 @@ const DOMAIN_ALIASES: Record<string, string> = {
 
 function canonicalEntryKey(url: string) {
   try {
+    if (isAssetLikeContentUrl(url)) return null;
     const parsed = new URL(url);
     const rawHost = parsed.hostname.toLowerCase();
     const host = DOMAIN_ALIASES[rawHost] ?? rawHost;
@@ -2657,6 +2719,7 @@ async function collectSeenContentDedupKeys(
 
 function isLikelyArticleUrl(url: string, seedHost: string) {
   try {
+    if (isAssetLikeContentUrl(url)) return false;
     const parsed = new URL(url);
     if (!["http:", "https:"].includes(parsed.protocol)) return false;
     const host = parsed.hostname.toLowerCase();
@@ -2714,6 +2777,7 @@ function isLikelyArticleUrl(url: string, seedHost: string) {
 
 function isFallbackContentUrl(url: string, seedHost: string) {
   try {
+    if (isAssetLikeContentUrl(url)) return false;
     const parsed = new URL(url);
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
     const host = parsed.hostname.toLowerCase();
@@ -2725,18 +2789,53 @@ function isFallbackContentUrl(url: string, seedHost: string) {
     if (
       path.startsWith("/tag/") ||
       path.startsWith("/tags/") ||
+      path.startsWith("/t/") ||
       path.startsWith("/category/") ||
       path.startsWith("/categories/") ||
       path.startsWith("/author/") ||
       path.startsWith("/authors/") ||
       path.startsWith("/topic/") ||
-      path.startsWith("/topics/")
+      path.startsWith("/topics/") ||
+      path.startsWith("/search/") ||
+      path.startsWith("/page/")
     ) return false;
-    const tail = path.split("/").filter(Boolean).pop()?.toLowerCase() || "";
-    if (["feed", "rss", "atom", "index", "page", "about", "contact"].includes(tail)) return false;
+    const segments = path.split("/").filter(Boolean);
+    const tail = segments[segments.length - 1]?.toLowerCase() || "";
+    if (["feed", "rss", "atom", "index", "page", "about", "contact", "receive", "subscribe", "unsubscribe", "login", "logout", "signup"].includes(tail)) return false;
+    // Require at least 2 meaningful segments (e.g. /year/slug or /section/slug).
+    // Single-segment paths (/receive, /life) are almost never articles.
+    if (segments.length < 2) return false;
     return tail.length >= 4;
   } catch {
     return false;
+  }
+}
+
+function isAssetLikeContentUrl(url: string) {
+  try {
+    const parsed = new URL(url);
+    const path = parsed.pathname.toLowerCase();
+    const q = parsed.search.toLowerCase();
+    if (
+      path.includes("/wp-content/") ||
+      path.includes("/assets/") ||
+      path.includes("/fonts/") ||
+      path.includes("/_static/") ||
+      path.includes("/dist/") ||
+      path.includes("/static/") ||
+      path.includes("/webmentions/") ||
+      path.includes("/webmention/") ||
+      path.includes("/api/") ||
+      path.includes("/.well-known/") ||
+      path.includes("/cdn-cgi/")
+    ) return true;
+    if (
+      /\.(woff2?|ttf|otf|eot|css|js|mjs|map|json|xml|txt|ico|svg|png|jpe?g|webp|avif|gif|bmp|mp4|webm|mp3|wav|zip|gz|pdf)(?:$|[?#])/i.test(path)
+    ) return true;
+    if (q.includes("webfont") || q.includes("font")) return true;
+    return false;
+  } catch {
+    return true;
   }
 }
 
@@ -3108,6 +3207,46 @@ async function handlePostAuthLogout(request: Request, env: Env) {
   return json({ ok: true });
 }
 
+async function handleGetCalendar(env: Env, userId: number) {
+  const rows = await env.DB.prepare(`
+    SELECT
+      ufs.date,
+      COUNT(DISTINCT CASE WHEN un.content IS NOT NULL AND trim(un.content) != '' THEN ufs.item_id END) AS memoCount
+    FROM user_feed_slots ufs
+    LEFT JOIN user_notes un ON un.item_id = ufs.item_id AND un.user_id = ufs.user_id
+    WHERE ufs.user_id = ?
+    GROUP BY ufs.date
+    ORDER BY ufs.date ASC
+  `).bind(userId).all<{ date: string; memoCount: number }>();
+
+  const user = await env.DB.prepare(
+    `SELECT created_at FROM users WHERE id = ? LIMIT 1`
+  ).bind(userId).first<{ created_at: string }>();
+
+  const startDate = user?.created_at?.slice(0, 10) ?? new Date().toISOString().slice(0, 10);
+
+  return json({
+    startDate,
+    dates: (rows.results ?? []).map((r) => ({
+      date: r.date,
+      memoCount: Number(r.memoCount),
+    })),
+  });
+}
+
+async function handleDeleteAccount(request: Request, env: Env) {
+  const auth = await authenticateSession(request, env);
+  if (!auth.ok) return json({ error: auth.error }, { status: 401 });
+  const userId = auth.user.id;
+  // Revoke all sessions first
+  await env.DB.prepare(
+    `UPDATE sessions SET revoked_at = CURRENT_TIMESTAMP WHERE user_id = ? AND revoked_at IS NULL`
+  ).bind(userId).run();
+  // Delete user — CASCADE handles all user-scoped data
+  await env.DB.prepare(`DELETE FROM users WHERE id = ?`).bind(userId).run();
+  return json({ ok: true });
+}
+
 function readBearerToken(request: Request) {
   const authHeader = request.headers.get("authorization")?.trim() ?? "";
   if (!authHeader.toLowerCase().startsWith("bearer ")) return "";
@@ -3175,7 +3314,7 @@ async function verifySessionToken(token: string, secret: string): Promise<AuthTo
 }
 
 async function authenticateSession(request: Request, env: Env): Promise<
-  | { ok: true; user: { id: number; email: string; displayName: string | null; avatarUrl: string | null }; sessionId: string }
+  | { ok: true; user: { id: number; email: string; displayName: string | null; avatarUrl: string | null; createdAt: string }; sessionId: string }
   | { ok: false; error: string }
 > {
   const secret = env.AUTH_JWT_SECRET?.trim();
@@ -3190,7 +3329,8 @@ async function authenticateSession(request: Request, env: Env): Promise<
 
   const row = await env.DB.prepare(`
     SELECT s.id AS sessionId, s.expires_at AS expiresAt, s.revoked_at AS revokedAt,
-           u.id AS userId, u.email AS email, u.display_name AS displayName, u.avatar_url AS avatarUrl
+           u.id AS userId, u.email AS email, u.display_name AS displayName, u.avatar_url AS avatarUrl,
+           u.created_at AS createdAt
     FROM sessions s
     JOIN users u ON u.id = s.user_id
     WHERE s.id = ?
@@ -3203,6 +3343,7 @@ async function authenticateSession(request: Request, env: Env): Promise<
     email: string;
     displayName: string | null;
     avatarUrl: string | null;
+    createdAt: string;
   }>();
   if (!row || row.revokedAt) return { ok: false, error: "SESSION_NOT_FOUND" };
   if (new Date(row.expiresAt).getTime() <= Date.now()) return { ok: false, error: "SESSION_EXPIRED" };
@@ -3216,6 +3357,7 @@ async function authenticateSession(request: Request, env: Env): Promise<
       email: row.email,
       displayName: row.displayName,
       avatarUrl: row.avatarUrl,
+      createdAt: row.createdAt,
     },
   };
 }
