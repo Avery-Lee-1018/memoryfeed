@@ -21,8 +21,9 @@ import {
 import type { SourceEntry } from "@/types/source";
 import { fetchMe, logout, type AuthUser } from "@/lib/auth-session";
 
-const SKELETON_MIN_MS = 500;
-const REPORT_TIMEOUT_MS = 6000;
+const SKELETON_MIN_MS = 220;
+const REPLACEMENT_TIMEOUT_MS = 2600;
+const REPORT_ASYNC_TIMEOUT_MS = 2200;
 const AUTO_RELOAD_SYNC_MS = 3 * 60 * 1000;
 const PENDING_UNCLASSIFIED_KEY = "memoryfeed.pendingUnclassifiedSourceIds.v1";
 
@@ -289,18 +290,14 @@ export default function App() {
     const startedAt = Date.now();
     setReplacingIds((prev) => new Set(prev).add(id));
 
-    await authorizedFetch("/api/reaction", {
+    // Non-blocking side-effect: replacement UX should not wait on reaction write.
+    void authorizedFetch("/api/reaction", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ itemId: id, type: "skip", reason }),
     });
 
-    const res = await authorizedFetch("/api/feed/replacement", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ excludeItemIds: currentItemIds, date: selectedDate, replaceItemId: id }),
-    });
-    const data = (await res.json()) as { item?: FeedItem | null };
+    const data = await requestReplacementCard(id, currentItemIds, selectedDate);
 
     const elapsed = Date.now() - startedAt;
     if (elapsed < SKELETON_MIN_MS) {
@@ -332,73 +329,18 @@ export default function App() {
     const currentItemIds = items.map((item) => item.id);
     const startedAt = Date.now();
     setReplacingIds((prev) => new Set(prev).add(id));
-    let repairedItem: FeedItem | null = null;
-    let reportTimeoutOrError = false;
-    try {
-      const controller = new AbortController();
-      const timeout = window.setTimeout(() => controller.abort(), REPORT_TIMEOUT_MS);
-      try {
-        const res = await authorizedFetch(`/api/items/${id}/report`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ issues: payload.issues, details: payload.details }),
-          signal: controller.signal,
-        });
-        if (res.ok) {
-          const data = (await res.json()) as { repaired: boolean; item?: FeedItem | null; reason?: string };
-          if (data.repaired && data.item) {
-            repairedItem = data.item;
-          }
-        } else {
-          reportTimeoutOrError = true;
-        }
-      } finally {
-        window.clearTimeout(timeout);
-      }
-    } catch {
-      reportTimeoutOrError = true;
-    }
-
-    if (repairedItem) {
-      setItems((prev) => prev.map((item) => (item.id === id ? repairedItem! : item)));
-      const elapsed = Date.now() - startedAt;
-      if (elapsed < SKELETON_MIN_MS) await new Promise((r) => setTimeout(r, SKELETON_MIN_MS - elapsed));
-      setReplacingIds((prev) => {
-        const next = new Set(prev);
-        next.delete(id);
-        return next;
-      });
-      setToast({
-        tone: "success",
-        title: "콘텐츠를 개선했어요",
-      });
-      return;
-    }
-
-    // Not repaired or report endpoint timed out/failed — fetch a replacement card.
-    let replacementItem: FeedItem | null = null;
-    try {
-      const repRes = await authorizedFetch("/api/feed/replacement", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ excludeItemIds: currentItemIds, date: selectedDate, replaceItemId: id }),
-      });
-      if (repRes.ok) {
-        const repData = (await repRes.json()) as { item?: FeedItem | null };
-        replacementItem = repData.item ?? null;
-      }
-    } catch {
-      replacementItem = null;
-    }
+    // Structural optimization:
+    // 1) replace first for UX latency
+    // 2) run heavy report extraction asynchronously for future quality
+    void submitReportInBackground(id, payload);
+    const replacementItem = await requestReplacementCard(id, currentItemIds, selectedDate);
 
     if (replacementItem) {
       setItems((prev) => prev.map((item) => (item.id === id ? replacementItem! : item)));
-      if (reportTimeoutOrError) {
-        setToast({
-          tone: "warning",
-          title: "응답이 지연되어 새 콘텐츠로 교체했어요",
-        });
-      }
+      setToast({
+        tone: "success",
+        title: "새 콘텐츠로 바로 교체했어요",
+      });
     } else {
       // Never reduce the visible card count on replacement failure.
       setToast({
@@ -414,6 +356,54 @@ export default function App() {
       next.delete(id);
       return next;
     });
+  };
+
+  const requestReplacementCard = async (
+    replaceItemId: number,
+    excludeItemIds: number[],
+    date: string,
+  ) => {
+    try {
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), REPLACEMENT_TIMEOUT_MS);
+      try {
+        const res = await authorizedFetch("/api/feed/replacement", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ excludeItemIds, date, replaceItemId }),
+          signal: controller.signal,
+        });
+        if (!res.ok) return null;
+        const data = (await res.json()) as { item?: FeedItem | null };
+        return data.item ?? null;
+      } finally {
+        window.clearTimeout(timeout);
+      }
+    } catch {
+      return null;
+    }
+  };
+
+  const submitReportInBackground = async (
+    id: number,
+    payload: { issues: string[]; details?: string },
+  ) => {
+    try {
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), REPORT_ASYNC_TIMEOUT_MS);
+      try {
+        await authorizedFetch(`/api/items/${id}/report`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ issues: payload.issues, details: payload.details }),
+          signal: controller.signal,
+        });
+      } finally {
+        window.clearTimeout(timeout);
+      }
+    } catch {
+      // non-blocking by design
+    }
   };
 
   const todayIso = toIsoDate(new Date());

@@ -707,6 +707,7 @@ async function queryDistinctDateItems(targetDate: string, env: Env, userId: numb
 
 async function handlePostFeedReplacement(request: Request, env: Env, userId: number) {
   await ensureFeedSlotsTable(env);
+  await ensureReplacementPerfIndexes(env);
   let body: { excludeItemIds?: number[]; date?: string; replaceItemId?: number };
   try {
     body = (await request.json()) as { excludeItemIds?: number[]; date?: string; replaceItemId?: number };
@@ -891,6 +892,26 @@ async function handlePostFeedReplacement(request: Request, env: Env, userId: num
     LIMIT 1
   `).bind(userId, userId, replacementId).first();
   return json({ item: finalReplacement ? sanitizeFeedItemText(finalReplacement as Record<string, unknown>) : null });
+}
+
+async function ensureReplacementPerfIndexes(env: Env) {
+  // Lightweight idempotent indexes for replacement/read-path latency.
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_user_feed_slots_user_item
+    ON user_feed_slots(user_id, item_id)
+  `).run();
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_items_status_source_id_id
+    ON items(status, source_id, id)
+  `).run();
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_user_sources_user_active_source
+    ON user_sources(user_id, is_active, source_id)
+  `).run();
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user_date_item
+    ON user_hidden_items(user_id, date, item_id)
+  `).run();
 }
 
 async function selectEmergencyNeverShownItemId(
