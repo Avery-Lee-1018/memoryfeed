@@ -1534,6 +1534,7 @@ async function handlePostSources(request: Request, env: Env, ctx: ExecutionConte
     return json({
       ok: true,
       added,
+      registeredCount: registeredOrReactivated,
       failed,
       invalidCount,
       duplicateCount,
@@ -1574,7 +1575,16 @@ async function handlePostSources(request: Request, env: Env, ctx: ExecutionConte
         await backfillFeedsUntilDate(getTodayIso(), env, userId);
       })());
       ctx.waitUntil(hydrateSourceItems(match, env));
-      return json({ ok: true, duplicateByHost: true, sourceIds: [match.id] }, { status: 201 });
+      return json({
+        ok: true,
+        duplicateByHost: true,
+        sourceIds: [match.id],
+        added: 0,
+        registeredCount: 1,
+        duplicateCount: 1,
+        failed: 0,
+        invalidCount: 0,
+      }, { status: 201 });
     }
   }
 
@@ -1592,10 +1602,10 @@ async function handlePostSources(request: Request, env: Env, ctx: ExecutionConte
       await backfillFeedsUntilDate(getTodayIso(), env, userId);
     })());
     ctx.waitUntil(hydrateSourceItems(inserted, env));
-    return json({ ok: true, sourceIds: [inserted.id] }, { status: 201 });
+    return json({ ok: true, sourceIds: [inserted.id], added: 1, registeredCount: 1, duplicateCount: 0, failed: 0, invalidCount: 0 }, { status: 201 });
   }
 
-  return json({ ok: true, sourceIds: [] }, { status: 201 });
+  return json({ ok: true, sourceIds: [], added: 0, registeredCount: 0, duplicateCount: 0, failed: 0, invalidCount: 0 }, { status: 201 });
 }
 
 async function upsertUserSourceActive(env: Env, userId: number, sourceId: number) {

@@ -2,6 +2,7 @@ import type { SourceEntry } from "@/types/source";
 
 export type SourceBulkResult = {
   added?: number;
+  registeredCount?: number;
   failed?: number;
   invalidCount?: number;
   duplicateCount?: number;
@@ -90,18 +91,26 @@ export function buildSourceResultToast(result: SourceBulkResult): SourceResultTo
   const invalidCount = result.invalidCount ?? 0;
   const failedUrls = result.failedUrls ?? [];
   const failedCount = invalidCount + failedUrls.length;
-  const registeredCount = added + duplicateCount;
+  const registeredCount = result.registeredCount ?? (added + duplicateCount);
   const reasonParts: string[] = [];
 
   if (duplicateCount > 0) reasonParts.push(`이미 등록 ${duplicateCount}개`);
   if (invalidCount > 0) reasonParts.push(`형식 오류 ${invalidCount}개`);
   if (failedUrls.length > 0) reasonParts.push(`처리 실패 ${failedUrls.length}개`);
 
-  if (registeredCount > 0 && failedCount === 0) {
+  if (added > 0 && failedCount === 0) {
     return {
       tone: "success",
-      title: `${registeredCount}개 등록됨`,
+      title: `${added}개 등록됨`,
       description: duplicateCount > 0 ? `새로 ${added}개, 기존 ${duplicateCount}개` : undefined,
+    };
+  }
+
+  if (added === 0 && duplicateCount > 0 && failedCount === 0) {
+    return {
+      tone: "warning",
+      title: `이미 등록된 링크 ${duplicateCount}개`,
+      description: "새로 추가된 링크는 없어요.",
     };
   }
 
@@ -115,8 +124,10 @@ export function buildSourceResultToast(result: SourceBulkResult): SourceResultTo
   }
 
   return {
-    tone: "warning",
-    title: `등록된 것 ${registeredCount}개 · 안된 것 ${failedCount}개`,
+    tone: registeredCount > 0 ? "warning" : "error",
+    title: registeredCount > 0
+      ? `등록된 것 ${registeredCount}개 · 안된 것 ${failedCount}개`
+      : `등록된 것 0개 · 안된 것 ${failedCount}개`,
     description: reasonParts.join(" · "),
     retryUrls: failedUrls.length > 0 ? failedUrls : undefined,
   };
