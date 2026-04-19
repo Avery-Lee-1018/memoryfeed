@@ -339,12 +339,12 @@ export default function FeedCard({
 
           {/* Header */}
           <CardHeader className="pb-2 pt-4">
-            <p className="flex items-center gap-1 text-xs text-muted-foreground">
+            <p className="order-1 flex items-center gap-1 text-xs text-muted-foreground">
               {sourceType === "rss" && <i className="ri-rss-line opacity-50" />}
               {sourceName}
             </p>
             {tags.length > 0 && (
-              <div className="mt-1.5 flex flex-wrap gap-1.5">
+              <div className="order-2 mt-1.5 flex flex-wrap gap-1.5">
                 {tags.map((tag) => (
                   <button
                     key={`top-${tag}`}
@@ -363,7 +363,7 @@ export default function FeedCard({
                 ))}
               </div>
             )}
-            <h2 className="line-clamp-2 text-base font-semibold leading-snug tracking-tight">
+            <h2 className="order-3 line-clamp-2 text-base font-semibold leading-snug tracking-tight">
               {title}
             </h2>
           </CardHeader>
