@@ -712,9 +712,6 @@ async function handlePostFeedReplacement(request: Request, env: Env, userId: num
     : [];
 
   const targetDate = getDateParamOrToday(body.date ?? null);
-  if (targetDate !== getTodayIso()) {
-    return json({ item: null, reason: "replacement_allowed_only_for_today" });
-  }
 
   const slot = Number.isInteger(body.replaceItemId)
     ? await env.DB.prepare(`
@@ -730,12 +727,19 @@ async function handlePostFeedReplacement(request: Request, env: Env, userId: num
 
   const replacedItemMeta = Number.isInteger(body.replaceItemId)
     ? await env.DB.prepare(`
-      SELECT id, source_id, url
+      SELECT id, source_id, title, url
       FROM items
       WHERE id = ?
       LIMIT 1
-    `).bind(body.replaceItemId).first<{ id: number; source_id: number; url: string }>()
+    `).bind(body.replaceItemId).first<{ id: number; source_id: number; title: string; url: string }>()
     : null;
+  const blockedDedupKey = replacedItemMeta
+    ? buildContentDedupKey(
+      Number(replacedItemMeta.source_id),
+      String(replacedItemMeta.title ?? ""),
+      String(replacedItemMeta.url ?? ""),
+    )
+    : "";
 
   const todayRows = await env.DB.prepare(`
     SELECT item_id, source_id
@@ -768,25 +772,29 @@ async function handlePostFeedReplacement(request: Request, env: Env, userId: num
   const preferred = await selectCandidateItemIds(env, {
     userId,
     targetDate,
-    limit: 1,
+    limit: 12,
     excludeItemIds: excludedIds,
     excludeSourceIds: excludedSources,
     requireNoMemo: true,
     distinctBySource: false,
   });
-  if (preferred.length > 0) replacementId = preferred[0];
+  if (preferred.length > 0) {
+    replacementId = await pickFirstNonDuplicateByKey(env, preferred, blockedDedupKey);
+  }
 
   if (!replacementId) {
     const fallbackUnassigned = await selectCandidateItemIds(env, {
       userId,
       targetDate,
-      limit: 1,
+      limit: 12,
       excludeItemIds: excludedIds,
       excludeSourceIds: todaySources,
       requireNoMemo: true,
       distinctBySource: false,
     });
-    if (fallbackUnassigned.length > 0) replacementId = fallbackUnassigned[0];
+    if (fallbackUnassigned.length > 0) {
+      replacementId = await pickFirstNonDuplicateByKey(env, fallbackUnassigned, blockedDedupKey);
+    }
   }
 
   if (!replacementId) {
@@ -794,13 +802,15 @@ async function handlePostFeedReplacement(request: Request, env: Env, userId: num
     const fallbackAny = await selectCandidateItemIds(env, {
       userId,
       targetDate,
-      limit: 1,
+      limit: 12,
       excludeItemIds: excludedIds,
       excludeSourceIds: [],
       requireNoMemo: false,
       distinctBySource: false,
     });
-    if (fallbackAny.length > 0) replacementId = fallbackAny[0];
+    if (fallbackAny.length > 0) {
+      replacementId = await pickFirstNonDuplicateByKey(env, fallbackAny, blockedDedupKey);
+    }
   }
 
   if (!replacementId) {
@@ -810,13 +820,14 @@ async function handlePostFeedReplacement(request: Request, env: Env, userId: num
       targetDate,
       excludedIds,
       todaySources,
+      blockedDedupKey,
     );
     if (emergencyNeverShown) replacementId = emergencyNeverShown;
   }
 
   if (!replacementId) {
     // Absolute final guard: pick anything active for this user (even previously shown).
-    const emergencyAny = await selectEmergencyAnyItemId(env, userId, excludedIds);
+    const emergencyAny = await selectEmergencyAnyItemId(env, userId, excludedIds, blockedDedupKey);
     if (emergencyAny) replacementId = emergencyAny;
   }
 
@@ -863,11 +874,12 @@ async function selectEmergencyNeverShownItemId(
   targetDate: string,
   excludeItemIds: number[],
   preferredExcludeSourceIds: number[],
+  blockedDedupKey: string,
 ) {
   const itemExclusion = buildInClause("i.id", excludeItemIds);
   const sourceExclusion = buildInClause("i.source_id", preferredExcludeSourceIds);
   const query = async (withSourceExclusion: boolean) => {
-    const row = await env.DB.prepare(`
+    const rows = await env.DB.prepare(`
       SELECT i.id
       FROM items i
       JOIN user_sources us ON us.user_id = ? AND us.source_id = i.source_id AND us.is_active = 1
@@ -885,15 +897,16 @@ async function selectEmergencyNeverShownItemId(
         ${itemExclusion.sql}
         ${withSourceExclusion ? sourceExclusion.sql : ""}
       ORDER BY i.id DESC
-      LIMIT 1
+      LIMIT 20
     `).bind(
       userId,
       userId,
       userId,
       ...itemExclusion.params,
       ...(withSourceExclusion ? sourceExclusion.params : []),
-    ).first<{ id: number }>();
-    return row?.id ?? null;
+    ).all<{ id: number }>();
+    const ids = (rows.results ?? []).map((r) => Number(r.id)).filter(Number.isFinite);
+    return await pickFirstNonDuplicateByKey(env, ids, blockedDedupKey);
   };
 
   const preferred = await query(true);
@@ -905,9 +918,14 @@ async function selectEmergencyNeverShownItemId(
   return await query(false);
 }
 
-async function selectEmergencyAnyItemId(env: Env, userId: number, excludeItemIds: number[]) {
+async function selectEmergencyAnyItemId(
+  env: Env,
+  userId: number,
+  excludeItemIds: number[],
+  blockedDedupKey: string,
+) {
   const itemExclusion = buildInClause("i.id", excludeItemIds);
-  const row = await env.DB.prepare(`
+  const rows = await env.DB.prepare(`
     SELECT i.id
     FROM items i
     JOIN user_sources us ON us.user_id = ? AND us.source_id = i.source_id AND us.is_active = 1
@@ -917,9 +935,23 @@ async function selectEmergencyAnyItemId(env: Env, userId: number, excludeItemIds
       AND RTRIM(i.url, '/') != RTRIM(s.url, '/')
       ${itemExclusion.sql}
     ORDER BY i.id DESC
-    LIMIT 1
-  `).bind(userId, ...itemExclusion.params).first<{ id: number }>();
-  return row?.id ?? null;
+    LIMIT 30
+  `).bind(userId, ...itemExclusion.params).all<{ id: number }>();
+  const ids = (rows.results ?? []).map((r) => Number(r.id)).filter(Number.isFinite);
+  return await pickFirstNonDuplicateByKey(env, ids, blockedDedupKey);
+}
+
+async function pickFirstNonDuplicateByKey(env: Env, candidateIds: number[], blockedDedupKey: string) {
+  if (candidateIds.length === 0) return null;
+  if (!blockedDedupKey) return candidateIds[0] ?? null;
+  const metaMap = await fetchItemMetaForItems(env, candidateIds);
+  for (const id of candidateIds) {
+    const meta = metaMap.get(id);
+    if (!meta) continue;
+    const key = buildContentDedupKey(meta.sourceId, meta.title, meta.url);
+    if (key !== blockedDedupKey) return id;
+  }
+  return null;
 }
 
 async function handleGetSourceMemos(sourceId: number, env: Env, userId: number) {

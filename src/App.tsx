@@ -315,11 +315,17 @@ export default function App() {
     setItems((prev) => {
       const targetIndex = prev.findIndex((item) => item.id === id);
       if (targetIndex === -1) return prev;
-      if (!data.item) return prev.filter((item) => item.id !== id); // no replacement -> feed out
+      if (!data.item) return prev;
       const next = [...prev];
       next[targetIndex] = data.item;
       return next;
     });
+    if (!data.item) {
+      setToast({
+        tone: "warning",
+        title: "대체 콘텐츠를 찾지 못해 기존 카드를 유지했어요",
+      });
+    }
   };
 
   const reportContent = async (id: number, payload: { issues: string[]; details?: string }) => {
@@ -394,11 +400,10 @@ export default function App() {
         });
       }
     } else {
-      // Deterministic outcome: if not fixable and no replacement, remove from current feed.
-      setItems((prev) => prev.filter((item) => item.id !== id));
+      // Never reduce the visible card count on replacement failure.
       setToast({
         tone: "warning",
-        title: "문제 콘텐츠를 피드에서 제외했어요",
+        title: "대체 콘텐츠를 찾지 못해 기존 카드를 유지했어요",
       });
     }
 
