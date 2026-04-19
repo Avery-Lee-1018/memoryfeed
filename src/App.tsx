@@ -22,7 +22,7 @@ import type { SourceEntry } from "@/types/source";
 import { fetchMe, logout, type AuthUser } from "@/lib/auth-session";
 
 const SKELETON_MIN_MS = 220;
-const REPLACEMENT_TIMEOUT_MS = 2600;
+const REPLACEMENT_TIMEOUT_MS = 7000;
 const REPORT_ASYNC_TIMEOUT_MS = 2200;
 const AUTO_RELOAD_SYNC_MS = 3 * 60 * 1000;
 const PENDING_UNCLASSIFIED_KEY = "memoryfeed.pendingUnclassifiedSourceIds.v1";
@@ -349,9 +349,10 @@ export default function App() {
       return next;
     });
     if (!data.item) {
+      await loadFeed(selectedDate);
       setToast({
         tone: "warning",
-        title: "대체 콘텐츠를 찾지 못해 기존 카드를 유지했어요",
+        title: "교체 반영을 다시 동기화했어요",
       });
     }
   };
@@ -373,10 +374,11 @@ export default function App() {
         title: "새 콘텐츠로 바로 교체했어요",
       });
     } else {
+      await loadFeed(selectedDate);
       // Never reduce the visible card count on replacement failure.
       setToast({
         tone: "warning",
-        title: "대체 콘텐츠를 찾지 못해 기존 카드를 유지했어요",
+        title: "교체 반영을 다시 동기화했어요",
       });
     }
 
@@ -394,14 +396,15 @@ export default function App() {
     excludeItemIds: number[],
     date: string,
   ) => {
-    try {
+    const body = JSON.stringify({ excludeItemIds, date, replaceItemId });
+    const runOnce = async () => {
       const controller = new AbortController();
       const timeout = window.setTimeout(() => controller.abort(), REPLACEMENT_TIMEOUT_MS);
       try {
         const res = await authorizedFetch("/api/feed/replacement", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ excludeItemIds, date, replaceItemId }),
+          body,
           signal: controller.signal,
         });
         if (!res.ok) return null;
@@ -410,6 +413,14 @@ export default function App() {
       } finally {
         window.clearTimeout(timeout);
       }
+    };
+
+    try {
+      const first = await runOnce();
+      if (first) return first;
+      // One short retry to absorb transient DB lock / cold-start latency.
+      await new Promise((r) => setTimeout(r, 250));
+      return await runOnce();
     } catch {
       return null;
     }
