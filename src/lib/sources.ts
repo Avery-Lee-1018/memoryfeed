@@ -59,6 +59,9 @@ export function normalizeSourceEntry(raw: Record<string, unknown>): SourceEntry 
     level,
     is_active: Number(raw.is_active ?? 0),
     extractionMode: raw.extractionMode === "split" ? "split" : "single",
+    extractionReason: typeof raw.extractionReason === "string"
+      ? (raw.extractionReason as SourceEntry["extractionReason"])
+      : "UNKNOWN",
     extractionNote: typeof raw.extractionNote === "string" ? raw.extractionNote : undefined,
     totalItems: Number(raw.totalItems ?? 0),
     splitItems: Number(raw.splitItems ?? 0),

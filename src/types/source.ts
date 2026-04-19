@@ -8,6 +8,7 @@ export type SourceEntry = {
   level?: SourceLevel;
   is_active: number;
   extractionMode?: "split" | "single";
+  extractionReason?: "NO_ITEMS" | "ROOT_ONLY" | "ONE_SPLIT" | "BLOCKED_PATTERN" | "UNKNOWN";
   extractionNote?: string;
   totalItems?: number;
   splitItems?: number;

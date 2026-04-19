@@ -693,6 +693,16 @@ async function handleGetSources(env: Env, userId: number) {
         ELSE 'single'
       END AS extractionMode,
       CASE
+        WHEN COUNT(DISTINCT i.id) = 0 THEN 'NO_ITEMS'
+        WHEN COUNT(DISTINCT CASE WHEN RTRIM(i.url, '/') <> RTRIM(s.url, '/') THEN i.id END) = 0
+          THEN CASE
+            WHEN lower(s.url) LIKE '%longblack.co%' THEN 'BLOCKED_PATTERN'
+            ELSE 'ROOT_ONLY'
+          END
+        WHEN COUNT(DISTINCT CASE WHEN RTRIM(i.url, '/') <> RTRIM(s.url, '/') THEN i.id END) = 1 THEN 'ONE_SPLIT'
+        ELSE 'UNKNOWN'
+      END AS extractionReason,
+      CASE
         WHEN COUNT(DISTINCT i.id) = 0 THEN '아직 수집된 콘텐츠가 없어요'
         WHEN COUNT(DISTINCT CASE WHEN RTRIM(i.url, '/') <> RTRIM(s.url, '/') THEN i.id END) = 0
           THEN '홈/피드 페이지 중심으로 감지됐어요'
@@ -2071,10 +2081,20 @@ function safeHost(url: string) {
   return extractSourceHost(url);
 }
 
+/**
+ * Domain aliases: English mirrors that map to a canonical Korean domain.
+ * When both are registered as sources, the English variant is treated as the
+ * same content so duplicates are suppressed at ingestion time.
+ */
+const DOMAIN_ALIASES: Record<string, string> = {
+  "eng.blog.toss.im": "blog.toss.im",
+};
+
 function canonicalEntryKey(url: string) {
   try {
     const parsed = new URL(url);
-    const host = parsed.hostname.toLowerCase();
+    const rawHost = parsed.hostname.toLowerCase();
+    const host = DOMAIN_ALIASES[rawHost] ?? rawHost;
     const normalizedPath = parsed.pathname.replace(/\/+$/, "");
     if (host.includes("bucketplace.com")) {
       const localized = normalizedPath.match(/^\/(ko|en|ja)\/post\/(.+)$/);
