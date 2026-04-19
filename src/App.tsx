@@ -490,7 +490,7 @@ export default function App() {
                 className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 sm:gap-5"
               >
                 {items.map((item, i) => (
-                  <div key={item.id} className="flex flex-col gap-2">
+                  <div key={item.id} className="flex flex-col gap-3">
                     {replacingIds.has(item.id) ? (
                       <CardSkeleton />
                     ) : (
@@ -517,7 +517,7 @@ export default function App() {
                       <button
                         onClick={() => skip(item.id)}
                         disabled={replacingIds.has(item.id)}
-                        className="text-xs text-muted-foreground/50 hover:text-muted-foreground transition-colors text-center py-1 disabled:opacity-0"
+                        className="text-xs text-zinc-600 hover:text-zinc-700 transition-colors text-center py-1 disabled:opacity-0"
                       >
                         오늘은 안볼래요
                       </button>

@@ -13,8 +13,10 @@ type ReactionType = "keep" | "skip";
 type SourceType = "rss" | "blog";
 type SourceLevel = "core" | "focus" | "light";
 const FEED_START_DATE = "2026-04-01";
-const ENTRY_LIMIT_PER_SOURCE = 30;
+const ENTRY_LIMIT_PER_SOURCE = 120;
 const RESURFACE_COOLDOWN_DAYS = 7;
+const SOURCE_REFRESH_INTERVAL_MINUTES = 45;
+const SOURCE_REFRESH_BATCH_SIZE = 4;
 const KOREAN_ACCEPT_LANGUAGE = "ko-KR,ko;q=0.95,en-US;q=0.7,en;q=0.6";
 const CRAWLER_USER_AGENT = "Mozilla/5.0 (compatible; MemoryFeedBot/1.0)";
 const ADMIN_HEADER = "x-memoryfeed-key";
@@ -408,6 +410,7 @@ async function handleGetFeedToday(url: URL, env: Env, ctx: ExecutionContext, use
   await pruneDateItemsDuplicatedAcrossOtherDates(env, userId, targetDate);
   await pruneDateContentDuplicatesByKey(env, userId, targetDate);
   await ensureItemsFromSources(env, ctx, userId);
+  ctx.waitUntil(refreshStaleSourcesInBackground(env, userId));
   await backfillFeedsUntilDate(targetDate, env, userId);
   let result = await queryDistinctDateItems(targetDate, env, userId);
 
@@ -1098,7 +1101,7 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
             END AS score,
           ROW_NUMBER() OVER (
             PARTITION BY i.source_id
-            ORDER BY (ABS(RANDOM()) % 1000000)
+            ORDER BY i.id DESC
           ) AS source_rank
         FROM items i
         JOIN user_sources us ON us.user_id = ? AND us.source_id = i.source_id
@@ -1119,7 +1122,7 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
       SELECT id
       FROM candidate
       WHERE source_rank = 1
-      ORDER BY score
+      ORDER BY id DESC, score
       LIMIT ?
     `).bind(
       userId,
@@ -1152,7 +1155,8 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
       ${assignedClause}
       ${itemExclusion.sql}
       ${sourceExclusion.sql}
-    ORDER BY (ABS(RANDOM()) % 1000000) * 1.0 /
+    ORDER BY i.id DESC,
+      (ABS(RANDOM()) % 1000000) * 1.0 /
       CASE COALESCE(us.level, 'focus')
         WHEN 'core' THEN 3.0
         WHEN 'focus' THEN 2.0
@@ -1370,6 +1374,45 @@ async function backfillFeedsUntilDate(targetDate: string, env: Env, userId: numb
   await fillDateIfNeeded(maxDate, env, userId);
 }
 
+async function ensureSourceRefreshTable(env: Env) {
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS source_refresh_state (
+      source_id INTEGER PRIMARY KEY,
+      last_refreshed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE
+    )
+  `).run();
+}
+
+async function refreshStaleSourcesInBackground(env: Env, userId: number) {
+  await ensureSourceRefreshTable(env);
+  const staleSources = await env.DB.prepare(`
+    SELECT s.id, s.name, s.url, s.type
+    FROM user_sources us
+    JOIN sources s ON s.id = us.source_id
+    LEFT JOIN source_refresh_state rs ON rs.source_id = s.id
+    WHERE us.user_id = ? AND us.is_active = 1
+      AND (
+        rs.last_refreshed_at IS NULL
+        OR rs.last_refreshed_at <= datetime('now', '-${SOURCE_REFRESH_INTERVAL_MINUTES} minutes')
+      )
+    ORDER BY COALESCE(rs.last_refreshed_at, '1970-01-01 00:00:00') ASC
+    LIMIT ?
+  `).bind(userId, SOURCE_REFRESH_BATCH_SIZE).all<{ id: number; name: string; url: string; type: SourceType }>();
+
+  for (const source of staleSources.results ?? []) {
+    try {
+      await hydrateSourceItems(source, env);
+    } finally {
+      await env.DB.prepare(`
+        INSERT INTO source_refresh_state (source_id, last_refreshed_at)
+        VALUES (?, CURRENT_TIMESTAMP)
+        ON CONFLICT(source_id) DO UPDATE SET last_refreshed_at = CURRENT_TIMESTAMP
+      `).bind(source.id).run();
+    }
+  }
+}
+
 async function cleanupDemoData(env: Env) {
   await env.DB.prepare("DELETE FROM items WHERE url LIKE 'https://memoryfeed.local/%'").run();
   await env.DB.prepare("DELETE FROM sources WHERE url LIKE 'https://memoryfeed.local/%'").run();
@@ -1559,27 +1602,27 @@ type SourceEntry = { title: string; url: string; summary?: string; thumbnailUrl?
 async function collectSourceEntries(source: { url: string; type: SourceType }): Promise<SourceEntry[]> {
   if (source.type === "rss") {
     const text = await fetchSourceText(source.url, "application/rss+xml,application/atom+xml,application/xml,text/xml,text/html");
-    const parsed = text ? dedupeEntries(parseRssEntries(text, source.url)) : [];
-    if (parsed.length > 0) return parsed;
+    const fromFeed = text ? parseRssEntries(text, source.url) : [];
     const fromSitemap = text ? await collectEntriesFromSitemap(source.url, text) : [];
-    if (fromSitemap.length > 0) return fromSitemap;
-    return text ? collectEntriesFromHtmlLinks(text, source.url) : [];
+    const fromHtml = text ? collectEntriesFromHtmlLinks(text, source.url) : [];
+    return dedupeEntries([...fromFeed, ...fromSitemap, ...fromHtml]).slice(0, ENTRY_LIMIT_PER_SOURCE);
   }
 
   const html = await fetchSourceText(source.url, "text/html,application/xhtml+xml,application/xml,text/xml");
   if (!html) return [];
 
+  const aggregated: SourceEntry[] = [];
   const feedUrls = discoverFeedUrlsFromHtml(html, source.url);
   for (const feedUrl of feedUrls) {
     const feedText = await fetchSourceText(feedUrl, "application/rss+xml,application/atom+xml,application/xml,text/xml,text/html");
     if (!feedText) continue;
-    const entries = dedupeEntries(parseRssEntries(feedText, feedUrl));
-    if (entries.length > 0) return entries;
+    aggregated.push(...parseRssEntries(feedText, feedUrl));
+    if (aggregated.length >= ENTRY_LIMIT_PER_SOURCE * 2) break;
   }
 
   const fromSitemap = await collectEntriesFromSitemap(source.url, html);
-  if (fromSitemap.length > 0) return fromSitemap;
-  return collectEntriesFromHtmlLinks(html, source.url);
+  const fromHtml = collectEntriesFromHtmlLinks(html, source.url);
+  return dedupeEntries([...aggregated, ...fromSitemap, ...fromHtml]).slice(0, ENTRY_LIMIT_PER_SOURCE);
 }
 
 function discoverFeedUrlsFromHtml(html: string, pageUrl: string) {
@@ -1719,22 +1762,23 @@ async function collectEntriesFromSitemap(pageUrl: string, pageHtml?: string) {
   if (sitemapUrls.length === 0) return [];
 
   const collected: SourceEntry[] = [];
-  for (const sitemapUrl of sitemapUrls.slice(0, 6)) {
+  for (const sitemapUrl of sitemapUrls.slice(0, 12)) {
     const sitemapText = await fetchSourceText(sitemapUrl, "application/xml,text/xml,text/html");
     if (!sitemapText) continue;
 
     const nestedLocs = parseSitemapLocs(sitemapText, sitemapUrl);
     const hasNestedSitemaps = /<sitemapindex[\s>]/i.test(sitemapText);
     if (hasNestedSitemaps && nestedLocs.length > 0) {
-      for (const nested of nestedLocs.slice(0, 8)) {
+      for (const nested of nestedLocs.slice(0, 20)) {
         const nestedText = await fetchSourceText(nested, "application/xml,text/xml,text/html");
         if (!nestedText) continue;
         collected.push(...buildSitemapEntries(parseSitemapLocs(nestedText, nested), pageUrl));
+        if (collected.length >= ENTRY_LIMIT_PER_SOURCE * 2) break;
       }
     } else {
       collected.push(...buildSitemapEntries(nestedLocs, pageUrl));
     }
-    if (collected.length >= ENTRY_LIMIT_PER_SOURCE) break;
+    if (collected.length >= ENTRY_LIMIT_PER_SOURCE * 2) break;
   }
 
   return dedupeEntries(collected).slice(0, ENTRY_LIMIT_PER_SOURCE);
