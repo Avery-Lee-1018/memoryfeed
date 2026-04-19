@@ -19,6 +19,7 @@ import type { SourceEntry } from "@/types/source";
 import { fetchMe, logout, type AuthUser } from "@/lib/auth-session";
 
 const SKELETON_MIN_MS = 500;
+const AUTO_RELOAD_SYNC_MS = 3 * 60 * 1000;
 
 export default function App() {
   const [authReady, setAuthReady] = useState(false);
@@ -52,8 +53,19 @@ export default function App() {
       .finally(() => setAuthReady(true));
   }, []);
 
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      // Reload only on visible tab to avoid surprising background refreshes.
+      if (document.visibilityState === "visible") {
+        window.location.reload();
+      }
+    }, AUTO_RELOAD_SYNC_MS);
+    return () => window.clearInterval(timer);
+  }, []);
+
   const loadFeed = async (date: string) => {
     setLoading(true);
+    setMemoItemIds(new Set()); // clear immediately so stamps don't flicker on date change
     return authorizedFetch(`/api/feed/today?date=${date}`)
       .then(async (r) => {
         if (r.status === 401) {
