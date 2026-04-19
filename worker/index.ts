@@ -119,6 +119,11 @@ export default {
         const itemId = parseInt(url.pathname.split("/")[3]);
         return handleGetRelatedItemsByTag(itemId, env, sessionUserId ?? 0);
       }
+      if (request.method === "GET" && /^\/api\/tags\/[^/]+\/feed$/.test(url.pathname)) {
+        const encodedTag = url.pathname.split("/")[3] ?? "";
+        const tag = decodeURIComponent(encodedTag);
+        return handleGetTagFeed(tag, env, sessionUserId ?? 0);
+      }
       if (request.method === "POST" && /^\/api\/items\/\d+\/report$/.test(url.pathname)) {
         const itemId = parseInt(url.pathname.split("/")[3]);
         return handlePostItemReport(itemId, request, env, ctx, sessionUserId ?? 0);
@@ -172,6 +177,7 @@ function isUserScopedRoute(method: string, pathname: string) {
   if ((method === "PATCH" || method === "DELETE") && /^\/api\/sources\/\d+$/.test(pathname)) return true;
   if ((method === "GET" || method === "POST" || method === "DELETE") && /^\/api\/notes\/\d+$/.test(pathname)) return true;
   if (method === "GET" && /^\/api\/items\/\d+\/related$/.test(pathname)) return true;
+  if (method === "GET" && /^\/api\/tags\/[^/]+\/feed$/.test(pathname)) return true;
   if (method === "POST" && /^\/api\/items\/\d+\/report$/.test(pathname)) return true;
   if (method === "GET" && pathname === "/api/stats/calendar") return true;
   if (method === "DELETE" && pathname === "/api/auth/account") return true;
@@ -682,6 +688,17 @@ async function queryDistinctDateItems(targetDate: string, env: Env, userId: numb
            s.name AS sourceName, s.type AS sourceType, us.level AS sourceLevel,
            i.source_id AS sourceId,
            CASE WHEN n.id IS NULL THEN 0 ELSE 1 END AS hasNote,
+           (
+             SELECT group_concat(tag, '|')
+             FROM (
+               SELECT tag
+               FROM user_item_tags uit
+               WHERE uit.user_id = fs.user_id
+                 AND uit.item_id = i.id
+               ORDER BY created_at DESC, tag ASC
+               LIMIT 12
+             )
+           ) AS tagsCsv,
            fs.slot_index AS slotIndex
     FROM user_feed_slots fs
     JOIN items i ON i.id = fs.item_id
@@ -883,14 +900,25 @@ async function handlePostFeedReplacement(request: Request, env: Env, userId: num
   const finalReplacement = await env.DB.prepare(`
     SELECT i.id, i.title, i.url, i.summary, i.thumbnail_url,
            s.name AS sourceName, s.type AS sourceType, us.level AS sourceLevel,
-           CASE WHEN n.id IS NULL THEN 0 ELSE 1 END AS hasNote
+           CASE WHEN n.id IS NULL THEN 0 ELSE 1 END AS hasNote,
+           (
+             SELECT group_concat(tag, '|')
+             FROM (
+               SELECT tag
+               FROM user_item_tags uit
+               WHERE uit.user_id = ?
+                 AND uit.item_id = i.id
+               ORDER BY created_at DESC, tag ASC
+               LIMIT 12
+             )
+           ) AS tagsCsv
     FROM items i
     JOIN sources s ON i.source_id = s.id
     JOIN user_sources us ON us.user_id = ? AND us.source_id = s.id
     LEFT JOIN user_notes n ON n.item_id = i.id AND n.user_id = ?
     WHERE i.id = ?
     LIMIT 1
-  `).bind(userId, userId, replacementId).first();
+  `).bind(userId, userId, userId, replacementId).first();
   return json({ item: finalReplacement ? sanitizeFeedItemText(finalReplacement as Record<string, unknown>) : null });
 }
 
@@ -1026,7 +1054,17 @@ async function handleGetSourceMemos(sourceId: number, env: Env, userId: number) 
     )
     SELECT i.id, i.title, i.url, i.summary, i.thumbnail_url,
            s.name AS sourceName, s.type AS sourceType, us.level AS sourceLevel,
-           CASE WHEN n.id IS NULL OR trim(COALESCE(n.content, '')) = '' THEN 0 ELSE 1 END AS hasNote
+           CASE WHEN n.id IS NULL OR trim(COALESCE(n.content, '')) = '' THEN 0 ELSE 1 END AS hasNote,
+           (
+             SELECT group_concat(tag, '|')
+             FROM (
+               SELECT tag
+               FROM user_item_tags uit
+               WHERE uit.user_id = ? AND uit.item_id = i.id
+               ORDER BY created_at DESC, tag ASC
+               LIMIT 12
+             )
+           ) AS tagsCsv
     FROM shown sh
     JOIN items i ON i.id = sh.item_id
     JOIN sources s ON s.id = i.source_id
@@ -1036,7 +1074,7 @@ async function handleGetSourceMemos(sourceId: number, env: Env, userId: number) 
       AND i.status = 'active'
     ORDER BY sh.lastShownDate DESC, i.id DESC
     LIMIT 180
-  `).bind(userId, sourceId, userId, userId, sourceId).all();
+  `).bind(userId, sourceId, userId, userId, userId, sourceId).all();
 
   const items = ((result.results ?? []) as Record<string, unknown>[]).map(sanitizeFeedItemText);
   return json({
@@ -3333,6 +3371,18 @@ function sanitizeFeedItemText(item: Record<string, unknown>) {
     }
   }
 
+  const tagsCsv = typeof next.tagsCsv === "string" ? next.tagsCsv : "";
+  if (tagsCsv) {
+    next.tags = tagsCsv
+      .split("|")
+      .map((t) => normalizeDisplayText(t).toLowerCase().trim())
+      .filter(Boolean)
+      .slice(0, 12);
+  } else {
+    next.tags = [];
+  }
+  delete next.tagsCsv;
+
   return next;
 }
 
@@ -4442,6 +4492,44 @@ async function handleGetRelatedItemsByTag(itemId: number, env: Env, userId: numb
   `).bind(userId, ...tags, itemId).all<{ id: number; title: string; url: string; sourceName: string; sharedTagCount: number }>();
 
   return json({ items: rows.results ?? [] });
+}
+
+async function handleGetTagFeed(rawTag: string, env: Env, userId: number) {
+  const tag = sanitizeTagValue(rawTag);
+  if (!tag) return json({ error: "INVALID_TAG" }, { status: 400 });
+
+  const rows = await env.DB.prepare(`
+    SELECT
+      i.id, i.title, i.url, i.summary, i.thumbnail_url,
+      s.name AS sourceName, s.type AS sourceType, us.level AS sourceLevel,
+      CASE WHEN n.id IS NULL OR trim(COALESCE(n.content, '')) = '' THEN 0 ELSE 1 END AS hasNote,
+      (
+        SELECT group_concat(tag, '|')
+        FROM (
+          SELECT tag
+          FROM user_item_tags uit2
+          WHERE uit2.user_id = ? AND uit2.item_id = i.id
+          ORDER BY created_at DESC, tag ASC
+          LIMIT 12
+        )
+      ) AS tagsCsv,
+      MAX(uit.created_at) AS taggedAt
+    FROM user_item_tags uit
+    JOIN items i ON i.id = uit.item_id
+    JOIN sources s ON s.id = i.source_id
+    JOIN user_sources us ON us.user_id = ? AND us.source_id = s.id
+    LEFT JOIN user_notes n ON n.user_id = ? AND n.item_id = i.id
+    WHERE uit.user_id = ?
+      AND uit.tag = ?
+      AND i.status = 'active'
+      AND ${buildSqlAssetExclusion("i")}
+    GROUP BY i.id, i.title, i.url, i.summary, i.thumbnail_url, s.name, s.type, us.level, n.id
+    ORDER BY taggedAt DESC, i.id DESC
+    LIMIT 120
+  `).bind(userId, userId, userId, userId, tag).all();
+
+  const items = ((rows.results ?? []) as Record<string, unknown>[]).map(sanitizeFeedItemText);
+  return json({ tag, items });
 }
 
 async function handlePatchSource(sourceId: number, request: Request, env: Env, userId: number) {

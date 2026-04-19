@@ -69,6 +69,7 @@ export default function App() {
   const [calendarDates, setCalendarDates] = useState<CalendarDate[]>([]);
   const [isDesktopSnb, setIsDesktopSnb] = useState(false);
   const [sourceMemoFocus, setSourceMemoFocus] = useState<{ id: number; name: string } | null>(null);
+  const [tagFeedFocus, setTagFeedFocus] = useState<string | null>(null);
   const lastMyScrollYRef = useRef(0);
   const restoreMyScrollRef = useRef(false);
   const [skipReasonItemId, setSkipReasonItemId] = useState<number | null>(null);
@@ -164,13 +165,14 @@ export default function App() {
 
   useEffect(() => {
     if (!authUser) return;
-    if (sourceMemoFocus) return;
+    if (sourceMemoFocus || tagFeedFocus) return;
     void loadFeed(selectedDate);
-  }, [selectedDate, authUser, sourceMemoFocus]);
+  }, [selectedDate, authUser, sourceMemoFocus, tagFeedFocus]);
 
   const loadSourceMemoFeed = async (sourceId: number, sourceName: string) => {
     lastMyScrollYRef.current = window.scrollY;
     setLoading(true);
+    setTagFeedFocus(null);
     setSourceMemoFocus({ id: sourceId, name: sourceName });
     try {
       const res = await authorizedFetch(`/api/sources/${sourceId}/memos`);
@@ -196,9 +198,38 @@ export default function App() {
 
   const backToMyFromSourceFeed = () => {
     setSourceMemoFocus(null);
+    setTagFeedFocus(null);
     setView("sources");
     setSnbOpen(false);
     restoreMyScrollRef.current = true;
+  };
+
+  const loadTagFeed = async (tag: string) => {
+    const normalized = tag.trim().toLowerCase();
+    if (!normalized) return;
+    setLoading(true);
+    setSourceMemoFocus(null);
+    setTagFeedFocus(normalized);
+    try {
+      const res = await authorizedFetch(`/api/tags/${encodeURIComponent(normalized)}/feed`);
+      const data = await readJson<{ items?: FeedItem[] }>(res);
+      const nextItems = data.items ?? [];
+      setItems(nextItems);
+      setInitialItemCount(nextItems.length);
+      setReplacingIds(new Set());
+      setMemoItemIds(new Set(nextItems.filter((i) => i.hasNote).map((i) => i.id)));
+      setView("feed");
+      setSnbOpen(false);
+    } catch (error) {
+      console.error(error);
+      setToast({
+        tone: "error",
+        title: "태그 피드를 불러오지 못했어요",
+        description: "잠시 후 다시 시도해 주세요.",
+      });
+    } finally {
+      setLoading(false);
+    }
   };
 
   const loadSources = async (showLoading = true) => {
@@ -445,7 +476,7 @@ export default function App() {
   };
 
   const hasMemoToday = memoItemIds.size > 0;
-  const snbContextVisible = view === "feed" && !sourceMemoFocus && (snbOpen || isDesktopSnb);
+  const snbContextVisible = view === "feed" && !sourceMemoFocus && !tagFeedFocus && (snbOpen || isDesktopSnb);
   const canSubmitSource = sourceInput.trim().length > 0 && !sourceSubmitting;
 
   const postSources = async (payload: { rawText?: string; urls?: string[] }) => {
@@ -687,9 +718,9 @@ export default function App() {
       <AuthGate onSignedIn={handleSignedIn} />
     ) : (
     <div className="relative isolate min-h-dvh overflow-x-clip bg-background">
-      <MemoShapes show={view === "feed" && !sourceMemoFocus && !snbOpen && hasMemoToday} dateKey={selectedDate} />
+      <MemoShapes show={view === "feed" && !sourceMemoFocus && !tagFeedFocus && !snbOpen && hasMemoToday} dateKey={selectedDate} />
       <div className="relative z-20 flex min-h-dvh w-full">
-        {view === "feed" && !sourceMemoFocus && (
+        {view === "feed" && !sourceMemoFocus && !tagFeedFocus && (
           <SideNav
             startDate={feedStartDate}
             today={todayIso}
@@ -707,7 +738,7 @@ export default function App() {
         )}
         <div className="flex min-h-dvh flex-1 flex-col min-w-0">
         <div className="mx-auto flex w-full max-w-[1100px] flex-1 flex-col px-5 py-6 md:px-10 md:py-8">
-        {!sourceMemoFocus && (
+        {!sourceMemoFocus && !tagFeedFocus && (
         <div className="mb-12 pt-2 sm:mb-14 sm:pt-4">
           <div className="flex items-end justify-between gap-5 sm:gap-5">
             <div className="flex items-end gap-5 sm:gap-5">
@@ -767,7 +798,7 @@ export default function App() {
           </div>
         </div>
         )}
-        {sourceMemoFocus && (
+        {(sourceMemoFocus || tagFeedFocus) && (
           <div className="mb-6 pt-2 sm:mb-8 sm:pt-3">
             <button
               type="button"
@@ -784,7 +815,7 @@ export default function App() {
             <div className="space-y-2">
               <AnimatePresence mode="wait" initial={false}>
                 <motion.div
-                  key={`title-${sourceMemoFocus ? `source-${sourceMemoFocus.id}` : selectedDate}`}
+                  key={`title-${sourceMemoFocus ? `source-${sourceMemoFocus.id}` : tagFeedFocus ? `tag-${tagFeedFocus}` : selectedDate}`}
                   initial={{ opacity: 0, x: -16 }}
                   animate={{ opacity: 1, x: 0 }}
                   exit={{ opacity: 0, x: 16 }}
@@ -797,6 +828,13 @@ export default function App() {
                         {sourceMemoFocus.name}에서 노출된 피드
                       </h1>
                     </>
+                  ) : tagFeedFocus ? (
+                    <>
+                      <p className="text-xs text-muted-foreground">태그별 탐색</p>
+                      <h1 className="mt-1 text-lg font-semibold leading-snug tracking-tight sm:text-xl">
+                        #{tagFeedFocus}
+                      </h1>
+                    </>
                   ) : (
                     <>
                       <p className="text-xs text-muted-foreground">{displayedDate}</p>
@@ -806,7 +844,7 @@ export default function App() {
                 </motion.div>
               </AnimatePresence>
             </div>
-            {sourceMemoFocus ? null : (
+            {sourceMemoFocus || tagFeedFocus ? null : (
               <div className="flex items-center gap-1 self-start pb-0.5 sm:self-auto">
                 <button
                   onClick={() => moveDate(-1)}
@@ -914,6 +952,7 @@ export default function App() {
                             })
                           }
                           onReport={(payload) => reportContent(item.id, payload)}
+                          onTagClick={(tag) => void loadTagFeed(tag)}
                         />
                       )}
                       {skipReasonItemId === item.id && (
@@ -964,7 +1003,7 @@ export default function App() {
                         </div>
                       )}
                     </div>
-                    {isToday && !sourceMemoFocus && !memoItemIds.has(item.id) && skipReasonItemId !== item.id && (
+                    {isToday && !sourceMemoFocus && !tagFeedFocus && !memoItemIds.has(item.id) && skipReasonItemId !== item.id && (
                       <button
                         onClick={() => setSkipReasonItemId(item.id)}
                         disabled={replacingIds.has(item.id)}

@@ -57,6 +57,7 @@ export type FeedItem = {
   url: string;
   summary?: string | null;
   thumbnail_url?: string | null;
+  tags?: string[];
   hasNote?: boolean;
   sourceName: string;
   sourceType: "rss" | "blog";
@@ -65,6 +66,7 @@ export type FeedItem = {
 type Props = FeedItem & {
   index?: number;
   dimThumbnail?: boolean;
+  onTagClick?: (tag: string) => void;
   onMemoSaved?: () => void;
   onMemoDeleted?: () => void;
   onReport?: (payload: { issues: string[]; details?: string }) => Promise<void>;
@@ -89,11 +91,7 @@ const TAG_THEMES = [
   "bg-cyan-100 text-cyan-800",
 ];
 
-function tagThemeClass(tag: string) {
-  let hash = 0;
-  for (let i = 0; i < tag.length; i += 1) hash = (hash * 31 + tag.charCodeAt(i)) >>> 0;
-  return TAG_THEMES[hash % TAG_THEMES.length];
-}
+const pickRandomTagTheme = () => TAG_THEMES[Math.floor(Math.random() * TAG_THEMES.length)];
 
 export default function FeedCard({
   id,
@@ -101,11 +99,13 @@ export default function FeedCard({
   url,
   summary,
   thumbnail_url,
+  tags: initialTags,
   hasNote,
   sourceName,
   sourceType,
   index = 0,
   dimThumbnail = false,
+  onTagClick,
   onMemoSaved,
   onMemoDeleted,
   onReport,
@@ -118,7 +118,8 @@ export default function FeedCard({
   const [memoLoaded, setMemoLoaded] = useState(!hasNote);
   const [memoSaving, setMemoSaving] = useState(false);
   const [hasMemoState, setHasMemoState] = useState(!!hasNote);
-  const [tags, setTags] = useState<string[]>([]);
+  const [tags, setTags] = useState<string[]>(Array.isArray(initialTags) ? initialTags.slice(0, 12) : []);
+  const [tagThemeByValue, setTagThemeByValue] = useState<Record<string, string>>({});
   const [recommendedTags, setRecommendedTags] = useState<string[]>([]);
   const [tagInput, setTagInput] = useState("");
   const [isTagComposing, setIsTagComposing] = useState(false);
@@ -128,6 +129,24 @@ export default function FeedCard({
   const [reportPhase, setReportPhase] = useState<"idle" | "issues" | "processing">("idle");
   const [selectedIssues, setSelectedIssues] = useState<Set<string>>(new Set());
   const [reportDetails, setReportDetails] = useState("");
+
+  useEffect(() => {
+    setTags(Array.isArray(initialTags) ? initialTags.slice(0, 12) : []);
+  }, [id, initialTags]);
+
+  useEffect(() => {
+    setTagThemeByValue((prev) => {
+      const next = { ...prev };
+      let changed = false;
+      for (const tag of tags) {
+        if (!next[tag]) {
+          next[tag] = pickRandomTagTheme();
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [tags]);
 
   const fallbackThumbnail = FALLBACK_THUMBNAILS[id % 3];
   const resolvedThumbnail = useMemo(() => {
@@ -324,6 +343,26 @@ export default function FeedCard({
               {sourceType === "rss" && <i className="ri-rss-line opacity-50" />}
               {sourceName}
             </p>
+            {tags.length > 0 && (
+              <div className="mt-1.5 flex flex-wrap gap-1.5">
+                {tags.map((tag) => (
+                  <button
+                    key={`top-${tag}`}
+                    type="button"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      onTagClick?.(tag);
+                    }}
+                    className={`rounded-md px-2 py-0.5 text-[11px] transition hover:brightness-95 ${
+                      tagThemeByValue[tag] ?? TAG_THEMES[0]
+                    }`}
+                  >
+                    #{tag}
+                  </button>
+                ))}
+              </div>
+            )}
             <h2 className="line-clamp-2 text-base font-semibold leading-snug tracking-tight">
               {title}
             </h2>
@@ -512,7 +551,7 @@ export default function FeedCard({
                     key={`r-${tag}`}
                     type="button"
                     onClick={() => setTags((prev) => (prev.includes(tag) ? prev : [...prev, tag].slice(0, 12)))}
-                    className={`rounded-md px-2 py-0.5 text-[11px] transition-colors hover:brightness-95 ${tagThemeClass(tag)}`}
+                    className={`rounded-md px-2 py-0.5 text-[11px] transition-colors hover:brightness-95 ${tagThemeByValue[tag] ?? TAG_THEMES[0]}`}
                   >
                     + {tag}
                   </button>
@@ -556,7 +595,7 @@ export default function FeedCard({
                         key={tag}
                         type="button"
                         onClick={() => setTags((prev) => prev.filter((t) => t !== tag))}
-                        className={`rounded-md px-2 py-0.5 text-[11px] ${tagThemeClass(tag)}`}
+                        className={`rounded-md px-2 py-0.5 text-[11px] ${tagThemeByValue[tag] ?? TAG_THEMES[0]}`}
                       >
                         {tag} ×
                       </button>
@@ -568,15 +607,6 @@ export default function FeedCard({
           ) : (
             <div>
               <p className="whitespace-pre-wrap text-sm leading-relaxed text-foreground/80">{savedMemo}</p>
-              {tags.length > 0 && (
-                <div className="mt-2.5 flex flex-wrap gap-x-1.5 gap-y-2">
-                  {tags.map((tag) => (
-                    <span key={tag} className={`rounded-md px-2 py-0.5 text-[11px] ${tagThemeClass(tag)}`}>
-                      #{tag}
-                    </span>
-                  ))}
-                </div>
-              )}
               <div className="mt-3">
                 <p className="text-[11px] font-semibold text-zinc-500">같은 주제 모음</p>
                 {relatedLoading ? (
