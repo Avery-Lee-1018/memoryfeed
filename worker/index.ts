@@ -405,7 +405,8 @@ async function handleGetFeedToday(url: URL, env: Env, ctx: ExecutionContext, use
   const targetDate = getDateParamOrToday(url.searchParams.get("date"));
   await ensureUserSourcesSeeded(env, userId);
   await pruneDateItemsDuplicatedAcrossOtherDates(env, userId, targetDate);
-  await ensureItemsFromSources(env, userId);
+  await pruneDateContentDuplicatesByKey(env, userId, targetDate);
+  await ensureItemsFromSources(env, ctx, userId);
   await backfillFeedsUntilDate(targetDate, env, userId);
   let result = await queryDistinctDateItems(targetDate, env, userId);
 
@@ -884,7 +885,7 @@ async function handlePostSources(request: Request, env: Env, ctx: ExecutionConte
     }
 
     if (registeredOrReactivated > 0) {
-      await ensureItemsFromSources(env, userId);
+      await ensureItemsFromSources(env, undefined, userId);
       await backfillFeedsUntilDate(getTodayIso(), env, userId);
     }
 
@@ -930,7 +931,7 @@ async function handlePostSources(request: Request, env: Env, ctx: ExecutionConte
     if (match) {
       await upsertUserSourceActive(env, userId, match.id);
       await seedItemForSource(match, env);
-      await ensureItemsFromSources(env, userId);
+      await ensureItemsFromSources(env, undefined, userId);
       await backfillFeedsUntilDate(getTodayIso(), env, userId);
       ctx.waitUntil(hydrateSourceItems(match, env));
       return json({ ok: true, duplicateByHost: true }, { status: 201 });
@@ -946,7 +947,7 @@ async function handlePostSources(request: Request, env: Env, ctx: ExecutionConte
   if (inserted) {
     await upsertUserSourceActive(env, userId, inserted.id);
     await seedItemForSource(inserted, env);
-    await ensureItemsFromSources(env, userId);
+    await ensureItemsFromSources(env, undefined, userId);
     await backfillFeedsUntilDate(getTodayIso(), env, userId);
     ctx.waitUntil(hydrateSourceItems(inserted, env));
   }
@@ -990,6 +991,7 @@ function normalizeUrl(input: string): string | null {
   try {
     const parsed = new URL(input);
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    stripTrackingQueryParams(parsed);
     parsed.hash = "";
     return parsed.toString();
   } catch {
@@ -1151,6 +1153,26 @@ async function selectCandidateItemIds(env: Env, options: CandidateQueryOptions) 
     .filter(Number.isFinite);
 }
 
+/** Batch-fetch item metadata for a list of item IDs. */
+async function fetchItemMetaForItems(
+  env: Env,
+  itemIds: number[],
+): Promise<Map<number, { sourceId: number; title: string; url: string }>> {
+  if (itemIds.length === 0) return new Map();
+  const placeholders = itemIds.map(() => "?").join(", ");
+  const rows = await env.DB.prepare(
+    `SELECT id, source_id, title, url FROM items WHERE id IN (${placeholders})`
+  ).bind(...itemIds).all<{ id: number; source_id: number; title: string; url: string }>();
+  return new Map((rows.results ?? []).map((r) => [
+    Number(r.id),
+    {
+      sourceId: Number(r.source_id),
+      title: String(r.title ?? ""),
+      url: String(r.url ?? ""),
+    },
+  ]));
+}
+
 async function fillDateIfNeeded(targetDate: string, env: Env, userId: number) {
   // Keep only slots backed by currently active user sources for this user/date.
   await env.DB.prepare(`
@@ -1165,6 +1187,7 @@ async function fillDateIfNeeded(targetDate: string, env: Env, userId: number) {
       )
   `).bind(userId, targetDate).run();
   await pruneDateItemsDuplicatedAcrossOtherDates(env, userId, targetDate);
+  await pruneDateContentDuplicatesByKey(env, userId, targetDate);
 
   const existing = await env.DB.prepare(`
     SELECT slot_index, item_id, source_id
@@ -1176,8 +1199,9 @@ async function fillDateIfNeeded(targetDate: string, env: Env, userId: number) {
   const currentRows = (existing.results ?? []) as Record<string, unknown>[];
   const currentIds = currentRows.map((row) => Number(row.item_id)).filter(Number.isFinite);
   const currentSourceIds = currentRows.map((row) => Number(row.source_id)).filter(Number.isFinite);
-  const existingSlots = new Set(currentRows.map((row) => Number(row.slot_index)).filter(Number.isFinite));
-  const missingSlots = [0, 1, 2].filter((slot) => !existingSlots.has(slot));
+  const seenDedupKeys = await collectSeenContentDedupKeys(env, userId, targetDate, currentIds);
+  const filledSlots = new Set(currentRows.map((row) => Number(row.slot_index)).filter(Number.isFinite));
+  let missingSlots = [0, 1, 2].filter((slot) => !filledSlots.has(slot));
   if (missingSlots.length <= 0) return;
 
   const fatigueRows = await env.DB.prepare(`
@@ -1191,6 +1215,41 @@ async function fillDateIfNeeded(targetDate: string, env: Env, userId: number) {
     .map((row) => Number(row.source_id))
     .filter(Number.isFinite);
 
+  /**
+   * Apply one fill pass: batch-fetch source_ids, batch-insert slots, track state in memory.
+   * Eliminates the per-item SELECT + per-item INSERT pattern (was N+1 × 3 passes).
+   */
+  async function applyPass(candidates: number[]): Promise<void> {
+    if (candidates.length === 0 || missingSlots.length === 0) return;
+    const metaMap = await fetchItemMetaForItems(env, candidates);
+    const assignments: Array<[slot: number, itemId: number, sourceId: number]> = [];
+    let cursor = 0;
+    for (const id of candidates) {
+      const slot = missingSlots[cursor++];
+      if (slot === undefined) break;
+      const meta = metaMap.get(id);
+      if (!meta) continue;
+      const dedupKey = buildContentDedupKey(meta.sourceId, meta.title, meta.url);
+      if (seenDedupKeys.has(dedupKey)) continue;
+      assignments.push([slot, id, meta.sourceId]);
+      filledSlots.add(slot);
+      seenDedupKeys.add(dedupKey);
+      currentIds.push(id);
+      currentSourceIds.push(meta.sourceId);
+    }
+    if (assignments.length > 0) {
+      await env.DB.batch(
+        assignments.map(([slot, itemId, sourceId]) =>
+          env.DB.prepare(
+            `INSERT OR REPLACE INTO user_feed_slots (user_id, date, slot_index, item_id, source_id) VALUES (?, ?, ?, ?, ?)`
+          ).bind(userId, targetDate, slot, itemId, sourceId)
+        )
+      );
+    }
+    missingSlots = [0, 1, 2].filter((slot) => !filledSlots.has(slot));
+  }
+
+  // Pass 1: diverse sources, avoid recently seen sources
   const diverse = await selectCandidateItemIds(env, {
     userId,
     limit: missingSlots.length,
@@ -1199,75 +1258,31 @@ async function fillDateIfNeeded(targetDate: string, env: Env, userId: number) {
     requireNoMemo: true,
     distinctBySource: true,
   });
+  await applyPass(diverse);
+  if (missingSlots.length <= 0) return;
 
-  let slotCursor = 0;
-  for (const id of diverse) {
-    const slot = missingSlots[slotCursor++];
-    if (slot === undefined) break;
-    const sourceRow = await env.DB.prepare("SELECT source_id FROM items WHERE id = ? LIMIT 1").bind(id).first<{ source_id: number }>();
-    if (!sourceRow) continue;
-    await env.DB.prepare(`
-      INSERT OR REPLACE INTO user_feed_slots (user_id, date, slot_index, item_id, source_id)
-      VALUES (?, ?, ?, ?, ?)
-    `).bind(userId, targetDate, slot, id, sourceRow.source_id).run();
-    currentIds.push(id);
-    currentSourceIds.push(sourceRow.source_id);
-  }
-
-  const filledSlots = await env.DB.prepare("SELECT slot_index FROM user_feed_slots WHERE user_id = ? AND date = ?").bind(userId, targetDate).all();
-  const filledSet = new Set(((filledSlots.results ?? []) as Record<string, unknown>[]).map((r) => Number(r.slot_index)));
-  const stillMissing = [0, 1, 2].filter((slot) => !filledSet.has(slot));
-  if (stillMissing.length <= 0) return;
-
+  // Pass 2: relax source fatigue, still distinct sources
   const fallback = await selectCandidateItemIds(env, {
     userId,
-    limit: stillMissing.length,
+    limit: missingSlots.length,
     excludeItemIds: currentIds,
     excludeSourceIds: currentSourceIds,
     requireNoMemo: true,
     distinctBySource: true,
   });
+  await applyPass(fallback);
+  if (missingSlots.length <= 0) return;
 
-  let fallbackCursor = 0;
-  for (const id of fallback) {
-    const slot = stillMissing[fallbackCursor++];
-    if (slot === undefined) break;
-    const sourceRow = await env.DB.prepare("SELECT source_id FROM items WHERE id = ? LIMIT 1").bind(id).first<{ source_id: number }>();
-    if (!sourceRow) continue;
-    await env.DB.prepare(`
-      INSERT OR REPLACE INTO user_feed_slots (user_id, date, slot_index, item_id, source_id)
-      VALUES (?, ?, ?, ?, ?)
-    `).bind(userId, targetDate, slot, id, sourceRow.source_id).run();
-    currentIds.push(id);
-    currentSourceIds.push(sourceRow.source_id);
-  }
-
-  const finalSlots = await env.DB.prepare("SELECT slot_index FROM user_feed_slots WHERE user_id = ? AND date = ?").bind(userId, targetDate).all();
-  const finalSet = new Set(((finalSlots.results ?? []) as Record<string, unknown>[]).map((r) => Number(r.slot_index)));
-  const finalMissing = [0, 1, 2].filter((slot) => !finalSet.has(slot));
-  if (finalMissing.length <= 0) return;
-
-  // Last-resort pass: allow memoed items, but never reuse items assigned on other dates.
+  // Pass 3: last resort — allow memoed items, any source
   const relaxed = await selectCandidateItemIds(env, {
     userId,
-    limit: finalMissing.length,
+    limit: missingSlots.length,
     excludeItemIds: currentIds,
     excludeSourceIds: [],
     requireNoMemo: false,
     distinctBySource: false,
   });
-
-  let relaxedCursor = 0;
-  for (const id of relaxed) {
-    const slot = finalMissing[relaxedCursor++];
-    if (slot === undefined) break;
-    const sourceRow = await env.DB.prepare("SELECT source_id FROM items WHERE id = ? LIMIT 1").bind(id).first<{ source_id: number }>();
-    if (!sourceRow) continue;
-    await env.DB.prepare(`
-      INSERT OR REPLACE INTO user_feed_slots (user_id, date, slot_index, item_id, source_id)
-      VALUES (?, ?, ?, ?, ?)
-    `).bind(userId, targetDate, slot, id, sourceRow.source_id).run();
-  }
+  await applyPass(relaxed);
 }
 
 async function pruneDateItemsDuplicatedAcrossOtherDates(env: Env, userId: number, targetDate: string) {
@@ -1284,6 +1299,47 @@ async function pruneDateItemsDuplicatedAcrossOtherDates(env: Env, userId: number
   `).bind(userId, targetDate).run();
 }
 
+async function pruneDateContentDuplicatesByKey(env: Env, userId: number, targetDate: string) {
+  const otherRows = await env.DB.prepare(`
+    SELECT i.source_id AS sourceId, i.title AS title, i.url AS url
+    FROM user_feed_slots fs
+    JOIN items i ON i.id = fs.item_id
+    WHERE fs.user_id = ? AND fs.date <> ?
+  `).bind(userId, targetDate).all<{ sourceId: number; title: string; url: string }>();
+  const seen = new Set<string>();
+  for (const row of otherRows.results ?? []) {
+    seen.add(buildContentDedupKey(Number(row.sourceId), String(row.title ?? ""), String(row.url ?? "")));
+  }
+
+  const targetRows = await env.DB.prepare(`
+    SELECT fs.slot_index AS slotIndex, i.source_id AS sourceId, i.title AS title, i.url AS url
+    FROM user_feed_slots fs
+    JOIN items i ON i.id = fs.item_id
+    WHERE fs.user_id = ? AND fs.date = ?
+    ORDER BY fs.slot_index ASC
+  `).bind(userId, targetDate).all<{ slotIndex: number; sourceId: number; title: string; url: string }>();
+
+  const deleteSlots: number[] = [];
+  for (const row of targetRows.results ?? []) {
+    const key = buildContentDedupKey(Number(row.sourceId), String(row.title ?? ""), String(row.url ?? ""));
+    if (seen.has(key)) {
+      deleteSlots.push(Number(row.slotIndex));
+      continue;
+    }
+    seen.add(key);
+  }
+
+  if (deleteSlots.length === 0) return;
+  await env.DB.batch(
+    deleteSlots.map((slot) =>
+      env.DB.prepare(`
+        DELETE FROM user_feed_slots
+        WHERE user_id = ? AND date = ? AND slot_index = ?
+      `).bind(userId, targetDate, slot)
+    )
+  );
+}
+
 async function backfillFeedsUntilDate(targetDate: string, env: Env, userId: number) {
   const today = new Date().toISOString().slice(0, 10);
   const maxDate = targetDate > today ? today : targetDate;
@@ -1295,7 +1351,7 @@ async function cleanupDemoData(env: Env) {
   await env.DB.prepare("DELETE FROM sources WHERE url LIKE 'https://memoryfeed.local/%'").run();
 }
 
-async function ensureItemsFromSources(env: Env, userId: number) {
+async function ensureItemsFromSources(env: Env, ctx: ExecutionContext | undefined, userId: number) {
   const rows = await env.DB.prepare(`
     SELECT
       s.id,
@@ -1327,15 +1383,18 @@ async function ensureItemsFromSources(env: Env, userId: number) {
     const rootUrlCount = Number(row.rootUrlCount ?? 0);
     const weakTitleCount = Number(row.weakTitleCount ?? 0);
     if (itemCount === 0) {
+      // Fast DB-only seed — keep inline so the slot-filling pass has something to work with.
       await seedItemForSource(source, env);
       continue;
     }
 
-    // If this source is effectively only showing a homepage placeholder, try re-hydration now.
+    // If this source only has homepage placeholders, re-hydrate via HTTP.
+    // Run in background so the response is never blocked by an external fetch.
     const onlyRootLikeItems =
       itemCount > 0 && (rootUrlCount >= itemCount || weakTitleCount >= itemCount);
     if (onlyRootLikeItems) {
-      await hydrateSourceItems(source, env);
+      if (ctx) ctx.waitUntil(hydrateSourceItems(source, env));
+      else await hydrateSourceItems(source, env);
     }
   }
 }
@@ -1910,6 +1969,7 @@ function normalizeDisplayText(text: string) {
     .replace(/(^|\s)[>»]+(?=\s|$)/g, " ")
     .replace(/^\s*[\-*•·]+\s*/, "")
     .replace(/\s+\*\s+/g, " ")
+    .replace(/(?:\s*[-–—]\s*|\s+)[a-f0-9]{8,16}$/i, "")
     .replace(/^[\s\-:|>]+/, "")
     .replace(/[\s\-:|>]+$/, "")
     .replace(/\bDiscussion\s*\|\s*Link\b/gi, "")
@@ -2009,6 +2069,56 @@ function canonicalEntryKey(url: string) {
   } catch {
     return null;
   }
+}
+
+function normalizeTitleKey(text: string) {
+  return normalizeDisplayText(text)
+    .toLowerCase()
+    .replace(/[^a-z0-9가-힣\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function buildContentDedupKey(sourceId: number, title: string, url: string) {
+  const titleKey = normalizeTitleKey(title);
+  if (titleKey) return `${sourceId}|${titleKey}`;
+  try {
+    const parsed = new URL(url);
+    return `${sourceId}|${parsed.hostname.toLowerCase()}${parsed.pathname.replace(/\/+$/, "")}`;
+  } catch {
+    return `${sourceId}|${normalizeDisplayText(url).toLowerCase()}`;
+  }
+}
+
+async function collectSeenContentDedupKeys(
+  env: Env,
+  userId: number,
+  targetDate: string,
+  currentItemIds: number[],
+) {
+  const seen = new Set<string>();
+  const historical = await env.DB.prepare(`
+    SELECT i.source_id AS sourceId, i.title AS title, i.url AS url
+    FROM user_feed_slots fs
+    JOIN items i ON i.id = fs.item_id
+    WHERE fs.user_id = ? AND fs.date <> ?
+  `).bind(userId, targetDate).all<{ sourceId: number; title: string; url: string }>();
+  for (const row of historical.results ?? []) {
+    seen.add(buildContentDedupKey(Number(row.sourceId), String(row.title ?? ""), String(row.url ?? "")));
+  }
+
+  if (currentItemIds.length > 0) {
+    const placeholders = currentItemIds.map(() => "?").join(", ");
+    const currentRows = await env.DB.prepare(`
+      SELECT source_id AS sourceId, title, url
+      FROM items
+      WHERE id IN (${placeholders})
+    `).bind(...currentItemIds).all<{ sourceId: number; title: string; url: string }>();
+    for (const row of currentRows.results ?? []) {
+      seen.add(buildContentDedupKey(Number(row.sourceId), String(row.title ?? ""), String(row.url ?? "")));
+    }
+  }
+  return seen;
 }
 
 function isLikelyArticleUrl(url: string, seedHost: string) {
@@ -2168,10 +2278,32 @@ function normalizeEntryUrl(url: string, baseUrl: string) {
   try {
     const parsed = new URL(url, baseUrl);
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    stripTrackingQueryParams(parsed);
     parsed.hash = "";
     return parsed.toString();
   } catch {
     return null;
+  }
+}
+
+function stripTrackingQueryParams(parsed: URL) {
+  const keys = [...parsed.searchParams.keys()];
+  for (const key of keys) {
+    const lower = key.toLowerCase();
+    if (
+      lower.startsWith("utm_") ||
+      lower === "fbclid" ||
+      lower === "gclid" ||
+      lower === "mc_cid" ||
+      lower === "mc_eid" ||
+      lower === "_hsenc" ||
+      lower === "_hsmi" ||
+      lower === "igshid" ||
+      lower === "ref" ||
+      lower === "ref_src"
+    ) {
+      parsed.searchParams.delete(key);
+    }
   }
 }
 
