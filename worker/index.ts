@@ -1584,8 +1584,11 @@ function parseSourceUrls(rawText?: string, urlsInput?: string[]) {
 }
 
 function normalizeUrl(input: string): string | null {
+  const sanitized = input.trim().replace(/[),.;]+$/g, "");
+  if (!sanitized) return null;
+  const withScheme = /^[a-z]+:\/\//i.test(sanitized) ? sanitized : `https://${sanitized}`;
   try {
-    const parsed = new URL(input);
+    const parsed = new URL(withScheme);
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
     stripTrackingQueryParams(parsed);
     parsed.hash = "";

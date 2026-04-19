@@ -30,20 +30,28 @@ export function parseSourceInput(input: string) {
 
   const deduped = new Set<string>();
   for (const token of tokens) {
-    try {
-      const parsed = new URL(token);
-      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") continue;
-      parsed.hash = "";
-      deduped.add(parsed.toString());
-    } catch {
-      // ignore invalid URL token
-    }
+    const normalized = normalizeSourceToken(token);
+    if (normalized) deduped.add(normalized);
   }
 
   return {
     totalTokens: tokens.length,
     urls: [...deduped],
   };
+}
+
+function normalizeSourceToken(input: string) {
+  const sanitized = input.trim().replace(/[),.;]+$/g, "");
+  if (!sanitized) return null;
+  const withScheme = /^[a-z]+:\/\//i.test(sanitized) ? sanitized : `https://${sanitized}`;
+  try {
+    const parsed = new URL(withScheme);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    parsed.hash = "";
+    return parsed.toString();
+  } catch {
+    return null;
+  }
 }
 
 export function normalizeSourceEntry(raw: Record<string, unknown>): SourceEntry {

@@ -513,7 +513,7 @@ export default function App() {
       setToast({
         tone: "warning",
         title: "추가할 링크가 없어요",
-        description: "http/https 링크를 한 줄씩 붙여넣어 주세요.",
+        description: "링크를 한 줄씩 붙여넣어 주세요.",
       });
       return;
     }
@@ -521,8 +521,13 @@ export default function App() {
     if (!result?.ok) {
       setOnboardingHosts([]);
       onboardingScheduledRef.current.clear();
+      return;
     }
-    setSourceInput("");
+    const added = result.data?.added ?? 0;
+    const duplicated = result.data?.duplicateCount ?? 0;
+    if (added + duplicated > 0) {
+      setSourceInput("");
+    }
   };
 
   const retryFailedSources = async () => {
