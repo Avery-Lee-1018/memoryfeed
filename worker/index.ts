@@ -1521,7 +1521,7 @@ async function handlePostSources(request: Request, env: Env, ctx: ExecutionConte
     let registeredOrReactivated = 0;
     for (const sourceUrl of urls) {
       const host = extractSourceHost(sourceUrl);
-      const existingByHost = host ? sourceByHost.get(host) : undefined;
+      const existingByHost = host && shouldDeduplicateByHost(sourceUrl) ? sourceByHost.get(host) : undefined;
       if (existingByHost) {
         duplicateUrls.push(sourceUrl);
         await upsertUserSourceActive(env, userId, existingByHost.id);
@@ -1613,7 +1613,7 @@ async function handlePostSources(request: Request, env: Env, ctx: ExecutionConte
   }
 
   const incomingHost = extractSourceHost(body.url);
-  if (incomingHost) {
+  if (incomingHost && shouldDeduplicateByHost(body.url)) {
     const existing = await env.DB
       .prepare(`
         SELECT s.id, s.name, s.url, s.type
@@ -1833,6 +1833,20 @@ function extractSourceHost(sourceUrl: string) {
     return new URL(sourceUrl).hostname.toLowerCase().replace(/^www\./, "");
   } catch {
     return "";
+  }
+}
+
+function shouldDeduplicateByHost(sourceUrl: string) {
+  try {
+    const parsed = new URL(sourceUrl);
+    const path = parsed.pathname.replace(/\/+$/, "");
+    // Root-like URLs can be deduped by host.
+    if (!path || path === "/") return true;
+    // Author/category/deep paths should be treated as distinct sources
+    // (e.g. brunch writer pages, blog categories, newsroom sections).
+    return false;
+  } catch {
+    return true;
   }
 }
 
